@@ -27,9 +27,15 @@ export function formatRatio(ratio: number): string {
   return `${ratio.toFixed(2)}×`;
 }
 
-export function formatAnnounceTime(unixSeconds: number | null): string {
+export function formatAnnounceTime(unixSeconds: number | null, timeZone?: string): string {
   if (unixSeconds === null) return "—";
-  return new Date(unixSeconds * 1000).toISOString().slice(11, 19);
+  return new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+    timeZone,
+  }).format(unixSeconds * 1000);
 }
 
 export const stateColor: Record<string, string> = {

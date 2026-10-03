@@ -76,8 +76,9 @@ describe("formatAnnounceTime", () => {
     expect(formatAnnounceTime(null)).toBe("—");
   });
 
-  it("formats the unix timestamp as UTC clock time", () => {
-    expect(formatAnnounceTime(0)).toBe("00:00:00");
-    expect(formatAnnounceTime(1_700_000_000)).toBe("22:13:20");
+  it("formats the unix timestamp in the requested time zone", () => {
+    expect(formatAnnounceTime(0, "UTC")).toBe("00:00:00");
+    expect(formatAnnounceTime(1_700_000_000, "UTC")).toBe("22:13:20");
+    expect(formatAnnounceTime(1_700_000_000, "America/Sao_Paulo")).toBe("19:13:20");
   });
 });
