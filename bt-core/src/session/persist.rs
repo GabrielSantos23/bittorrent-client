@@ -14,6 +14,8 @@ pub(crate) struct PersistedTorrent {
     pub file: String,
     pub output_dir: PathBuf,
     pub paused: bool,
+    #[serde(default)]
+    pub magnet: Option<String>,
 }
 
 pub(crate) fn load(data_dir: &Path) -> (SessionFile, Vec<String>) {

@@ -101,6 +101,12 @@ enum SessionCommand {
         paused: bool,
         reply: oneshot::Sender<Result<String, SessionError>>,
     },
+    AddMagnet {
+        uri: String,
+        output_dir: PathBuf,
+        paused: bool,
+        reply: oneshot::Sender<Result<String, SessionError>>,
+    },
     Pause {
         id: String,
         reply: oneshot::Sender<Result<(), SessionError>>,
@@ -232,11 +238,22 @@ impl Session {
         };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
+        let mut pending_magnets: Vec<(String, PathBuf, bool)> = Vec::new();
+        let persisted_file;
         if let Some(data_dir) = &persistence {
             std::fs::create_dir_all(data_dir)?;
-            let (file, errors) = persist::load(data_dir);
+            let (loaded, errors) = persist::load(data_dir);
+            persisted_file = loaded;
             restore_errors.extend(errors);
-            for entry in file.torrents {
+            for entry in &persisted_file.torrents {
+                if let Some(uri) = &entry.magnet {
+                    pending_magnets.push((uri.clone(), entry.output_dir.clone(), entry.paused));
+                }
+            }
+            for entry in persisted_file.torrents {
+                if entry.magnet.is_some() {
+                    continue;
+                }
                 let metainfo_path = data_dir.join(&entry.file);
                 let restored_entry = match std::fs::read(&metainfo_path) {
                     Ok(bytes) => match MetaInfo::from_bytes(&bytes) {
@@ -281,6 +298,21 @@ impl Session {
                 continue;
             }
             let entry = spawn_entry(meta, output_dir, paused, &wiring).await?;
+            initial.push(make_summary(&id, &entry));
+            order.push(id.clone());
+            torrents.insert(id, entry);
+        }
+        for (uri, output_dir, paused) in pending_magnets {
+            let Ok(link) = crate::magnet::parse(&uri) else {
+                restore_errors.push(format!("bad magnet: {uri}"));
+                continue;
+            };
+            let id = hex::encode(&link.info_hash);
+            if torrents.contains_key(&id) {
+                restore_errors.push(format!("duplicate restored magnet {id}"));
+                continue;
+            }
+            let entry = spawn_magnet_entry(link, output_dir, paused, &wiring).await?;
             initial.push(make_summary(&id, &entry));
             order.push(id.clone());
             torrents.insert(id, entry);
@@ -351,6 +383,20 @@ impl Session {
         self.commands
             .send(SessionCommand::Add {
                 bytes: bytes.to_vec(),
+                output_dir,
+                paused: false,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
+    pub async fn add_magnet(&self, uri: &str, output_dir: PathBuf) -> Result<String, SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::AddMagnet {
+                uri: uri.to_string(),
                 output_dir,
                 paused: false,
                 reply,
@@ -509,6 +555,15 @@ impl SessionActor {
                 let result = self.add(bytes, output_dir, paused).await;
                 let _ = reply.send(result);
             }
+            SessionCommand::AddMagnet {
+                uri,
+                output_dir,
+                paused,
+                reply,
+            } => {
+                let result = self.add_magnet(&uri, output_dir, paused).await;
+                let _ = reply.send(result);
+            }
             SessionCommand::Pause { id, reply } => {
                 let result = self.set_paused(&id, true).await;
                 let _ = reply.send(result);
@@ -566,6 +621,46 @@ impl SessionActor {
         self.order.push(id.clone());
         self.torrents.insert(id.clone(), entry);
         self.persist();
+        self.publish();
+        Ok(id)
+    }
+
+    async fn add_magnet(
+        &mut self,
+        uri: &str,
+        output_dir: PathBuf,
+        paused: bool,
+    ) -> Result<String, SessionError> {
+        let link = crate::magnet::parse(uri)?;
+        let id = hex::encode(&link.info_hash);
+        if self.torrents.contains_key(&id) {
+            return Err(SessionError::Duplicate(id));
+        }
+        let entry = spawn_magnet_entry(link, output_dir.clone(), paused, &self.wiring).await?;
+        self.order.push(id.clone());
+        self.torrents.insert(id.clone(), entry);
+        if let Some(data_dir) = &self.persistence {
+            let file = SessionFile {
+                torrents: self
+                    .order
+                    .iter()
+                    .filter_map(|existing| {
+                        self.torrents.get(existing).map(|entry| PersistedTorrent {
+                            id: existing.clone(),
+                            file: format!("{existing}.torrent"),
+                            output_dir: entry.output_dir.clone(),
+                            paused: entry.paused,
+                            magnet: if existing == &id {
+                                Some(uri.to_string())
+                            } else {
+                                None
+                            },
+                        })
+                    })
+                    .collect(),
+            };
+            let _ = persist::save(data_dir, &file);
+        }
         self.publish();
         Ok(id)
     }
@@ -671,6 +766,7 @@ impl SessionActor {
                             file: format!("{id}.torrent"),
                             output_dir: entry.output_dir.clone(),
                             paused: entry.paused,
+                            magnet: None,
                         })
                     })
                     .collect(),
@@ -690,6 +786,40 @@ impl SessionActor {
             let _ = self.summaries_tx.send(summaries);
         }
     }
+}
+
+async fn spawn_magnet_entry(
+    link: crate::magnet::MagnetLink,
+    output_dir: PathBuf,
+    paused: bool,
+    wiring: &EngineWiring,
+) -> Result<SessionTorrent, SessionError> {
+    let options = crate::engine::TorrentOptions {
+        bootstrap_peers: wiring.bootstrap_peers.clone(),
+        dial: wiring.dial.clone(),
+        listen_active: wiring.listen_active.clone(),
+        announce_port: wiring.announce_port.clone(),
+        uploads: wiring.uploads.clone(),
+        registry: wiring.registry.clone(),
+        choke_interval: wiring.choke_interval,
+        optimistic_interval: wiring.optimistic_interval,
+        peer_id: wiring.peer_id,
+    };
+    let handle = Torrent::spawn_from_magnet(link, output_dir.clone(), options).await?;
+    let stats = handle.subscribe();
+    if paused {
+        handle.pause().await?;
+    }
+    #[allow(clippy::expect_used)]
+    let placeholder_meta =
+        MetaInfo::from_bytes(b"d4:infoi0ee").expect("statically valid placeholder");
+    Ok(SessionTorrent {
+        handle,
+        meta: Arc::new(placeholder_meta),
+        output_dir,
+        paused,
+        stats,
+    })
 }
 
 async fn spawn_entry(

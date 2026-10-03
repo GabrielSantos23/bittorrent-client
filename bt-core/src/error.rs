@@ -162,6 +162,8 @@ pub enum SessionError {
     Closed,
     #[error("{0}")]
     Listen(String),
+    #[error("{0}")]
+    Magnet(#[from] crate::magnet::MagnetError),
 }
 
 #[derive(Debug, Error)]
