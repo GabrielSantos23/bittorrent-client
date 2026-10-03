@@ -6,6 +6,7 @@ pub mod engine;
 pub mod error;
 pub mod hex;
 pub mod listener;
+pub mod magnet;
 pub mod metainfo;
 pub mod peer;
 pub mod peer_id;
