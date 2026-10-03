@@ -175,11 +175,15 @@ export default function App() {
                 ? "text-sm text-primary"
                 : "text-sm text-destructive"
             }
-            title={listener.error ?? undefined}
+            title={
+              listener.active
+                ? "The port is bound locally, but reachability from outside is not verified. Router/NAT port forwarding may be needed for remote peers to connect."
+                : listener.error ?? undefined
+            }
             role="status"
           >
             {listener.active
-              ? `Listening on :${listener.port}`
+              ? `Listening on :${listener.port} (local)`
               : "Listener inactive"}
           </span>
         )}
