@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -684,10 +686,14 @@ impl Engine {
                 numwant: 0,
                 event: Some(Event::Stopped),
             };
-            let http = self.http.clone();
-            let url = tracker.url.clone();
+            let future = self.announce_future(
+                tracker.url.clone(),
+                tracker.transport.clone(),
+                tracker.id,
+                request,
+            );
             waits.spawn(async move {
-                let _ = tracker::http_announce(&http, &url, &request).await;
+                let _ = future.await;
             });
         }
         let _ = tokio::time::timeout(STOP_ANNOUNCE_WAIT, waits.join_all()).await;
@@ -751,6 +757,39 @@ impl Engine {
         }
     }
 
+    fn announce_future(
+        &self,
+        url: String,
+        transport: TrackerTransport,
+        id: usize,
+        request: AnnounceRequest,
+    ) -> Pin<Box<dyn Future<Output = TrackerOutcome> + Send>> {
+        let tx = self.announce_results_tx.clone();
+        match transport {
+            TrackerTransport::Http => {
+                let http = self.http.clone();
+                Box::pin(async move {
+                    let result = tracker::http_announce(&http, &url, &request).await;
+                    TrackerOutcome { id, result }
+                })
+            }
+            TrackerTransport::Udp(cell) => Box::pin(async move {
+                let client = cell
+                    .get_or_try_init(|| async {
+                        UdpTrackerClient::connect_tracker(&url, UdpConfig::default())
+                            .await
+                            .map(|client| Arc::new(tokio::sync::Mutex::new(client)))
+                    })
+                    .await;
+                let result = match client {
+                    Ok(client) => client.lock().await.announce(&request, -1).await,
+                    Err(err) => Err(err),
+                };
+                TrackerOutcome { id, result }
+            }),
+        }
+    }
+
     fn spawn_announce(
         &self,
         url: &str,
@@ -758,34 +797,12 @@ impl Engine {
         id: usize,
         request: AnnounceRequest,
     ) {
+        let future = self.announce_future(url.to_string(), transport, id, request);
         let tx = self.announce_results_tx.clone();
-        match transport {
-            TrackerTransport::Http => {
-                let http = self.http.clone();
-                let url = url.to_string();
-                tokio::spawn(async move {
-                    let result = tracker::http_announce(&http, &url, &request).await;
-                    let _ = tx.send(TrackerOutcome { id, result }).await;
-                });
-            }
-            TrackerTransport::Udp(cell) => {
-                let url = url.to_string();
-                tokio::spawn(async move {
-                    let client = cell
-                        .get_or_try_init(|| async {
-                            UdpTrackerClient::connect_tracker(&url, UdpConfig::default())
-                                .await
-                                .map(|client| Arc::new(tokio::sync::Mutex::new(client)))
-                        })
-                        .await;
-                    let result = match client {
-                        Ok(client) => client.lock().await.announce(&request, -1).await,
-                        Err(err) => Err(err),
-                    };
-                    let _ = tx.send(TrackerOutcome { id, result }).await;
-                });
-            }
-        }
+        tokio::spawn(async move {
+            let outcome = future.await;
+            let _ = tx.send(outcome).await;
+        });
     }
 
     fn handle_tracker_result(&mut self, outcome: TrackerOutcome) {

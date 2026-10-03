@@ -217,3 +217,35 @@ async fn failing_tracker_does_not_block_the_others() {
     tracker_b.shutdown();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_returns_within_budget_with_silent_udp_tracker() {
+    use std::net::Ipv4Addr;
+
+    let silent = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let url = format!("udp://{}/announce", silent.local_addr().unwrap());
+    let (meta, _data) = torrent_with_trackers(vec![vec![url]]);
+    let dir = temp_dir("udp-shutdown");
+    let torrent = Torrent::spawn_with_options(
+        meta,
+        dir.clone(),
+        TorrentOptions {
+            registry: Arc::new(bt_core::listener::Registry::default()),
+            ..TorrentOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let started = Instant::now();
+    torrent.stop().await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "stop must not wait for the udp retransmit budget, took {elapsed:?}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
