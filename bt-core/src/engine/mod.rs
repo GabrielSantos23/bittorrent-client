@@ -387,6 +387,7 @@ impl PeerBacklog {
         self.queue.retain(|queued| queued != addr);
     }
 
+    #[cfg(test)]
     fn is_known(&self, addr: &SocketAddr) -> bool {
         self.known.contains(addr)
     }

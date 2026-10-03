@@ -10,10 +10,6 @@ use bt_core::engine::{State, Torrent, TorrentOptions, TrackerState};
 use bt_core::metainfo::MetaInfo;
 use common::{temp_dir, test_data, FakeDial, SeederKind};
 
-fn addr(port: u16) -> SocketAddr {
-    SocketAddr::from(([127, 0, 0, 1], port))
-}
-
 fn lan_peer(port: u16) -> SocketAddr {
     SocketAddr::from(([10, 0, 0, 1], port))
 }
