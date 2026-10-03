@@ -3,15 +3,27 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use bt_core::listener::DEFAULT_LISTEN_PORT;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct Settings {
     pub download_dir: PathBuf,
+    #[serde(default = "default_listen_port")]
+    pub listen_port: u16,
+    #[serde(default)]
+    pub upload_limit_bps: u64,
+}
+
+fn default_listen_port() -> u16 {
+    DEFAULT_LISTEN_PORT
 }
 
 pub fn default_settings(data_dir: &Path) -> Settings {
     Settings {
         download_dir: data_dir.join("downloads"),
+        listen_port: DEFAULT_LISTEN_PORT,
+        upload_limit_bps: 0,
     }
 }
 
@@ -54,6 +66,8 @@ mod tests {
     fn sample() -> Settings {
         Settings {
             download_dir: PathBuf::from("D:\\downloads"),
+            listen_port: 6889,
+            upload_limit_bps: 1024,
         }
     }
 
@@ -64,6 +78,18 @@ mod tests {
         let path = dir.join("settings.json");
         save_settings(&path, &sample()).unwrap();
         assert_eq!(load_settings(&path), Some(sample()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_fields_fall_back_to_defaults() {
+        let dir = unique_dir("partial");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"download_dir":"D:\\downloads"}"#).unwrap();
+        let settings = load_settings(&path).unwrap();
+        assert_eq!(settings.listen_port, DEFAULT_LISTEN_PORT);
+        assert_eq!(settings.upload_limit_bps, 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

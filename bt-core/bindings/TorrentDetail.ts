@@ -2,4 +2,4 @@
 import type { FileSummary } from "./FileSummary";
 import type { PeerStats } from "./PeerStats";
 
-export type TorrentDetail = { id: string, info_hash: string, peers: Array<PeerStats>, files: Array<FileSummary>, trackers: Array<string>, comment: string | null, output_dir: string, };
+export type TorrentDetail = { id: string, info_hash: string, peers: Array<PeerStats>, files: Array<FileSummary>, trackers: Array<string>, comment: string | null, output_dir: string, session_uploaded: number, upload_rate: number, ratio: number, };

@@ -7,7 +7,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bt_core::engine::State;
-use bt_core::session::{Session, TorrentDetail, TorrentSummary};
+use bt_core::listener::ListenerStatus;
+use bt_core::session::{Session, SessionOptions, TorrentDetail, TorrentSummary};
 use settings::{default_settings, load_settings, save_settings, Settings};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
@@ -104,9 +105,13 @@ async fn get_settings(state: tauri::State<'_, AppState>) -> Result<Settings, Str
 async fn set_settings(
     state: tauri::State<'_, AppState>,
     download_dir: String,
+    listen_port: u16,
+    upload_limit_bps: u64,
 ) -> Result<(), String> {
     let settings = Settings {
         download_dir: PathBuf::from(download_dir),
+        listen_port,
+        upload_limit_bps,
     };
     let path = state.data_dir.join("settings.json");
     save_settings(&path, &settings).map_err(|err| err.to_string())?;
@@ -161,6 +166,18 @@ fn spawn_detail_events(
     });
 }
 
+fn spawn_listener_events(app: AppHandle, mut status: watch::Receiver<ListenerStatus>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let snapshot = status.borrow().clone();
+            let _ = app.emit("session://listener", &snapshot);
+            if status.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -203,8 +220,10 @@ fn main() {
             let settings = load_settings(&data_dir.join("settings.json"))
                 .unwrap_or_else(|| default_settings(&data_dir));
             std::fs::create_dir_all(&settings.download_dir)?;
-            let session =
-                tauri::async_runtime::block_on(Session::spawn(Some(data_dir.join("session"))))?;
+            let session = tauri::async_runtime::block_on(Session::spawn_with_options(
+                Some(data_dir.join("session")),
+                SessionOptions::new(settings.listen_port, settings.upload_limit_bps),
+            ))?;
             let summaries = session.subscribe();
             let (selected_tx, selected_rx) = watch::channel(None);
             app.manage(AppState {
@@ -219,7 +238,10 @@ fn main() {
             spawn_summary_events(handle, summaries);
 
             let handle = app.handle().clone();
-            spawn_detail_events(handle, session, selected_rx);
+            spawn_detail_events(handle, session.clone(), selected_rx);
+
+            let handle = app.handle().clone();
+            spawn_listener_events(handle, session.listener_status());
 
             build_tray(app)?;
             Ok(())

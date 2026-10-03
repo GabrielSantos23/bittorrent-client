@@ -10,6 +10,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::spawn_blocking;
 
 use crate::engine::{PeerStats, State, Torrent};
+use crate::listener::{self, Listener, ListenerOptions, ListenerStatus, Registry};
+use crate::ratelimit::UploadBucket;
 
 use self::persist::{PersistedTorrent, SessionFile};
 use crate::error::SessionError;
@@ -17,6 +19,30 @@ use crate::hex;
 use crate::metainfo::MetaInfo;
 
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Clone)]
+pub struct SessionOptions {
+    pub listen_port: u16,
+    pub upload_limit_bps: u64,
+    pub choke_interval: Duration,
+    pub optimistic_interval: Duration,
+    pub dial: Arc<dyn crate::engine::Dial>,
+    pub bootstrap_peers: Vec<std::net::SocketAddr>,
+}
+
+impl SessionOptions {
+    pub fn new(listen_port: u16, upload_limit_bps: u64) -> SessionOptions {
+        let connect_timeout = crate::peer::PeerConfig::default().connect_timeout;
+        SessionOptions {
+            listen_port,
+            upload_limit_bps,
+            choke_interval: Duration::from_secs(10),
+            optimistic_interval: Duration::from_secs(30),
+            dial: Arc::new(crate::engine::TcpDial::new(connect_timeout)),
+            bootstrap_peers: Vec::new(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
 #[ts(export)]
@@ -30,6 +56,10 @@ pub struct TorrentSummary {
     pub verified_bytes: u64,
     pub progress: f64,
     pub download_rate: f64,
+    #[ts(type = "number")]
+    pub session_uploaded: u64,
+    pub upload_rate: f64,
+    pub ratio: f64,
     #[ts(type = "number | null")]
     pub eta_seconds: Option<u64>,
     pub peer_count: usize,
@@ -55,6 +85,10 @@ pub struct TorrentDetail {
     pub trackers: Vec<String>,
     pub comment: Option<String>,
     pub output_dir: PathBuf,
+    #[ts(type = "number")]
+    pub session_uploaded: u64,
+    pub upload_rate: f64,
+    pub ratio: f64,
 }
 
 #[derive(Debug)]
@@ -91,16 +125,15 @@ enum SessionCommand {
 pub struct Session {
     commands: mpsc::Sender<SessionCommand>,
     summaries: watch::Receiver<Vec<TorrentSummary>>,
+    listener_status: watch::Receiver<ListenerStatus>,
     restore_errors: Arc<Vec<String>>,
 }
 
 impl Session {
     pub async fn spawn(persistence: Option<PathBuf>) -> Result<Session, SessionError> {
-        let connect_timeout = crate::peer::PeerConfig::default().connect_timeout;
-        Session::spawn_with_dial(
+        Session::spawn_with_options(
             persistence,
-            Arc::new(crate::engine::TcpDial::new(connect_timeout)),
-            Vec::new(),
+            SessionOptions::new(listener::DEFAULT_LISTEN_PORT, 0),
         )
         .await
     }
@@ -110,6 +143,42 @@ impl Session {
         dial: Arc<dyn crate::engine::Dial>,
         bootstrap_peers: Vec<std::net::SocketAddr>,
     ) -> Result<Session, SessionError> {
+        let options = SessionOptions {
+            dial,
+            bootstrap_peers,
+            ..SessionOptions::new(listener::DEFAULT_LISTEN_PORT, 0)
+        };
+        Session::spawn_with_options(persistence, options).await
+    }
+
+    pub async fn spawn_with_options(
+        persistence: Option<PathBuf>,
+        options: SessionOptions,
+    ) -> Result<Session, SessionError> {
+        let registry = Arc::new(Registry::default());
+        let listener = listener::spawn(
+            ListenerOptions {
+                port: options.listen_port,
+                ..ListenerOptions::default()
+            },
+            registry.clone(),
+        );
+        let listener_status = listener.status();
+        let snapshot = listener_status.borrow().clone();
+        let wiring = EngineWiring {
+            listen_active: snapshot.active,
+            announce_port: if snapshot.active {
+                snapshot.port
+            } else {
+                options.listen_port
+            },
+            uploads: Arc::new(UploadBucket::new(options.upload_limit_bps)),
+            registry,
+            choke_interval: options.choke_interval,
+            optimistic_interval: options.optimistic_interval,
+            dial: options.dial,
+            bootstrap_peers: options.bootstrap_peers,
+        };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
         if let Some(data_dir) = &persistence {
@@ -160,14 +229,7 @@ impl Session {
                 restore_errors.push(format!("duplicate restored torrent {id}"));
                 continue;
             }
-            let entry = spawn_entry(
-                meta,
-                output_dir,
-                paused,
-                bootstrap_peers.clone(),
-                dial.clone(),
-            )
-            .await?;
+            let entry = spawn_entry(meta, output_dir, paused, &wiring).await?;
             initial.push(make_summary(&id, &entry));
             order.push(id.clone());
             torrents.insert(id, entry);
@@ -176,20 +238,25 @@ impl Session {
         let (summaries_tx, summaries_rx) = watch::channel(initial.clone());
         let actor = SessionActor {
             persistence,
-            dial,
-            bootstrap_peers,
+            wiring,
             torrents,
             order,
             summaries_tx,
             last: initial,
             commands: command_rx,
+            listener,
         };
         tokio::spawn(actor.run());
         Ok(Session {
             commands,
             summaries: summaries_rx,
+            listener_status,
             restore_errors,
         })
+    }
+
+    pub fn listener_status(&self) -> watch::Receiver<ListenerStatus> {
+        self.listener_status.clone()
     }
 
     pub fn restore_errors(&self) -> &[String] {
@@ -289,15 +356,27 @@ struct SessionTorrent {
     stats: watch::Receiver<crate::engine::Stats>,
 }
 
-struct SessionActor {
-    persistence: Option<PathBuf>,
+#[derive(Clone)]
+struct EngineWiring {
+    listen_active: bool,
+    announce_port: u16,
+    uploads: Arc<UploadBucket>,
+    registry: Arc<Registry>,
+    choke_interval: Duration,
+    optimistic_interval: Duration,
     dial: Arc<dyn crate::engine::Dial>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
+}
+
+struct SessionActor {
+    persistence: Option<PathBuf>,
+    wiring: EngineWiring,
     torrents: HashMap<String, SessionTorrent>,
     order: Vec<String>,
     summaries_tx: watch::Sender<Vec<TorrentSummary>>,
     last: Vec<TorrentSummary>,
     commands: mpsc::Receiver<SessionCommand>,
+    listener: Listener,
 }
 
 impl SessionActor {
@@ -370,14 +449,7 @@ impl SessionActor {
         if self.torrents.contains_key(&id) {
             return Err(SessionError::Duplicate(id));
         }
-        let entry = spawn_entry(
-            meta,
-            output_dir,
-            paused,
-            self.bootstrap_peers.clone(),
-            self.dial.clone(),
-        )
-        .await?;
+        let entry = spawn_entry(meta, output_dir, paused, &self.wiring).await?;
         if let Some(data_dir) = &self.persistence {
             persist::write_metainfo(data_dir, &id, &bytes)?;
         }
@@ -466,6 +538,9 @@ impl SessionActor {
             trackers,
             comment: entry.meta.comment.clone(),
             output_dir: entry.output_dir.clone(),
+            session_uploaded: stats.session_uploaded,
+            upload_rate: stats.upload_rate,
+            ratio: stats.ratio,
         })
     }
 
@@ -477,6 +552,7 @@ impl SessionActor {
             }
         }
         self.persist();
+        self.listener.shutdown();
         let _ = self.summaries_tx.send(Vec::new());
     }
 
@@ -517,12 +593,19 @@ async fn spawn_entry(
     meta: Arc<MetaInfo>,
     output_dir: PathBuf,
     paused: bool,
-    bootstrap_peers: Vec<std::net::SocketAddr>,
-    dial: Arc<dyn crate::engine::Dial>,
+    wiring: &EngineWiring,
 ) -> Result<SessionTorrent, SessionError> {
-    let handle =
-        Torrent::spawn_with_dial((*meta).clone(), output_dir.clone(), bootstrap_peers, dial)
-            .await?;
+    let options = crate::engine::TorrentOptions {
+        bootstrap_peers: wiring.bootstrap_peers.clone(),
+        dial: wiring.dial.clone(),
+        listen_active: wiring.listen_active,
+        announce_port: wiring.announce_port,
+        uploads: wiring.uploads.clone(),
+        registry: wiring.registry.clone(),
+        choke_interval: wiring.choke_interval,
+        optimistic_interval: wiring.optimistic_interval,
+    };
+    let handle = Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), options).await?;
     let stats = handle.subscribe();
     if paused {
         handle.pause().await?;
@@ -557,6 +640,9 @@ fn make_summary(id: &str, entry: &SessionTorrent) -> TorrentSummary {
         verified_bytes: stats.verified_bytes,
         progress,
         download_rate: stats.download_rate,
+        session_uploaded: stats.session_uploaded,
+        upload_rate: stats.upload_rate,
+        ratio: stats.ratio,
         eta_seconds,
         peer_count: stats.peer_count,
         output_dir: entry.output_dir.clone(),
