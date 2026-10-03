@@ -76,6 +76,7 @@ pub struct ListenerOptions {
     pub handshake_timeout: Duration,
     pub global_pending: usize,
     pub per_ip_pending: usize,
+    pub our_peer_id: [u8; 20],
 }
 
 impl Default for ListenerOptions {
@@ -85,6 +86,7 @@ impl Default for ListenerOptions {
             handshake_timeout: Duration::from_secs(10),
             global_pending: DEFAULT_GLOBAL_PENDING,
             per_ip_pending: DEFAULT_PER_IP_PENDING,
+            our_peer_id: *peer_id::session(),
         }
     }
 }
@@ -247,7 +249,7 @@ async fn negotiate(
         Err(_) => return Err(NegotiateError::Timeout),
     }
     let remote = handshake::decode(&buffer).map_err(|_| NegotiateError::Protocol)?;
-    if remote.peer_id == *peer_id::session() {
+    if remote.peer_id == state.options.our_peer_id {
         return Err(NegotiateError::SelfConnection);
     }
     let Some(sender) = state.registry.route(&remote.info_hash) else {
@@ -256,7 +258,7 @@ async fn negotiate(
     let reply = handshake::encode(&Handshake {
         info_hash: remote.info_hash,
         reserved: [0; 8],
-        peer_id: *peer_id::session(),
+        peer_id: state.options.our_peer_id,
     });
     stream.write_all(&reply).await.map_err(NegotiateError::Io)?;
     let incoming = Incoming {
@@ -287,6 +289,7 @@ mod tests {
             handshake_timeout,
             global_pending: global,
             per_ip_pending: per_ip,
+            ..ListenerOptions::default()
         }
     }
 

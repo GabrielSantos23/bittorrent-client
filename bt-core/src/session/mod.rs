@@ -604,6 +604,7 @@ async fn spawn_entry(
         registry: wiring.registry.clone(),
         choke_interval: wiring.choke_interval,
         optimistic_interval: wiring.optimistic_interval,
+        ..crate::engine::TorrentOptions::default()
     };
     let handle = Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), options).await?;
     let stats = handle.subscribe();

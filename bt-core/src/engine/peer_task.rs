@@ -359,8 +359,12 @@ where
                         RequestDecision::Ignore => {}
                         RequestDecision::Serve => {
                             let request = ServeRequest { index, begin, length };
-                            if serve_tx.try_send(request).is_err() {
-                                break Ok(());
+                            match serve_tx.try_send(request) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    break Ok(());
+                                }
                             }
                         }
                     }

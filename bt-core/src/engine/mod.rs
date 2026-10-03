@@ -117,6 +117,7 @@ pub struct TorrentOptions {
     pub registry: Arc<Registry>,
     pub choke_interval: Duration,
     pub optimistic_interval: Duration,
+    pub peer_id: [u8; 20],
 }
 
 impl Default for TorrentOptions {
@@ -130,6 +131,7 @@ impl Default for TorrentOptions {
             registry: Arc::new(Registry::default()),
             choke_interval: Duration::from_secs(10),
             optimistic_interval: Duration::from_secs(30),
+            peer_id: *peer_id::session(),
         }
     }
 }
@@ -267,6 +269,7 @@ struct Engine {
     storage: Arc<Storage>,
     dial: Arc<dyn Dial>,
     http: reqwest::Client,
+    our_peer_id: [u8; 20],
     stats_tx: watch::Sender<Stats>,
     commands: mpsc::Receiver<EngineCommand>,
     events_tx: mpsc::Sender<PeerEvent>,
@@ -332,6 +335,7 @@ impl Engine {
             registry,
             choke_interval,
             optimistic_interval,
+            peer_id: our_peer_id,
             ..
         } = options;
         Engine {
@@ -347,6 +351,7 @@ impl Engine {
             storage,
             dial,
             http,
+            our_peer_id,
             stats_tx,
             commands,
             events_tx,
@@ -534,7 +539,7 @@ impl Engine {
         self.announce_at = None;
         let request = AnnounceRequest {
             info_hash: self.meta.info_hash,
-            peer_id: *peer_id::session(),
+            peer_id: self.our_peer_id,
             port: self.announce_port,
             uploaded: self.session_uploaded,
             downloaded: self.session_downloaded,
@@ -558,7 +563,7 @@ impl Engine {
         let event = self.announce_event.take();
         let request = AnnounceRequest {
             info_hash: self.meta.info_hash,
-            peer_id: *peer_id::session(),
+            peer_id: self.our_peer_id,
             port: self.announce_port,
             uploaded: self.session_uploaded,
             downloaded: self.session_downloaded,
@@ -596,7 +601,10 @@ impl Engine {
     }
 
     fn try_connect(&mut self) {
-        if self.state != State::Downloading {
+        if !matches!(
+            self.state,
+            State::Downloading | State::Completed | State::Seeding
+        ) {
             return;
         }
         while self.peers.len() < MAX_PEERS {
@@ -656,7 +664,7 @@ impl Engine {
         let task = peer_task::PeerTask {
             addr,
             info_hash: self.meta.info_hash,
-            our_peer_id: *peer_id::session(),
+            our_peer_id: self.our_peer_id,
             piece_count: self.meta.info.pieces.len(),
             piece_length: self.meta.info.piece_length,
             total_length: self.total_length,

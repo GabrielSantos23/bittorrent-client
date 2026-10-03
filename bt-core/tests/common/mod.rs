@@ -5,18 +5,21 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use bt_core::bencode::{self, Value};
 use bt_core::engine::{BoxedStream, Dial};
+use bt_core::error::PeerError;
 use bt_core::metainfo::MetaInfo;
-use bt_core::peer::{Bitfield, Message, PeerConfig, PeerConnection};
+use bt_core::peer::{handshake, Bitfield, Handshake, Message, PeerConfig, PeerConnection};
 use sha1::{Digest, Sha1};
-use tokio::io::duplex;
+use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
 pub const PIECE_LENGTH: usize = 16384;
 pub const PIECE_COUNT: usize = 3;
 pub const DATA_LENGTH: usize = PIECE_LENGTH * PIECE_COUNT;
 pub const SEEDER_PEER_ID: [u8; 20] = *b"-SD0000-seeder000001";
+pub const LEECHER_PEER_ID: [u8; 20] = *b"-LC0000-leecher00001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeederKind {
@@ -24,6 +27,263 @@ pub enum SeederKind {
     CorruptOnce,
     Choking,
     NeverReads,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeecherConfig {
+    pub send_interested: bool,
+    pub requests_after_unchoke: Vec<(u32, u32, u32)>,
+    pub cancel_first: Option<(u32, u32, u32)>,
+    pub deadline: Duration,
+    pub request_blocks_of_all_pieces: bool,
+}
+
+impl Default for LeecherConfig {
+    fn default() -> Self {
+        LeecherConfig {
+            send_interested: true,
+            requests_after_unchoke: Vec::new(),
+            cancel_first: None,
+            deadline: Duration::from_secs(10),
+            request_blocks_of_all_pieces: false,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct LeecherReport {
+    pub saw_bitfield: bool,
+    pub saw_unchoke: bool,
+    pub saw_choke: bool,
+    pub closed: bool,
+    pub blocks: Vec<(u32, u32, Vec<u8>)>,
+}
+
+pub struct FakeLeecherDial {
+    info_hash: [u8; 20],
+    data: Arc<Vec<u8>>,
+    piece_count: usize,
+    config: LeecherConfig,
+    reports: tokio::sync::mpsc::Sender<LeecherReport>,
+}
+
+impl FakeLeecherDial {
+    pub fn new(
+        info_hash: [u8; 20],
+        data: Arc<Vec<u8>>,
+        piece_count: usize,
+        config: LeecherConfig,
+    ) -> (FakeLeecherDial, tokio::sync::mpsc::Receiver<LeecherReport>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        (
+            FakeLeecherDial {
+                info_hash,
+                data,
+                piece_count,
+                config,
+                reports: tx,
+            },
+            rx,
+        )
+    }
+}
+
+impl Dial for FakeLeecherDial {
+    fn dial(
+        &self,
+        _addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<BoxedStream>> + Send>> {
+        let info_hash = self.info_hash;
+        let data = self.data.clone();
+        let piece_count = self.piece_count;
+        let config = self.config.clone();
+        let reports = self.reports.clone();
+        Box::pin(async move {
+            let (client_side, server_side) = duplex(256 * 1024);
+            tokio::spawn(async move {
+                let report =
+                    run_leecher(Box::new(server_side), info_hash, data, piece_count, config).await;
+                let _ = reports.send(report).await;
+            });
+            Ok(Box::new(client_side) as BoxedStream)
+        })
+    }
+}
+
+pub fn all_block_requests(data_length: usize, piece_count: usize) -> Vec<(u32, u32, u32)> {
+    let mut requests = Vec::new();
+    for index in 0..piece_count {
+        let start = index * PIECE_LENGTH;
+        let size = PIECE_LENGTH.min(data_length - start);
+        let mut begin = 0;
+        while begin < size {
+            let length = BLOCK.min(size - begin);
+            requests.push((index as u32, begin as u32, length as u32));
+            begin += BLOCK;
+        }
+    }
+    requests
+}
+
+const BLOCK: usize = 16 * 1024;
+
+async fn send_requests(
+    conn: &mut PeerConnection<BoxedStream>,
+    report: &mut LeecherReport,
+    config: &LeecherConfig,
+    data: &Arc<Vec<u8>>,
+    piece_count: usize,
+) -> Option<usize> {
+    let mut requests: Vec<(u32, u32, u32)> = Vec::new();
+    if let Some(cancel) = config.cancel_first {
+        requests.push(cancel);
+    }
+    if config.request_blocks_of_all_pieces {
+        requests.extend(all_block_requests(data.len(), piece_count));
+    }
+    requests.extend(config.requests_after_unchoke.iter().copied());
+    if let Some(cancel) = config.cancel_first {
+        requests.retain(|request| (request.0, request.1, request.2) != cancel);
+        if conn
+            .write_message(&Message::Request {
+                index: cancel.0,
+                begin: cancel.1,
+                length: cancel.2,
+            })
+            .await
+            .is_err()
+        {
+            report.closed = true;
+            return None;
+        }
+        if conn
+            .write_message(&Message::Cancel {
+                index: cancel.0,
+                begin: cancel.1,
+                length: cancel.2,
+            })
+            .await
+            .is_err()
+        {
+            report.closed = true;
+            return None;
+        }
+    }
+    for (index, begin, length) in &requests {
+        if conn
+            .write_message(&Message::Request {
+                index: *index,
+                begin: *begin,
+                length: *length,
+            })
+            .await
+            .is_err()
+        {
+            report.closed = true;
+            return None;
+        }
+    }
+    Some(requests.len())
+}
+
+async fn run_leecher(
+    stream: BoxedStream,
+    info_hash: [u8; 20],
+    data: Arc<Vec<u8>>,
+    piece_count: usize,
+    config: LeecherConfig,
+) -> LeecherReport {
+    let mut report = LeecherReport::default();
+    let mut raw: BoxedStream = stream;
+    let mut buffer = [0u8; 68];
+    if raw.read_exact(&mut buffer).await.is_err() {
+        report.closed = true;
+        return report;
+    }
+    let remote = match handshake::decode(&buffer) {
+        Ok(remote) => remote,
+        Err(_) => {
+            report.closed = true;
+            return report;
+        }
+    };
+    if remote.info_hash != info_hash {
+        report.closed = true;
+        return report;
+    }
+    let reply = handshake::encode(&Handshake {
+        info_hash,
+        reserved: [0; 8],
+        peer_id: LEECHER_PEER_ID,
+    });
+    if raw.write_all(&reply).await.is_err() {
+        report.closed = true;
+        return report;
+    }
+    let config_for_conn = PeerConfig {
+        read_timeout: Duration::from_secs(30),
+        ..PeerConfig::default()
+    };
+    let mut conn = PeerConnection::new(raw, remote, piece_count, config_for_conn);
+    if config.send_interested {
+        if conn.write_message(&Message::Interested).await.is_err() {
+            report.closed = true;
+            return report;
+        }
+    }
+    let mut requested = false;
+    let mut expected: Option<usize> = None;
+    if !config.send_interested {
+        let sent = send_requests(&mut conn, &mut report, &config, &data, piece_count).await;
+        if sent.is_none() {
+            return report;
+        }
+    }
+    let deadline = tokio::time::Instant::now() + config.deadline;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let message = match tokio::time::timeout(remaining, conn.read_message()).await {
+            Ok(Ok(message)) => message,
+            Ok(Err(PeerError::ConnectionClosed)) => {
+                report.closed = true;
+                break;
+            }
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        };
+        match message {
+            Message::Bitfield(_) => report.saw_bitfield = true,
+            Message::Unchoke => {
+                report.saw_unchoke = true;
+                if !requested {
+                    requested = true;
+                    expected =
+                        send_requests(&mut conn, &mut report, &config, &data, piece_count).await;
+                    if expected == Some(0) {
+                        break;
+                    }
+                }
+            }
+            Message::Choke => report.saw_choke = true,
+            Message::Piece {
+                index,
+                begin,
+                block,
+            } => {
+                report.blocks.push((index, begin, block));
+                if let Some(expected) = expected {
+                    if report.blocks.len() >= expected {
+                        return report;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    report
 }
 
 pub struct FakeDial {
