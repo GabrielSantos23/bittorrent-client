@@ -16,7 +16,7 @@ use crate::listener::{Incoming, Registry};
 use crate::metainfo::MetaInfo;
 use crate::peer::{Bitfield, PeerConfig};
 use crate::peer_id;
-use crate::ratelimit::UploadBucket;
+use crate::ratelimit::{RateWindow, UploadBucket};
 use crate::tracker::{self, AnnounceRequest, Event};
 
 use self::assembly::{BlockOutcome, PieceAssembler};
@@ -266,7 +266,7 @@ struct PeerHandle {
     window_down: u64,
     window_up: u64,
     depth: usize,
-    rate_samples: VecDeque<(TokioInstant, u64)>,
+    rate_window: RateWindow,
 }
 
 struct Engine {
@@ -665,7 +665,7 @@ impl Engine {
                 window_down: 0,
                 window_up: 0,
                 depth: INITIAL_PIPELINE_DEPTH,
-                rate_samples: VecDeque::new(),
+                rate_window: RateWindow::new(RATE_WINDOW),
             },
         );
         let task = peer_task::PeerTask {
@@ -720,7 +720,7 @@ impl Engine {
                 window_down: 0,
                 window_up: 0,
                 depth: INITIAL_PIPELINE_DEPTH,
-                rate_samples: VecDeque::new(),
+                rate_window: RateWindow::new(RATE_WINDOW),
             },
         );
         let task = peer_task::IncomingPeer {
@@ -1103,20 +1103,8 @@ impl Engine {
         for handle in self.peers.values_mut() {
             handle.rate_base = handle.received_bytes;
             handle.upload_rate_base = handle.uploaded_bytes;
-            handle.rate_samples.push_back((now, handle.received_bytes));
-            while let Some((at, _)) = handle.rate_samples.front() {
-                if now.duration_since(*at) <= RATE_WINDOW {
-                    break;
-                }
-                handle.rate_samples.pop_front();
-            }
-            let rate = match (handle.rate_samples.front(), handle.rate_samples.back()) {
-                (Some((start, start_bytes)), Some((end, end_bytes))) if end > start => {
-                    (*end_bytes - *start_bytes) as f64 / (*end - *start).as_secs_f64()
-                }
-                _ => 0.0,
-            };
-            handle.depth = pipeline_depth(rate, TARGET_RTT, BLOCK_SIZE);
+            handle.rate_window.push(now, handle.received_bytes);
+            handle.depth = pipeline_depth(handle.rate_window.rate(), TARGET_RTT, BLOCK_SIZE);
         }
         self.last_rate = (now, self.session_downloaded, self.session_uploaded);
         self.publish();

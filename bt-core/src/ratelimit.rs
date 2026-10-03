@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use tokio::time::Instant as TokioInstant;
 
 const MIN_CAPACITY: u64 = 16 * 1024;
 const MAX_WAIT: Duration = Duration::from_secs(60);
@@ -73,6 +76,39 @@ impl UploadBucket {
     }
 }
 
+pub struct RateWindow {
+    window: Duration,
+    samples: VecDeque<(TokioInstant, u64)>,
+}
+
+impl RateWindow {
+    pub fn new(window: Duration) -> RateWindow {
+        RateWindow {
+            window,
+            samples: VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, now: TokioInstant, cumulative_bytes: u64) {
+        self.samples.push_back((now, cumulative_bytes));
+        while let Some((at, _)) = self.samples.front() {
+            if now.duration_since(*at) <= self.window {
+                break;
+            }
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn rate(&self) -> f64 {
+        match (self.samples.front(), self.samples.back()) {
+            (Some((start, start_bytes)), Some((end, end_bytes))) if end > start => {
+                (*end_bytes - *start_bytes) as f64 / (*end - *start).as_secs_f64()
+            }
+            _ => 0.0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,6 +143,52 @@ mod tests {
             "350 KiB at 100 KiB/s with a 100 KiB burst must wait, took {elapsed:?}"
         );
         assert!(elapsed < Duration::from_secs(10), "took {elapsed:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_window_is_zero_without_two_spaced_samples() {
+        let mut window = RateWindow::new(Duration::from_secs(6));
+        assert_eq!(window.rate(), 0.0);
+        window.push(TokioInstant::now(), 100);
+        assert_eq!(window.rate(), 0.0);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        window.push(TokioInstant::now(), 100);
+        assert_eq!(window.rate(), 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_window_computes_bytes_per_second() {
+        let mut window = RateWindow::new(Duration::from_secs(6));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        window.push(TokioInstant::now(), 16_384);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        window.push(TokioInstant::now(), 49_152);
+        assert_eq!(window.rate(), 16_384.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_window_expires_old_samples() {
+        let mut window = RateWindow::new(Duration::from_secs(6));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        window.push(TokioInstant::now(), 0);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        window.push(TokioInstant::now(), 32_768);
+        assert_eq!(window.rate(), 0.0);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        window.push(TokioInstant::now(), 65_536);
+        assert_eq!(window.rate(), 32_768.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_window_counts_burst_within_span() {
+        let mut window = RateWindow::new(Duration::from_secs(6));
+        tokio::time::advance(Duration::from_secs(2)).await;
+        window.push(TokioInstant::now(), 1_000);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        window.push(TokioInstant::now(), 1_000);
+        window.push(TokioInstant::now(), 2_000);
+        window.push(TokioInstant::now(), 3_000);
+        assert_eq!(window.rate(), 2_000.0);
     }
 
     #[tokio::test]
