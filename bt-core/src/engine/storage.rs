@@ -85,6 +85,10 @@ impl Storage {
     fn spans(&self, index: usize) -> Vec<(usize, u64, usize)> {
         let start = index as u64 * self.piece_length as u64;
         let end = start + self.piece_size(index) as u64;
+        self.spans_range(start, end)
+    }
+
+    fn spans_range(&self, start: u64, end: u64) -> Vec<(usize, u64, usize)> {
         let mut result = Vec::new();
         for (slot_index, slot) in self.slots.iter().enumerate() {
             let overlap_start = start.max(slot.offset);
@@ -98,6 +102,43 @@ impl Storage {
             }
         }
         result
+    }
+
+    #[allow(dead_code)]
+    pub fn read_block(
+        &self,
+        index: usize,
+        begin: usize,
+        length: usize,
+    ) -> Result<Vec<u8>, StorageError> {
+        let piece_start = (index as u64)
+            .checked_mul(self.piece_length as u64)
+            .ok_or(StorageError::PieceOutOfRange(index))?;
+        if length == 0 || piece_start >= self.total_length {
+            return Err(StorageError::PieceOutOfRange(index));
+        }
+        let piece_size = (self.total_length - piece_start).min(self.piece_length as u64) as usize;
+        if begin >= piece_size || length > piece_size - begin {
+            return Err(StorageError::PieceOutOfRange(index));
+        }
+        let mut buffer = vec![0u8; length];
+        let mut cursor = 0usize;
+        let start = piece_start + begin as u64;
+        for (slot_index, file_offset, span_length) in self.spans_range(start, start + length as u64)
+        {
+            let slot = &self.slots[slot_index];
+            let mut guard = lock_file(&slot.file);
+            guard.seek(SeekFrom::Start(file_offset))?;
+            let mut filled = 0usize;
+            while filled < span_length {
+                match guard.read(&mut buffer[cursor + filled..cursor + span_length])? {
+                    0 => break,
+                    read => filled += read,
+                }
+            }
+            cursor += span_length;
+        }
+        Ok(buffer)
     }
 
     pub fn read_piece(&self, index: usize, buf: &mut [u8]) -> Result<(), StorageError> {
@@ -272,6 +313,27 @@ mod tests {
         let mut buffer = [0u8; 4];
         storage.read_piece(1, &mut buffer).unwrap();
         assert_eq!(buffer, [5, 6, 7, 8]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reads_blocks_across_file_boundaries() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("readblock");
+        let storage = Storage::create(&meta, &dir).unwrap();
+        storage.write_piece(0, &[1, 2, 3, 4]).unwrap();
+        storage.write_piece(1, &[5, 6, 7, 8]).unwrap();
+        storage.write_piece(2, &[9, 10, 11, 12]).unwrap();
+        assert_eq!(storage.read_block(0, 1, 3).unwrap(), [2, 3, 4]);
+        assert_eq!(storage.read_block(1, 0, 3).unwrap(), [5, 6, 7]);
+        assert_eq!(storage.read_block(1, 2, 2).unwrap(), [7, 8]);
+        assert_eq!(storage.read_block(2, 0, 4).unwrap(), [9, 10, 11, 12]);
+        for (index, begin, length) in [(2, 0, 5), (3, 0, 1), (0, 0, 0), (0, 4, 1)] {
+            assert!(matches!(
+                storage.read_block(index, begin, length),
+                Err(StorageError::PieceOutOfRange(_))
+            ));
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
