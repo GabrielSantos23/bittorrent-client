@@ -1,0 +1,17 @@
+[package]
+name = "bt-app"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+bt-core = { path = "../bt-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+ts-rs = { workspace = true }
+tokio = { workspace = true }

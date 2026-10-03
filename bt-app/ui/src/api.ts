@@ -1,0 +1,53 @@
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { Settings } from "../../bindings/Settings";
+import type { TorrentDetail } from "../../../bt-core/bindings/TorrentDetail";
+import type { TorrentSummary } from "../../../bt-core/bindings/TorrentSummary";
+
+export const api = {
+  list: () => invoke<TorrentSummary[]>("list_torrents"),
+  add: (path: string) => invoke<string>("add_torrent", { path }),
+  pause: (id: string) => invoke<void>("pause_torrent", { id }),
+  resume: (id: string) => invoke<void>("resume_torrent", { id }),
+  remove: (id: string, deleteFiles: boolean) =>
+    invoke<void>("remove_torrent", { id, deleteFiles }),
+  select: (id: string | null) => invoke<void>("select_torrent", { id }),
+  getSettings: () => invoke<Settings>("get_settings"),
+  setSettings: (downloadDir: string) =>
+    invoke<void>("set_settings", { downloadDir }),
+  openOutputDir: (id: string) => invoke<void>("open_output_dir", { id }),
+  onSummaries: (handler: (summaries: TorrentSummary[]) => void) =>
+    listen<TorrentSummary[]>("session://summaries", (event) =>
+      handler(event.payload),
+    ),
+  onDetail: (handler: (detail: TorrentDetail | null) => void) =>
+    listen<TorrentDetail | null>("torrent://detail", (event) =>
+      handler(event.payload),
+    ),
+  pickTorrent: () =>
+    open({
+      multiple: false,
+      filters: [{ name: "Torrent", extensions: ["torrent"] }],
+    }),
+  pickDirectory: () => open({ directory: true }),
+  onDragEnter: (handler: (paths: string[]) => void) =>
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "enter") {
+        handler(event.payload.paths);
+      }
+    }),
+  onDragLeave: (handler: () => void) =>
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "leave") {
+        handler();
+      }
+    }),
+  onTorrentDrop: (handler: (paths: string[]) => void) =>
+    getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "drop") {
+        handler(event.payload.paths);
+      }
+    }),
+};

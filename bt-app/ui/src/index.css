@@ -1,0 +1,30 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 14 17 22;
+  --surface: 22 27 34;
+  --border: 42 49 60;
+  --text: 230 232 235;
+  --muted: 139 148 158;
+  --accent: 63 185 80;
+  --accent2: 88 166 255;
+  --danger: 248 81 73;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: rgb(var(--bg));
+  color: rgb(var(--text));
+  font-family:
+    system-ui,
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+}

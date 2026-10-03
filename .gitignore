@@ -1,0 +1,4 @@
+target/
+node_modules/
+bt-app/ui/dist/
+gen/

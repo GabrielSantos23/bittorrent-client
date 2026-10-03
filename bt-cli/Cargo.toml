@@ -1,0 +1,8 @@
+[package]
+name = "bt-cli"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bt-core = { path = "../bt-core" }
+tokio = { workspace = true }
