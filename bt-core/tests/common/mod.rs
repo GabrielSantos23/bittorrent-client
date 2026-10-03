@@ -225,11 +225,9 @@ async fn run_leecher(
         ..PeerConfig::default()
     };
     let mut conn = PeerConnection::new(raw, remote, piece_count, config_for_conn);
-    if config.send_interested {
-        if conn.write_message(&Message::Interested).await.is_err() {
-            report.closed = true;
-            return report;
-        }
+    if config.send_interested && conn.write_message(&Message::Interested).await.is_err() {
+        report.closed = true;
+        return report;
     }
     let mut requested = false;
     let mut expected: Option<usize> = None;

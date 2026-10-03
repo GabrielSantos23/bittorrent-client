@@ -2,29 +2,50 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
-  --bg: 14 17 22;
-  --surface: 22 27 34;
-  --border: 42 49 60;
-  --text: 230 232 235;
-  --muted: 139 148 158;
-  --accent: 63 185 80;
-  --accent2: 88 166 255;
-  --danger: 248 81 73;
+@layer base {
+  :root {
+    --background: 14 17 22;
+    --foreground: 230 232 235;
+    --card: 22 27 34;
+    --card-foreground: 230 232 235;
+    --popover: 22 27 34;
+    --popover-foreground: 230 232 235;
+    --primary: 63 185 80;
+    --primary-foreground: 14 17 22;
+    --secondary: 30 36 45;
+    --secondary-foreground: 230 232 235;
+    --muted: 30 36 45;
+    --muted-foreground: 139 148 158;
+    --accent: 30 36 45;
+    --accent-foreground: 230 232 235;
+    --destructive: 248 81 73;
+    --destructive-foreground: 255 255 255;
+    --info: 88 166 255;
+    --border: 42 49 60;
+    --input: 42 49 60;
+    --ring: 88 166 255;
+    --radius: 0.375rem;
+  }
 }
 
-html,
-body,
-#root {
-  height: 100%;
-}
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
 
-body {
-  background-color: rgb(var(--bg));
-  color: rgb(var(--text));
-  font-family:
-    system-ui,
-    -apple-system,
-    "Segoe UI",
-    sans-serif;
+  body {
+    background-color: rgb(var(--background));
+    color: rgb(var(--foreground));
+    font-family:
+      system-ui,
+      -apple-system,
+      "Segoe UI",
+      sans-serif;
+  }
+
+  * {
+    border-color: rgb(var(--border));
+  }
 }

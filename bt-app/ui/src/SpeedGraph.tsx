@@ -4,7 +4,7 @@ interface SpeedGraphProps {
   height?: number;
 }
 
-export default function SpeedGraph({ history, width = 260, height = 44 }: SpeedGraphProps) {
+export function SpeedGraph({ history, width = 260, height = 44 }: SpeedGraphProps) {
   const max = Math.max(...history, 1);
   const points = history.map((value, index) => {
     const x = (index / Math.max(history.length - 1, 1)) * width;
@@ -18,17 +18,17 @@ export default function SpeedGraph({ history, width = 260, height = 44 }: SpeedG
       width={width}
       height={height}
       viewBox={`0 0 ${width} ${height}`}
-      className="border border-border bg-surface"
+      className="rounded-md border border-border bg-card"
       role="img"
       aria-label={`Download speed history, current ${max} bytes per second peak`}
     >
-      <polygon points={area} className="fill-accent/10" />
+      <polygon points={area} className="fill-primary/10" />
       <polyline
         points={line}
         fill="none"
         strokeWidth="1.5"
         strokeLinejoin="round"
-        className="stroke-accent"
+        className="stroke-primary"
       />
     </svg>
   );

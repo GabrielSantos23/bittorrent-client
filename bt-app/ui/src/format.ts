@@ -23,11 +23,16 @@ export function formatEta(seconds: number | null): string {
   return `${hours}h ${minutes % 60}m`;
 }
 
+export function formatRatio(ratio: number): string {
+  return `${ratio.toFixed(2)}×`;
+}
+
 export const stateColor: Record<string, string> = {
-  Checking: "text-accent2",
-  Downloading: "text-accent",
-  Paused: "text-muted",
-  Completed: "text-accent",
-  Stopped: "text-muted",
-  Error: "text-danger",
+  Checking: "text-info",
+  Downloading: "text-primary",
+  Paused: "text-muted-foreground",
+  Completed: "text-primary",
+  Stopped: "text-muted-foreground",
+  Error: "text-destructive",
+  Seeding: "text-info",
 };

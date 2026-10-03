@@ -1,36 +1,16 @@
-import { formatBytes, formatEta, formatRate, stateColor } from "./format";
+import { formatBytes, formatEta, formatRate, formatRatio, stateColor } from "./format";
+import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Button } from "@/components/ui/button";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import type { TorrentSummary } from "../../../bt-core/bindings/TorrentSummary";
-
-interface ProgressBarProps {
-  progress: number;
-  label: string;
-}
-
-function ProgressBar({ progress, label }: ProgressBarProps) {
-  const percent = Math.min(Math.max(progress * 100, 0), 100);
-  return (
-    <svg
-      width="110"
-      height="8"
-      viewBox="0 0 110 8"
-      role="progressbar"
-      aria-valuenow={Math.round(percent)}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      aria-label={label}
-    >
-      <rect x="0" y="0" width="110" height="8" rx="2" className="fill-border" />
-      <rect
-        x="1"
-        y="1"
-        width={Math.max((108 * percent) / 100, percent > 0 ? 2 : 0)}
-        height="6"
-        rx="1.5"
-        className="fill-accent"
-      />
-    </svg>
-  );
-}
 
 interface TorrentTableProps {
   summaries: TorrentSummary[];
@@ -40,6 +20,19 @@ interface TorrentTableProps {
   onRemove: (summary: TorrentSummary) => void;
 }
 
+const badgeVariantByState: Record<
+  string,
+  "default" | "secondary" | "destructive" | "info" | "success"
+> = {
+  Checking: "info",
+  Downloading: "success",
+  Seeding: "info",
+  Completed: "success",
+  Paused: "secondary",
+  Stopped: "secondary",
+  Error: "destructive",
+};
+
 export default function TorrentTable({
   summaries,
   selectedId,
@@ -48,113 +41,126 @@ export default function TorrentTable({
   onRemove,
 }: TorrentTableProps) {
   return (
-    <table className="w-full text-left text-sm">
-      <thead>
-        <tr className="border-b border-border text-muted">
-          <th className="px-3 py-2 font-medium">Name</th>
-          <th className="px-3 py-2 font-medium">Size</th>
-          <th className="px-3 py-2 font-medium">Progress</th>
-          <th className="px-3 py-2 font-medium">State</th>
-          <th className="px-3 py-2 font-medium">Rate</th>
-          <th className="px-3 py-2 font-medium">ETA</th>
-          <th className="px-3 py-2 font-medium">Peers</th>
-          <th className="px-3 py-2 font-medium">Actions</th>
-        </tr>
-      </thead>
-      <tbody>
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Name</TableHead>
+          <TableHead>Size</TableHead>
+          <TableHead>Progress</TableHead>
+          <TableHead>State</TableHead>
+          <TableHead>Down</TableHead>
+          <TableHead>Up</TableHead>
+          <TableHead>Ratio</TableHead>
+          <TableHead>ETA</TableHead>
+          <TableHead>Peers</TableHead>
+          <TableHead>Actions</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
         {summaries.length === 0 ? (
-          <tr>
-            <td colSpan={8} className="px-3 py-8 text-center text-muted">
+          <TableRow>
+            <TableCell
+              colSpan={10}
+              className="h-24 text-center text-muted-foreground"
+            >
               No torrents yet — use “Add torrent” or drop a .torrent file here.
-            </td>
-          </tr>
+            </TableCell>
+          </TableRow>
         ) : (
           summaries.map((summary) => {
             const pausable =
               summary.state === "Downloading" || summary.state === "Checking";
             const resumable = summary.state === "Paused";
             return (
-              <tr
+              <TableRow
                 key={summary.id}
                 onClick={() => onSelect(summary.id)}
-                className={`cursor-pointer border-b border-border hover:bg-surface/70 ${
-                  selectedId === summary.id ? "bg-surface" : ""
-                }`}
+                data-selected={selectedId === summary.id || undefined}
+                className="cursor-pointer data-[selected]:bg-accent"
               >
-                <td className="max-w-[240px] truncate px-3 py-2" title={summary.name}>
+                <TableCell className="max-w-[240px] truncate" title={summary.name}>
                   {summary.name}
                   {summary.error !== null && (
-                    <span className="ml-2 text-danger" title={summary.error}>
+                    <span className="ml-2 text-destructive" title={summary.error}>
                       ⚠
                     </span>
                   )}
-                </td>
-                <td className="px-3 py-2">{formatBytes(summary.total_length)}</td>
-                <td className="px-3 py-2">
+                </TableCell>
+                <TableCell>{formatBytes(summary.total_length)}</TableCell>
+                <TableCell>
                   <div className="flex items-center gap-2">
-                    <ProgressBar
-                      progress={summary.progress}
-                      label={`${summary.name} progress`}
+                    <Progress
+                      value={Math.min(Math.max(summary.progress * 100, 0), 100)}
+                      aria-label={`${summary.name} progress`}
+                      className="w-28"
                     />
-                    <span className="text-muted">
+                    <span className="text-muted-foreground">
                       {(summary.progress * 100).toFixed(1)}%
                     </span>
                   </div>
-                </td>
-                <td className={`px-3 py-2 ${stateColor[summary.state] ?? ""}`}>
-                  {summary.state}
+                </TableCell>
+                <TableCell>
+                  <Badge
+                    variant={badgeVariantByState[summary.state] ?? "secondary"}
+                    className={stateColor[summary.state] ?? ""}
+                  >
+                    {summary.state}
+                  </Badge>
                   {summary.error !== null && (
-                    <div className="max-w-[220px] truncate text-xs text-danger">
+                    <div className="max-w-[220px] truncate text-xs text-destructive">
                       {summary.error}
                     </div>
                   )}
-                </td>
-                <td className="px-3 py-2">{formatRate(summary.download_rate)}</td>
-                <td className="px-3 py-2">{formatEta(summary.eta_seconds)}</td>
-                <td className="px-3 py-2">{summary.peer_count}</td>
-                <td className="px-3 py-2">
+                </TableCell>
+                <TableCell>{formatRate(summary.download_rate)}</TableCell>
+                <TableCell>{formatRate(summary.upload_rate)}</TableCell>
+                <TableCell>{formatRatio(summary.ratio)}</TableCell>
+                <TableCell>{formatEta(summary.eta_seconds)}</TableCell>
+                <TableCell>{summary.peer_count}</TableCell>
+                <TableCell>
                   <div className="flex gap-2">
                     {pausable && (
-                      <button
-                        type="button"
-                        className="rounded border border-border px-2 py-0.5 hover:bg-surface"
+                      <Button
+                        variant="outline"
+                        size="sm"
                         onClick={(event) => {
                           event.stopPropagation();
                           onPauseResume(summary);
                         }}
                       >
                         Pause
-                      </button>
+                      </Button>
                     )}
                     {resumable && (
-                      <button
-                        type="button"
-                        className="rounded border border-border px-2 py-0.5 hover:bg-surface"
+                      <Button
+                        variant="outline"
+                        size="sm"
                         onClick={(event) => {
                           event.stopPropagation();
                           onPauseResume(summary);
                         }}
                       >
                         Resume
-                      </button>
+                      </Button>
                     )}
-                    <button
-                      type="button"
-                      className="rounded border border-danger px-2 py-0.5 text-danger hover:bg-surface"
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="text-destructive"
                       onClick={(event) => {
                         event.stopPropagation();
                         onRemove(summary);
                       }}
                     >
                       Remove
-                    </button>
+                    </Button>
                   </div>
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             );
           })
         )}
-      </tbody>
-    </table>
+      </TableBody>
+    </Table>
   );
 }

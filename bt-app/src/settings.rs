@@ -12,6 +12,7 @@ pub struct Settings {
     #[serde(default = "default_listen_port")]
     pub listen_port: u16,
     #[serde(default)]
+    #[ts(type = "number")]
     pub upload_limit_bps: u64,
 }
 

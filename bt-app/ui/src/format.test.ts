@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatEta, formatRate } from "./format";
+import { formatBytes, formatEta, formatRate, formatRatio } from "./format";
 
 describe("formatBytes", () => {
   it("formats zero and small values in bytes", () => {
@@ -54,5 +54,13 @@ describe("formatEta", () => {
   it("formats hours and drops seconds", () => {
     expect(formatEta(3600)).toBe("1h 0m");
     expect(formatEta(7325)).toBe("2h 2m");
+  });
+});
+
+describe("formatRatio", () => {
+  it("formats the share ratio with two decimals", () => {
+    expect(formatRatio(0)).toBe("0.00×");
+    expect(formatRatio(0.5)).toBe("0.50×");
+    expect(formatRatio(12.345)).toBe("12.35×");
   });
 });

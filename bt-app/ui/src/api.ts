@@ -5,6 +5,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { Settings } from "../../bindings/Settings";
 import type { TorrentDetail } from "../../../bt-core/bindings/TorrentDetail";
 import type { TorrentSummary } from "../../../bt-core/bindings/TorrentSummary";
+import type { ListenerStatus } from "../../../bt-core/bindings/ListenerStatus";
 
 export const api = {
   list: () => invoke<TorrentSummary[]>("list_torrents"),
@@ -15,8 +16,11 @@ export const api = {
     invoke<void>("remove_torrent", { id, deleteFiles }),
   select: (id: string | null) => invoke<void>("select_torrent", { id }),
   getSettings: () => invoke<Settings>("get_settings"),
-  setSettings: (downloadDir: string) =>
-    invoke<void>("set_settings", { downloadDir }),
+  setSettings: (settings: {
+    downloadDir: string;
+    listenPort: number;
+    uploadLimitBps: number;
+  }) => invoke<void>("set_settings", settings),
   openOutputDir: (id: string) => invoke<void>("open_output_dir", { id }),
   onSummaries: (handler: (summaries: TorrentSummary[]) => void) =>
     listen<TorrentSummary[]>("session://summaries", (event) =>
@@ -24,6 +28,10 @@ export const api = {
     ),
   onDetail: (handler: (detail: TorrentDetail | null) => void) =>
     listen<TorrentDetail | null>("torrent://detail", (event) =>
+      handler(event.payload),
+    ),
+  onListener: (handler: (status: ListenerStatus) => void) =>
+    listen<ListenerStatus>("session://listener", (event) =>
       handler(event.payload),
     ),
   pickTorrent: () =>
