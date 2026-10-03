@@ -14,6 +14,10 @@ fn addr(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
 }
 
+fn lan_peer(port: u16) -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, 1], port))
+}
+
 fn str_field(value: &str) -> Value {
     Value::Bytes(value.as_bytes().to_vec())
 }
@@ -78,14 +82,14 @@ async fn merges_and_dedupes_peers_from_two_trackers_in_one_tier() {
         1,
         3,
         0,
-        &[addr(9301), addr(9302)],
+        &[lan_peer(9301), lan_peer(9302)],
     ))
     .await;
     let (tracker_b, _) = common::spawn_fake_http_tracker(common::FakeTrackerResponse::ok(
         1,
         3,
         0,
-        &[addr(9302), addr(9303)],
+        &[lan_peer(9302), lan_peer(9303)],
     ))
     .await;
     let url_a = format!("http://{}/announce", tracker_a.addr);
@@ -97,9 +101,9 @@ async fn merges_and_dedupes_peers_from_two_trackers_in_one_tier() {
         data.clone(),
         meta.info.pieces.len(),
         vec![
-            (addr(9301), SeederKind::Good),
-            (addr(9302), SeederKind::Good),
-            (addr(9303), SeederKind::Good),
+            (lan_peer(9301), SeederKind::Good),
+            (lan_peer(9302), SeederKind::Good),
+            (lan_peer(9303), SeederKind::Good),
         ],
     ));
     let dir = temp_dir("tracker-merge");
@@ -117,9 +121,9 @@ async fn merges_and_dedupes_peers_from_two_trackers_in_one_tier() {
     .unwrap();
     wait_completed(&torrent, 30).await;
 
-    assert_eq!(dial.dial_count(&addr(9301)), 1);
-    assert_eq!(dial.dial_count(&addr(9302)), 1);
-    assert_eq!(dial.dial_count(&addr(9303)), 1);
+    assert_eq!(dial.dial_count(&lan_peer(9301)), 1);
+    assert_eq!(dial.dial_count(&lan_peer(9302)), 1);
+    assert_eq!(dial.dial_count(&lan_peer(9303)), 1);
 
     let mut stats = torrent.subscribe();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -154,9 +158,13 @@ async fn failing_tracker_does_not_block_the_others() {
     let (tracker_a, _) =
         common::spawn_fake_http_tracker(common::FakeTrackerResponse::failure("no such torrent"))
             .await;
-    let (tracker_b, _) =
-        common::spawn_fake_http_tracker(common::FakeTrackerResponse::ok(1, 1, 0, &[addr(9401)]))
-            .await;
+    let (tracker_b, _) = common::spawn_fake_http_tracker(common::FakeTrackerResponse::ok(
+        1,
+        1,
+        0,
+        &[lan_peer(9401)],
+    ))
+    .await;
     let url_a = format!("http://{}/announce", tracker_a.addr);
     let url_b = format!("http://{}/announce", tracker_b.addr);
     let (meta, data) = torrent_with_trackers(vec![vec![url_a.clone(), url_b.clone()]]);
@@ -165,7 +173,7 @@ async fn failing_tracker_does_not_block_the_others() {
         meta.info_hash,
         data.clone(),
         meta.info.pieces.len(),
-        vec![(addr(9401), SeederKind::Good)],
+        vec![(lan_peer(9401), SeederKind::Good)],
     ));
     let dir = temp_dir("tracker-fail");
     let torrent = Torrent::spawn_with_options(
