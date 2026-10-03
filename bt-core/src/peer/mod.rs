@@ -4,6 +4,6 @@ pub mod handshake;
 pub mod message;
 
 pub use bitfield::Bitfield;
-pub use connection::{connect, PeerConfig, PeerConnection};
+pub use connection::{connect, PeerConfig, PeerConnection, PeerReadHalf, PeerWriteHalf};
 pub use handshake::Handshake;
 pub use message::Message;

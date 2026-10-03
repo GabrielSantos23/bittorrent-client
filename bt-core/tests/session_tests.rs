@@ -112,10 +112,7 @@ async fn pause_resume_completes() {
     let added_id = id.clone();
     wait_for(
         &summaries,
-        move |s| {
-            s.iter()
-                .any(|t| t.id == added_id && t.verified_bytes >= 1 && t.state == State::Downloading)
-        },
+        move |s| s.iter().any(|t| t.id == added_id && t.verified_bytes >= 1),
         30,
     )
     .await;

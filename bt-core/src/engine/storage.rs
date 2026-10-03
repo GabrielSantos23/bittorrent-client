@@ -104,7 +104,6 @@ impl Storage {
         result
     }
 
-    #[allow(dead_code)]
     pub fn read_block(
         &self,
         index: usize,

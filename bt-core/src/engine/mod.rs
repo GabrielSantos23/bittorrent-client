@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -11,13 +11,15 @@ use tokio::task::spawn_blocking;
 use tokio::time::{sleep_until, Instant as TokioInstant, MissedTickBehavior};
 
 use crate::error::{EngineError, StorageError};
+use crate::listener::{Incoming, Registry};
 use crate::metainfo::MetaInfo;
 use crate::peer::{Bitfield, PeerConfig};
 use crate::peer_id;
+use crate::ratelimit::UploadBucket;
 use crate::tracker::{self, AnnounceRequest, Event};
 
 use self::assembly::{BlockOutcome, PieceAssembler};
-use self::peer_task::{PeerCommand, PeerEvent};
+use self::peer_task::{HaveMap, PeerCommand, PeerEvent};
 use self::picker::PiecePicker;
 use self::storage::Storage;
 
@@ -31,6 +33,7 @@ pub use storage::delete_torrent_files;
 
 pub const BLOCK_SIZE: usize = assembly::BLOCK_SIZE;
 const MAX_PEERS: usize = 50;
+const MAX_PEERS_PER_IP: usize = 8;
 const REFILL_LIMIT: usize = 8;
 const RANDOM_FIRST: usize = 4;
 const MAX_ACTIVE_PIECES: usize = 25;
@@ -41,8 +44,9 @@ const CONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_INTERVAL: Duration = Duration::from_secs(1);
 const BAN_STRIKES: u32 = 3;
-const DEFAULT_PORT: u16 = 6881;
+const DEFAULT_ANNOUNCE_PORT: u16 = 6881;
 const NUMWANT: u32 = 50;
+const CHOKE_SLOTS: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[ts(export)]
@@ -53,6 +57,14 @@ pub enum State {
     Completed,
     Stopped,
     Error,
+    Seeding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub enum PeerDirection {
+    Incoming,
+    Outgoing,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
@@ -61,7 +73,10 @@ pub struct PeerStats {
     pub addr: SocketAddr,
     pub client: String,
     pub rate: f64,
+    pub up_rate: f64,
     pub choked: bool,
+    pub unchoked: bool,
+    pub direction: PeerDirection,
 }
 
 #[derive(Debug, Clone)]
@@ -72,10 +87,14 @@ pub struct Stats {
     pub verified_bytes: u64,
     pub session_downloaded: u64,
     pub session_uploaded: u64,
+    pub upload_rate: f64,
+    pub ratio: f64,
     pub verified_pieces: usize,
     pub piece_count: usize,
     pub download_rate: f64,
     pub peer_count: usize,
+    pub incoming_peers: usize,
+    pub outgoing_peers: usize,
     pub peers: Vec<PeerStats>,
     pub error: Option<String>,
 }
@@ -88,6 +107,33 @@ pub enum EngineCommand {
     Stop,
 }
 
+#[derive(Clone)]
+pub struct TorrentOptions {
+    pub bootstrap_peers: Vec<SocketAddr>,
+    pub dial: Arc<dyn Dial>,
+    pub listen_active: bool,
+    pub announce_port: u16,
+    pub uploads: Arc<UploadBucket>,
+    pub registry: Arc<Registry>,
+    pub choke_interval: Duration,
+    pub optimistic_interval: Duration,
+}
+
+impl Default for TorrentOptions {
+    fn default() -> Self {
+        TorrentOptions {
+            bootstrap_peers: Vec::new(),
+            dial: Arc::new(TcpDial::new(PeerConfig::default().connect_timeout)),
+            listen_active: false,
+            announce_port: DEFAULT_ANNOUNCE_PORT,
+            uploads: Arc::new(UploadBucket::new(0)),
+            registry: Arc::new(Registry::default()),
+            choke_interval: Duration::from_secs(10),
+            optimistic_interval: Duration::from_secs(30),
+        }
+    }
+}
+
 pub struct Torrent {
     commands: mpsc::Sender<EngineCommand>,
     stats: watch::Receiver<Stats>,
@@ -95,14 +141,7 @@ pub struct Torrent {
 
 impl Torrent {
     pub async fn spawn(meta: MetaInfo, output_dir: PathBuf) -> Result<Torrent, EngineError> {
-        let connect_timeout = PeerConfig::default().connect_timeout;
-        Torrent::spawn_with_dial(
-            meta,
-            output_dir,
-            Vec::new(),
-            Arc::new(TcpDial::new(connect_timeout)),
-        )
-        .await
+        Torrent::spawn_with_options(meta, output_dir, TorrentOptions::default()).await
     }
 
     pub async fn spawn_with_dial(
@@ -111,11 +150,24 @@ impl Torrent {
         bootstrap_peers: Vec<SocketAddr>,
         dial: Arc<dyn Dial>,
     ) -> Result<Torrent, EngineError> {
+        let options = TorrentOptions {
+            bootstrap_peers,
+            dial,
+            ..TorrentOptions::default()
+        };
+        Torrent::spawn_with_options(meta, output_dir, options).await
+    }
+
+    pub async fn spawn_with_options(
+        meta: MetaInfo,
+        output_dir: PathBuf,
+        options: TorrentOptions,
+    ) -> Result<Torrent, EngineError> {
         let meta = Arc::new(meta);
+        let output_dir_clone = output_dir.clone();
         let storage = spawn_blocking({
             let meta = meta.clone();
-            let output_dir = output_dir.clone();
-            move || Storage::create(&meta, &output_dir)
+            move || Storage::create(&meta, &output_dir_clone)
         })
         .await
         .map_err(|_| EngineError::Task)??;
@@ -123,6 +175,7 @@ impl Torrent {
         let http = tracker::http_client()?;
         let (commands, command_rx) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(1024);
+        let (incoming_tx, incoming_rx) = mpsc::channel(8);
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         let name = meta.info.name.clone();
@@ -133,23 +186,28 @@ impl Torrent {
             verified_bytes: 0,
             session_downloaded: 0,
             session_uploaded: 0,
+            upload_rate: 0.0,
+            ratio: 0.0,
             verified_pieces: 0,
             piece_count,
             download_rate: 0.0,
             peer_count: 0,
+            incoming_peers: 0,
+            outgoing_peers: 0,
             peers: Vec::new(),
             error: None,
         });
+        options.registry.register(meta.info_hash, incoming_tx);
         let engine = Engine::new(
             meta,
             storage,
-            bootstrap_peers,
-            dial,
             http,
+            options,
             stats_tx,
             command_rx,
             events_tx,
             events,
+            incoming_rx,
         );
         tokio::spawn(engine.run());
         Ok(Torrent {
@@ -188,12 +246,20 @@ impl Torrent {
 
 struct PeerHandle {
     client: String,
+    peer_id: [u8; 20],
     commands: mpsc::Sender<PeerCommand>,
     bitfield: Option<Bitfield>,
     choked: bool,
+    interested: bool,
+    we_unchoked: bool,
+    direction: PeerDirection,
     in_flight: usize,
     received_bytes: u64,
+    uploaded_bytes: u64,
     rate_base: u64,
+    upload_rate_base: u64,
+    window_down: u64,
+    window_up: u64,
 }
 
 struct Engine {
@@ -205,7 +271,17 @@ struct Engine {
     commands: mpsc::Receiver<EngineCommand>,
     events_tx: mpsc::Sender<PeerEvent>,
     events: mpsc::Receiver<PeerEvent>,
+    incoming_rx: mpsc::Receiver<Incoming>,
+    registry: Arc<Registry>,
+    uploads: Arc<UploadBucket>,
+    have_map: HaveMap,
     state: State,
+    listen_active: bool,
+    announce_port: u16,
+    choke_interval: Duration,
+    optimistic_interval: Duration,
+    optimistic_peer: Option<SocketAddr>,
+    optimistic_cursor: usize,
     total_length: u64,
     picker: PiecePicker,
     assembler: PieceAssembler,
@@ -220,7 +296,7 @@ struct Engine {
     session_uploaded: u64,
     verified_bytes: u64,
     error: Option<String>,
-    last_rate: (TokioInstant, u64),
+    last_rate: (TokioInstant, u64, u64),
     announce_at: Option<TokioInstant>,
     announce_event: Option<Event>,
     pending_pause: bool,
@@ -231,22 +307,33 @@ impl Engine {
     fn new(
         meta: Arc<MetaInfo>,
         storage: Arc<Storage>,
-        bootstrap_peers: Vec<SocketAddr>,
-        dial: Arc<dyn Dial>,
         http: reqwest::Client,
+        options: TorrentOptions,
         stats_tx: watch::Sender<Stats>,
         commands: mpsc::Receiver<EngineCommand>,
         events_tx: mpsc::Sender<PeerEvent>,
         events: mpsc::Receiver<PeerEvent>,
+        incoming_rx: mpsc::Receiver<Incoming>,
     ) -> Engine {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         let mut queue = VecDeque::new();
         let mut known = HashSet::new();
-        for addr in bootstrap_peers {
-            known.insert(addr);
-            queue.push_back(addr);
+        for addr in &options.bootstrap_peers {
+            known.insert(*addr);
+            queue.push_back(*addr);
         }
+        let have_map: HaveMap = Arc::new(RwLock::new(Bitfield::new(piece_count)));
+        let TorrentOptions {
+            dial,
+            listen_active,
+            announce_port,
+            uploads,
+            registry,
+            choke_interval,
+            optimistic_interval,
+            ..
+        } = options;
         Engine {
             picker: PiecePicker::new(
                 piece_count,
@@ -264,7 +351,17 @@ impl Engine {
             commands,
             events_tx,
             events,
+            incoming_rx,
+            registry,
+            uploads,
+            have_map,
             state: State::Checking,
+            listen_active,
+            announce_port,
+            choke_interval,
+            optimistic_interval,
+            optimistic_peer: None,
+            optimistic_cursor: 0,
             total_length,
             peers: HashMap::new(),
             queue,
@@ -277,7 +374,7 @@ impl Engine {
             session_uploaded: 0,
             verified_bytes: 0,
             error: None,
-            last_rate: (TokioInstant::now(), 0),
+            last_rate: (TokioInstant::now(), 0, 0),
             announce_at: None,
             announce_event: None,
             pending_pause: false,
@@ -288,7 +385,15 @@ impl Engine {
         let mut stats_tick = tokio::time::interval(STATS_INTERVAL);
         let mut reap_tick = tokio::time::interval(REAP_INTERVAL);
         let mut connect_tick = tokio::time::interval(CONNECT_INTERVAL);
-        for tick in [&mut stats_tick, &mut reap_tick, &mut connect_tick] {
+        let mut choke_tick = tokio::time::interval(self.choke_interval);
+        let mut optimistic_tick = tokio::time::interval(self.optimistic_interval);
+        for tick in [
+            &mut stats_tick,
+            &mut reap_tick,
+            &mut connect_tick,
+            &mut choke_tick,
+            &mut optimistic_tick,
+        ] {
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
         self.run_check().await;
@@ -303,18 +408,26 @@ impl Engine {
             tokio::select! {
                 command = self.commands.recv() => match command {
                     Some(command) => self.handle_command(command).await,
-                    None => return,
+                    None => break,
                 },
                 event = self.events.recv() => match event {
                     Some(event) => self.handle_event(event).await,
-                    None => return,
+                    None => break,
+                },
+                incoming = self.incoming_rx.recv() => {
+                    if let Some(incoming) = incoming {
+                        self.accept_incoming(incoming);
+                    }
                 },
                 _ = announce_tick => self.run_announce().await,
                 _ = reap_tick.tick() => self.reap_stale_requests().await,
                 _ = stats_tick.tick() => self.tick_stats(),
                 _ = connect_tick.tick() => self.try_connect(),
+                _ = choke_tick.tick() => self.apply_choke(false),
+                _ = optimistic_tick.tick() => self.apply_choke(true),
             }
         }
+        self.registry.unregister(&self.meta.info_hash);
     }
 
     async fn handle_command(&mut self, command: EngineCommand) {
@@ -344,6 +457,10 @@ impl Engine {
         .await;
         match have {
             Ok(have) => {
+                *self
+                    .have_map
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = have.clone();
                 self.picker.set_have(&have);
                 let mut verified = 0u64;
                 for index in 0..self.meta.info.pieces.len() {
@@ -354,7 +471,7 @@ impl Engine {
                 self.verified_bytes = verified;
                 self.error = None;
                 if self.picker.is_complete() {
-                    self.state = State::Completed;
+                    self.state = self.completed_state();
                     self.announce_event = Some(Event::Completed);
                     self.announce_at = Some(TokioInstant::now() + Duration::from_secs(1));
                 } else {
@@ -377,10 +494,18 @@ impl Engine {
         self.publish();
     }
 
+    fn completed_state(&self) -> State {
+        if self.listen_active {
+            State::Seeding
+        } else {
+            State::Completed
+        }
+    }
+
     async fn pause(&mut self) {
         match self.state {
             State::Checking => self.pending_pause = true,
-            State::Downloading | State::Completed => {
+            State::Downloading | State::Completed | State::Seeding => {
                 self.disconnect_all().await;
                 self.backoff.clear();
                 self.announce_at = None;
@@ -394,7 +519,7 @@ impl Engine {
     fn resume(&mut self) {
         if self.state == State::Paused {
             self.state = if self.picker.is_complete() {
-                State::Completed
+                self.completed_state()
             } else {
                 State::Downloading
             };
@@ -410,8 +535,8 @@ impl Engine {
         let request = AnnounceRequest {
             info_hash: self.meta.info_hash,
             peer_id: *peer_id::session(),
-            port: DEFAULT_PORT,
-            uploaded: 0,
+            port: self.announce_port,
+            uploaded: self.session_uploaded,
             downloaded: self.session_downloaded,
             left: self.total_length - self.verified_bytes,
             numwant: 0,
@@ -423,7 +548,10 @@ impl Engine {
     }
 
     async fn run_announce(&mut self) {
-        if !matches!(self.state, State::Downloading | State::Completed) {
+        if !matches!(
+            self.state,
+            State::Downloading | State::Completed | State::Seeding
+        ) {
             self.announce_at = None;
             return;
         }
@@ -431,8 +559,8 @@ impl Engine {
         let request = AnnounceRequest {
             info_hash: self.meta.info_hash,
             peer_id: *peer_id::session(),
-            port: DEFAULT_PORT,
-            uploaded: 0,
+            port: self.announce_port,
+            uploaded: self.session_uploaded,
             downloaded: self.session_downloaded,
             left: self.total_length - self.verified_bytes,
             numwant: NUMWANT,
@@ -509,23 +637,89 @@ impl Engine {
             addr,
             PeerHandle {
                 client: String::new(),
+                peer_id: [0; 20],
                 commands,
                 bitfield: None,
                 choked: true,
+                interested: false,
+                we_unchoked: false,
+                direction: PeerDirection::Outgoing,
                 in_flight: 0,
                 received_bytes: 0,
+                uploaded_bytes: 0,
                 rate_base: 0,
+                upload_rate_base: 0,
+                window_down: 0,
+                window_up: 0,
             },
         );
+        let task = peer_task::PeerTask {
+            addr,
+            info_hash: self.meta.info_hash,
+            our_peer_id: *peer_id::session(),
+            piece_count: self.meta.info.pieces.len(),
+            piece_length: self.meta.info.piece_length,
+            total_length: self.total_length,
+            config: PeerConfig::default(),
+            dial: self.dial.clone(),
+            have: self.have_map.clone(),
+            storage: self.storage.clone(),
+            uploads: self.uploads.clone(),
+        };
         tokio::spawn(peer_task::run_peer_task(
-            peer_task::PeerTask {
-                addr,
-                info_hash: self.meta.info_hash,
-                our_peer_id: *peer_id::session(),
-                piece_count: self.meta.info.pieces.len(),
-                config: PeerConfig::default(),
-                dial: self.dial.clone(),
+            task,
+            command_rx,
+            self.events_tx.clone(),
+        ));
+    }
+
+    fn accept_incoming(&mut self, incoming: Incoming) {
+        let addr = incoming.addr;
+        if self.banned.contains(&addr)
+            || self.peers.contains_key(&addr)
+            || self.peers.len() >= MAX_PEERS
+        {
+            return;
+        }
+        let ip = addr.ip();
+        if self.peers.keys().filter(|a| a.ip() == ip).count() >= MAX_PEERS_PER_IP {
+            return;
+        }
+        let (commands, command_rx) = mpsc::channel(64);
+        self.peers.insert(
+            addr,
+            PeerHandle {
+                client: String::new(),
+                peer_id: [0; 20],
+                commands,
+                bitfield: None,
+                choked: true,
+                interested: false,
+                we_unchoked: false,
+                direction: PeerDirection::Incoming,
+                in_flight: 0,
+                received_bytes: 0,
+                uploaded_bytes: 0,
+                rate_base: 0,
+                upload_rate_base: 0,
+                window_down: 0,
+                window_up: 0,
             },
+        );
+        let task = peer_task::IncomingPeer {
+            addr,
+            piece_count: self.meta.info.pieces.len(),
+            piece_length: self.meta.info.piece_length,
+            total_length: self.total_length,
+            config: PeerConfig::default(),
+            remote: incoming.remote,
+            stream: incoming.stream,
+            have: self.have_map.clone(),
+            storage: self.storage.clone(),
+            uploads: self.uploads.clone(),
+        };
+        tokio::spawn(peer_task::run_incoming_peer_task(
+            task,
             command_rx,
             self.events_tx.clone(),
         ));
@@ -534,7 +728,20 @@ impl Engine {
     async fn handle_event(&mut self, event: PeerEvent) {
         match event {
             PeerEvent::Handshaken { addr, peer_id } => {
-                if let Some(handle) = self.peers.get_mut(&addr) {
+                let duplicate = self
+                    .peers
+                    .iter()
+                    .any(|(other, handle)| *other != addr && handle.peer_id == peer_id);
+                let incoming = self
+                    .peers
+                    .get(&addr)
+                    .is_some_and(|handle| handle.direction == PeerDirection::Incoming);
+                if duplicate && incoming {
+                    if let Some(handle) = self.peers.remove(&addr) {
+                        let _ = handle.commands.try_send(PeerCommand::Stop);
+                    }
+                } else if let Some(handle) = self.peers.get_mut(&addr) {
+                    handle.peer_id = peer_id;
                     handle.client = peer_id::client_name(&peer_id);
                 }
                 self.publish();
@@ -570,26 +777,50 @@ impl Engine {
                 }
                 self.refill(addr).await;
             }
+            PeerEvent::Interested { addr } => {
+                if let Some(handle) = self.peers.get_mut(&addr) {
+                    handle.interested = true;
+                }
+                self.publish();
+            }
+            PeerEvent::NotInterested { addr } => {
+                if let Some(handle) = self.peers.get_mut(&addr) {
+                    handle.interested = false;
+                }
+                self.publish();
+            }
             PeerEvent::Block {
                 addr,
                 index,
                 begin,
                 block,
             } => self.handle_block(addr, index, begin, block).await,
+            PeerEvent::Uploaded { addr, bytes } => {
+                self.session_uploaded += bytes;
+                if let Some(handle) = self.peers.get_mut(&addr) {
+                    handle.uploaded_bytes += bytes;
+                    handle.window_up += bytes;
+                }
+                self.publish();
+            }
             PeerEvent::Disconnected { addr } => {
+                let mut direction = None;
                 if let Some(handle) = self.peers.remove(&addr) {
+                    direction = Some(handle.direction);
                     if let Some(bitfield) = &handle.bitfield {
                         self.picker.remove_peer(bitfield);
                     }
                     self.picker.return_blocks(addr);
                 }
-                if self.state == State::Downloading {
-                    self.backoff
-                        .insert(addr, TokioInstant::now() + CONNECT_BACKOFF);
+                if direction == Some(PeerDirection::Outgoing) {
+                    if self.state == State::Downloading {
+                        self.backoff
+                            .insert(addr, TokioInstant::now() + CONNECT_BACKOFF);
+                    }
+                    self.known.remove(&addr);
+                    self.push_peer(addr);
                 }
                 self.deferred.remove(&addr);
-                self.known.remove(&addr);
-                self.push_peer(addr);
                 self.refill_all().await;
                 self.publish();
             }
@@ -610,6 +841,7 @@ impl Engine {
                 if let Some(handle) = self.peers.get_mut(&addr) {
                     handle.in_flight = handle.in_flight.saturating_sub(1);
                     handle.received_bytes += block.len() as u64;
+                    handle.window_down += block.len() as u64;
                 }
                 self.session_downloaded += block.len() as u64;
                 self.picker.block_received(index, begin, addr);
@@ -643,9 +875,14 @@ impl Engine {
         match outcome {
             Ok(PieceWriteOutcome::Verified) => {
                 self.picker.mark_have(index);
+                let _ = self
+                    .have_map
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .set(index);
                 self.verified_bytes += self.piece_size(index) as u64;
                 if self.picker.is_complete() {
-                    self.state = State::Completed;
+                    self.state = self.completed_state();
                     self.announce_event = Some(Event::Completed);
                     self.announce_at = Some(TokioInstant::now() + Duration::from_secs(1));
                     self.disconnect_all().await;
@@ -737,18 +974,8 @@ impl Engine {
     }
 
     async fn disconnect_all(&mut self) {
-        for addr in self.peers.keys().copied().collect::<Vec<_>>() {
-            self.picker.return_blocks(addr);
-            if let Some(bitfield) = self
-                .peers
-                .get(&addr)
-                .and_then(|handle| handle.bitfield.as_ref())
-            {
-                self.picker.remove_peer(bitfield);
-            }
-            if let Some(handle) = self.peers.remove(&addr) {
-                let _ = handle.commands.try_send(PeerCommand::Stop);
-            }
+        for handle in self.peers.values() {
+            let _ = handle.commands.try_send(PeerCommand::Stop);
         }
     }
 
@@ -767,6 +994,53 @@ impl Engine {
         self.refill_all().await;
     }
 
+    fn apply_choke(&mut self, rotate: bool) {
+        if self.peers.is_empty() {
+            return;
+        }
+        let seeding = matches!(self.state, State::Seeding | State::Completed);
+        let candidates: Vec<ChokeCandidate> = self
+            .peers
+            .iter()
+            .map(|(addr, handle)| ChokeCandidate {
+                addr: *addr,
+                interested: handle.interested,
+                down: handle.window_down,
+                up: handle.window_up,
+            })
+            .collect();
+        if rotate {
+            let (next, cursor) =
+                rotate_optimistic(&candidates, CHOKE_SLOTS, seeding, self.optimistic_cursor);
+            self.optimistic_peer = next;
+            self.optimistic_cursor = cursor;
+        }
+        if let Some(optimistic) = self.optimistic_peer {
+            if !self.peers.contains_key(&optimistic) {
+                self.optimistic_peer = None;
+            }
+        }
+        let unchoke = decide_choke(&candidates, CHOKE_SLOTS, seeding, self.optimistic_peer);
+        for (addr, handle) in self.peers.iter_mut() {
+            let want_unchoke = unchoke.contains(addr);
+            if want_unchoke != handle.we_unchoked {
+                let command = if want_unchoke {
+                    PeerCommand::Unchoke
+                } else {
+                    PeerCommand::Choke
+                };
+                let _ = handle.commands.try_send(command);
+                handle.we_unchoked = want_unchoke;
+            }
+        }
+        if !rotate {
+            for handle in self.peers.values_mut() {
+                handle.window_down = 0;
+                handle.window_up = 0;
+            }
+        }
+    }
+
     fn piece_size(&self, index: usize) -> usize {
         self.storage.piece_size(index)
     }
@@ -774,24 +1048,36 @@ impl Engine {
     fn tick_stats(&mut self) {
         for handle in self.peers.values_mut() {
             handle.rate_base = handle.received_bytes;
+            handle.upload_rate_base = handle.uploaded_bytes;
         }
-        self.last_rate = (TokioInstant::now(), self.session_downloaded);
+        self.last_rate = (
+            TokioInstant::now(),
+            self.session_downloaded,
+            self.session_uploaded,
+        );
         self.publish();
     }
 
     fn current_stats(&self) -> Stats {
         let now = TokioInstant::now();
         let dt = (now - self.last_rate.0).as_secs_f64().max(0.001);
-        let peers = self
+        let peers: Vec<PeerStats> = self
             .peers
             .iter()
             .map(|(addr, handle)| PeerStats {
                 addr: *addr,
                 client: handle.client.clone(),
                 rate: (handle.received_bytes - handle.rate_base) as f64 / dt,
+                up_rate: (handle.uploaded_bytes - handle.upload_rate_base) as f64 / dt,
                 choked: handle.choked,
+                unchoked: handle.we_unchoked,
+                direction: handle.direction,
             })
             .collect();
+        let incoming_peers = peers
+            .iter()
+            .filter(|peer| peer.direction == PeerDirection::Incoming)
+            .count();
         Stats {
             state: self.state,
             name: self.meta.info.name.clone(),
@@ -799,10 +1085,18 @@ impl Engine {
             verified_bytes: self.verified_bytes,
             session_downloaded: self.session_downloaded,
             session_uploaded: self.session_uploaded,
+            upload_rate: (self.session_uploaded - self.last_rate.2) as f64 / dt,
+            ratio: if self.total_length > 0 {
+                self.session_uploaded as f64 / self.total_length as f64
+            } else {
+                0.0
+            },
             verified_pieces: self.picker.have().count(),
             piece_count: self.meta.info.pieces.len(),
             download_rate: (self.session_downloaded - self.last_rate.1) as f64 / dt,
             peer_count: self.peers.len(),
+            incoming_peers,
+            outgoing_peers: peers.len() - incoming_peers,
             peers,
             error: self.error.clone(),
         }
@@ -811,6 +1105,63 @@ impl Engine {
     fn publish(&self) {
         let _ = self.stats_tx.send(self.current_stats());
     }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ChokeCandidate {
+    pub addr: SocketAddr,
+    pub interested: bool,
+    pub down: u64,
+    pub up: u64,
+}
+
+fn choke_metric(candidate: &ChokeCandidate, seeding: bool) -> u64 {
+    if seeding {
+        candidate.up
+    } else {
+        candidate.down
+    }
+}
+
+fn ranked_interested(candidates: &[ChokeCandidate], seeding: bool) -> Vec<SocketAddr> {
+    let mut interested: Vec<&ChokeCandidate> = candidates.iter().filter(|c| c.interested).collect();
+    interested.sort_by(|a, b| {
+        choke_metric(b, seeding)
+            .cmp(&choke_metric(a, seeding))
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
+    interested.into_iter().map(|c| c.addr).collect()
+}
+
+fn decide_choke(
+    candidates: &[ChokeCandidate],
+    slots: usize,
+    seeding: bool,
+    optimistic: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let ranked = ranked_interested(candidates, seeding);
+    let mut unchoke: Vec<SocketAddr> = ranked.iter().take(slots).copied().collect();
+    if let Some(optimistic) = optimistic {
+        if !unchoke.contains(&optimistic) {
+            unchoke.push(optimistic);
+        }
+    }
+    unchoke
+}
+
+fn rotate_optimistic(
+    candidates: &[ChokeCandidate],
+    slots: usize,
+    seeding: bool,
+    cursor: usize,
+) -> (Option<SocketAddr>, usize) {
+    let ranked = ranked_interested(candidates, seeding);
+    let mut pool: Vec<SocketAddr> = ranked.into_iter().skip(slots).collect();
+    pool.sort();
+    if pool.is_empty() {
+        return (None, cursor);
+    }
+    (Some(pool[cursor % pool.len()]), cursor + 1)
 }
 
 enum PieceWriteOutcome {
@@ -860,6 +1211,19 @@ fn register_strike(
 mod tests {
     use super::*;
 
+    fn addr(host: &str) -> SocketAddr {
+        format!("{host}:1").parse().unwrap()
+    }
+
+    fn candidate(host: &str, interested: bool, down: u64, up: u64) -> ChokeCandidate {
+        ChokeCandidate {
+            addr: addr(host),
+            interested,
+            down,
+            up,
+        }
+    }
+
     #[test]
     fn bans_peer_after_three_strikes() {
         let addr: SocketAddr = "1.2.3.4:1".parse().unwrap();
@@ -886,5 +1250,91 @@ mod tests {
         assert!(banned.contains(&one));
         assert!(!banned.contains(&two));
         assert_eq!(strikes.get(&two), Some(&1));
+    }
+
+    #[test]
+    fn choking_picks_top_downloaders_while_downloading() {
+        let candidates = vec![
+            candidate("1.1.1.1", true, 100, 0),
+            candidate("2.2.2.2", true, 900, 0),
+            candidate("3.3.3.3", true, 500, 0),
+            candidate("4.4.4.4", true, 700, 0),
+            candidate("5.5.5.5", true, 300, 0),
+            candidate("6.6.6.6", false, 999, 0),
+        ];
+        let unchoke = decide_choke(&candidates, 4, false, None);
+        assert_eq!(unchoke.len(), 4);
+        assert!(unchoke.contains(&addr("2.2.2.2")));
+        assert!(unchoke.contains(&addr("4.4.4.4")));
+        assert!(unchoke.contains(&addr("3.3.3.3")));
+        assert!(unchoke.contains(&addr("5.5.5.5")));
+        assert!(!unchoke.contains(&addr("1.1.1.1")));
+        assert!(!unchoke.contains(&addr("6.6.6.6")));
+    }
+
+    #[test]
+    fn choking_picks_top_upload_recipients_while_seeding() {
+        let candidates = vec![
+            candidate("1.1.1.1", true, 0, 100),
+            candidate("2.2.2.2", true, 0, 900),
+            candidate("3.3.3.3", true, 0, 500),
+            candidate("4.4.4.4", true, 0, 700),
+            candidate("5.5.5.5", true, 0, 300),
+        ];
+        let unchoke = decide_choke(&candidates, 4, true, None);
+        assert_eq!(unchoke.len(), 4);
+        assert!(unchoke.contains(&addr("2.2.2.2")));
+        assert!(unchoke.contains(&addr("4.4.4.4")));
+        assert!(unchoke.contains(&addr("3.3.3.3")));
+        assert!(unchoke.contains(&addr("5.5.5.5")));
+        assert!(!unchoke.contains(&addr("1.1.1.1")));
+    }
+
+    #[test]
+    fn only_interested_peers_get_unchoked() {
+        let candidates = vec![
+            candidate("1.1.1.1", false, 100, 100),
+            candidate("2.2.2.2", false, 100, 100),
+        ];
+        assert!(decide_choke(&candidates, 4, false, None).is_empty());
+    }
+
+    #[test]
+    fn optimistic_slot_is_added_and_kept() {
+        let candidates = vec![
+            candidate("1.1.1.1", true, 900, 0),
+            candidate("2.2.2.2", true, 800, 0),
+            candidate("3.3.3.3", true, 700, 0),
+            candidate("4.4.4.4", true, 600, 0),
+            candidate("5.5.5.5", true, 500, 0),
+            candidate("6.6.6.6", true, 400, 0),
+        ];
+        let (optimistic, cursor) = rotate_optimistic(&candidates, 4, false, 0);
+        assert_eq!(optimistic, Some(addr("5.5.5.5")));
+        assert_eq!(cursor, 1);
+        let unchoke = decide_choke(&candidates, 4, false, optimistic);
+        assert_eq!(unchoke.len(), 5);
+        assert!(unchoke.contains(&addr("5.5.5.5")));
+        let (next, _) = rotate_optimistic(&candidates, 4, false, cursor);
+        assert_eq!(next, Some(addr("6.6.6.6")));
+    }
+
+    #[test]
+    fn optimistic_rotation_wraps_and_survives_empty_pool() {
+        let candidates = vec![
+            candidate("1.1.1.1", true, 900, 0),
+            candidate("2.2.2.2", true, 800, 0),
+            candidate("3.3.3.3", true, 700, 0),
+            candidate("4.4.4.4", true, 600, 0),
+        ];
+        let (optimistic, cursor) = rotate_optimistic(&candidates, 4, false, 0);
+        assert_eq!(optimistic, None);
+        assert_eq!(cursor, 0);
+        let mut sparse = candidates.clone();
+        sparse.push(candidate("5.5.5.5", true, 1, 0));
+        let (first, cursor) = rotate_optimistic(&sparse, 4, false, 0);
+        assert_eq!(first, Some(addr("5.5.5.5")));
+        let (second, _) = rotate_optimistic(&sparse, 4, false, cursor);
+        assert_eq!(second, Some(addr("5.5.5.5")));
     }
 }

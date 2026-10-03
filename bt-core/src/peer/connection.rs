@@ -71,6 +71,10 @@ impl<S: AsyncRead + AsyncWrite> PeerConnection<S> {
         self.remote.peer_id
     }
 
+    pub fn remote(&self) -> Handshake {
+        self.remote
+    }
+
     pub fn reserved(&self) -> [u8; 8] {
         self.remote.reserved
     }
@@ -157,6 +161,56 @@ impl<W: AsyncWrite + Unpin> PeerWriter<W> {
         self.stream.write_all(frame).await?;
         self.stream.flush().await?;
         Ok(())
+    }
+}
+
+pub struct PeerReadHalf<S> {
+    inner: PeerReader<S>,
+    piece_count: usize,
+    read_timeout: Duration,
+}
+
+impl<S: AsyncRead + Unpin> PeerReadHalf<S> {
+    pub async fn read_message(&mut self) -> Result<Message, PeerError> {
+        let frame = self.inner.read_frame(self.read_timeout).await?;
+        if frame.is_empty() {
+            return Ok(Message::KeepAlive);
+        }
+        Ok(Message::decode(&frame, self.piece_count)?)
+    }
+}
+
+pub struct PeerWriteHalf<S> {
+    inner: PeerWriter<S>,
+}
+
+impl<S: AsyncWrite + Unpin> PeerWriteHalf<S> {
+    pub async fn write_message(&mut self, message: &Message) -> Result<(), PeerError> {
+        self.inner.write_frame(&message.encode()).await
+    }
+
+    pub async fn send_keep_alive(&mut self) -> Result<(), PeerError> {
+        self.inner.write_frame(&KEEP_ALIVE_FRAME).await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite> PeerConnection<S> {
+    pub fn into_halves(self) -> (PeerReadHalf<S>, PeerWriteHalf<S>) {
+        let PeerConnection {
+            reader,
+            writer,
+            piece_count,
+            config,
+            ..
+        } = self;
+        (
+            PeerReadHalf {
+                inner: reader,
+                piece_count,
+                read_timeout: config.read_timeout,
+            },
+            PeerWriteHalf { inner: writer },
+        )
     }
 }
 

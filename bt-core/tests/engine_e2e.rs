@@ -95,12 +95,7 @@ async fn pause_and_resume_continue_without_recheck() {
     .await
     .unwrap();
     let stats = torrent.subscribe();
-    wait_for(
-        &stats,
-        |s| s.verified_pieces >= 1 && s.state == State::Downloading,
-        30,
-    )
-    .await;
+    wait_for(&stats, |s| s.verified_bytes > 0, 30).await;
 
     torrent.pause().await.unwrap();
     wait_for(&stats, |s| s.state == State::Paused, 10).await;

@@ -1,23 +1,36 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::task::spawn_blocking;
 use tokio::time::{interval_at, sleep_until, timeout, Instant as TokioInstant, MissedTickBehavior};
 
 use crate::error::PeerError;
+use crate::peer::handshake::Handshake;
 use crate::peer::{Bitfield, Message, PeerConfig, PeerConnection};
+use crate::ratelimit::UploadBucket;
+
+use super::storage::Storage;
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+
 impl<T: AsyncRead + AsyncWrite + Unpin + Send + ?Sized> Stream for T {}
 
 pub type BoxedStream = Box<dyn Stream>;
 
+pub type HaveMap = Arc<RwLock<Bitfield>>;
+
 const UNPRODUCTIVE_TIMEOUT: Duration = Duration::from_secs(120);
+pub const MAX_REQUEST_LENGTH: usize = 16 * 1024;
+pub const MAX_TOLERATED_LENGTH: usize = 32 * 1024;
+const SERVE_QUEUE_CAPACITY: usize = 64;
+const WRITE_QUEUE_CAPACITY: usize = 64;
 
 pub trait Dial: Send + Sync + 'static {
     fn dial(
@@ -59,6 +72,8 @@ impl Dial for TcpDial {
 pub enum PeerCommand {
     Request { index: u32, begin: u32, length: u32 },
     Have(u32),
+    Choke,
+    Unchoke,
     Stop,
 }
 
@@ -82,11 +97,21 @@ pub enum PeerEvent {
     Unchoke {
         addr: SocketAddr,
     },
+    Interested {
+        addr: SocketAddr,
+    },
+    NotInterested {
+        addr: SocketAddr,
+    },
     Block {
         addr: SocketAddr,
         index: u32,
         begin: u32,
         block: Vec<u8>,
+    },
+    Uploaded {
+        addr: SocketAddr,
+        bytes: u64,
     },
     Disconnected {
         addr: SocketAddr,
@@ -98,8 +123,26 @@ pub(crate) struct PeerTask {
     pub info_hash: [u8; 20],
     pub our_peer_id: [u8; 20],
     pub piece_count: usize,
+    pub piece_length: u32,
+    pub total_length: u64,
     pub config: PeerConfig,
     pub dial: Arc<dyn Dial>,
+    pub have: HaveMap,
+    pub storage: Arc<Storage>,
+    pub uploads: Arc<UploadBucket>,
+}
+
+pub(crate) struct IncomingPeer {
+    pub addr: SocketAddr,
+    pub piece_count: usize,
+    pub piece_length: u32,
+    pub total_length: u64,
+    pub config: PeerConfig,
+    pub remote: Handshake,
+    pub stream: BoxedStream,
+    pub have: HaveMap,
+    pub storage: Arc<Storage>,
+    pub uploads: Arc<UploadBucket>,
 }
 
 pub(crate) async fn run_peer_task(
@@ -107,20 +150,70 @@ pub(crate) async fn run_peer_task(
     mut commands: mpsc::Receiver<PeerCommand>,
     events: mpsc::Sender<PeerEvent>,
 ) {
-    let _ = serve(&task, &mut commands, &events).await;
+    let outcome = connect_outgoing(&task).await;
+    if let Ok((connection, remote)) = outcome {
+        let _ = events
+            .send(PeerEvent::Handshaken {
+                addr: task.addr,
+                peer_id: remote.peer_id,
+            })
+            .await;
+        let _ = serve_established(
+            task.addr,
+            connection,
+            task.piece_count,
+            task.piece_length,
+            task.total_length,
+            task.have,
+            task.storage,
+            task.uploads,
+            &mut commands,
+            &events,
+            task.config.keep_alive_interval,
+        )
+        .await;
+    }
     let _ = events
         .send(PeerEvent::Disconnected { addr: task.addr })
         .await;
 }
 
-async fn serve(
+pub(crate) async fn run_incoming_peer_task(
+    task: IncomingPeer,
+    mut commands: mpsc::Receiver<PeerCommand>,
+    events: mpsc::Sender<PeerEvent>,
+) {
+    let connection = PeerConnection::new(task.stream, task.remote, task.piece_count, task.config);
+    let _ = events
+        .send(PeerEvent::Handshaken {
+            addr: task.addr,
+            peer_id: task.remote.peer_id,
+        })
+        .await;
+    let _ = serve_established(
+        task.addr,
+        connection,
+        task.piece_count,
+        task.piece_length,
+        task.total_length,
+        task.have,
+        task.storage,
+        task.uploads,
+        &mut commands,
+        &events,
+        task.config.keep_alive_interval,
+    )
+    .await;
+    let _ = events
+        .send(PeerEvent::Disconnected { addr: task.addr })
+        .await;
+}
+
+async fn connect_outgoing(
     task: &PeerTask,
-    commands: &mut mpsc::Receiver<PeerCommand>,
-    events: &mpsc::Sender<PeerEvent>,
-) -> Result<(), PeerError> {
-    let addr = task.addr;
-    let stream = task.dial.dial(addr).await?;
-    let mut conn = PeerConnection::connect_stream(
+) -> Result<(PeerConnection<BoxedStream>, Handshake), PeerError> {
+    let stream = task.dial.dial(task.addr).await?;
+    let connection = PeerConnection::connect_stream(
         stream,
         task.info_hash,
         task.our_peer_id,
@@ -128,34 +221,101 @@ async fn serve(
         task.config,
     )
     .await?;
-    let _ = events
-        .send(PeerEvent::Handshaken {
+    let remote = connection.remote();
+    Ok((connection, remote))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_established<S>(
+    addr: SocketAddr,
+    connection: PeerConnection<S>,
+    piece_count: usize,
+    piece_length: u32,
+    total_length: u64,
+    have: HaveMap,
+    storage: Arc<Storage>,
+    uploads: Arc<UploadBucket>,
+    commands: &mut mpsc::Receiver<PeerCommand>,
+    events: &mpsc::Sender<PeerEvent>,
+    keep_alive_interval: Duration,
+) -> Result<(), PeerError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (mut reader, writer) = connection.into_halves();
+    let (write_tx, write_rx) = mpsc::channel::<Message>(WRITE_QUEUE_CAPACITY);
+    let writer_task = tokio::spawn(writer_loop(writer, write_rx));
+    let (serve_tx, serve_rx) = mpsc::channel::<ServeRequest>(SERVE_QUEUE_CAPACITY);
+    let cancelled: Arc<Mutex<HashSet<(u32, u32, u32)>>> = Arc::new(Mutex::new(HashSet::new()));
+    let serve_task = tokio::spawn(serve_loop(
+        serve_rx,
+        ServeContext {
             addr,
-            peer_id: conn.remote_peer_id(),
-        })
-        .await;
-    conn.write_message(&Message::Interested).await?;
+            storage: storage.clone(),
+            uploads,
+            write_tx: write_tx.clone(),
+            cancelled: cancelled.clone(),
+            events: events.clone(),
+        },
+    ));
+
+    let snapshot = have
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if snapshot.count() > 0 {
+        let _ = write_tx.send(Message::Bitfield(snapshot.clone())).await;
+    }
+    let initial_interest = if snapshot.count() >= piece_count {
+        Message::NotInterested
+    } else {
+        Message::Interested
+    };
+    let _ = write_tx.send(initial_interest).await;
+
     let mut last_useful = TokioInstant::now();
     let mut keep_alive = interval_at(
-        TokioInstant::now() + task.config.keep_alive_interval,
-        task.config.keep_alive_interval,
+        TokioInstant::now() + keep_alive_interval,
+        keep_alive_interval,
     );
     keep_alive.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
+    let mut we_choke = true;
+
+    let outcome = loop {
         let deadline = last_useful + UNPRODUCTIVE_TIMEOUT;
         tokio::select! {
-            _ = sleep_until(deadline) => return Ok(()),
-            _ = keep_alive.tick() => conn.send_keep_alive().await?,
+            _ = sleep_until(deadline) => break Ok(()),
+            _ = keep_alive.tick() => {
+                if write_tx.send(Message::KeepAlive).await.is_err() {
+                    break Err(PeerError::ConnectionClosed);
+                }
+            }
             command = commands.recv() => match command {
                 Some(PeerCommand::Request { index, begin, length }) => {
-                    conn.write_message(&Message::Request { index, begin, length }).await?;
+                    if write_tx.send(Message::Request { index, begin, length }).await.is_err() {
+                        break Err(PeerError::ConnectionClosed);
+                    }
                 }
                 Some(PeerCommand::Have(index)) => {
-                    conn.write_message(&Message::Have(index)).await?;
+                    if write_tx.send(Message::Have(index)).await.is_err() {
+                        break Err(PeerError::ConnectionClosed);
+                    }
                 }
-                Some(PeerCommand::Stop) | None => return Ok(()),
+                Some(PeerCommand::Choke) => {
+                    we_choke = true;
+                    if write_tx.send(Message::Choke).await.is_err() {
+                        break Err(PeerError::ConnectionClosed);
+                    }
+                }
+                Some(PeerCommand::Unchoke) => {
+                    we_choke = false;
+                    if write_tx.send(Message::Unchoke).await.is_err() {
+                        break Err(PeerError::ConnectionClosed);
+                    }
+                }
+                Some(PeerCommand::Stop) | None => break Ok(()),
             },
-            message = conn.read_message() => match message? {
+            message = reader.read_message() => match message? {
                 Message::KeepAlive => {}
                 Message::Choke => {
                     last_useful = TokioInstant::now();
@@ -173,12 +333,289 @@ async fn serve(
                     last_useful = TokioInstant::now();
                     let _ = events.send(PeerEvent::Have { addr, index }).await;
                 }
+                Message::Interested => {
+                    last_useful = TokioInstant::now();
+                    let _ = events.send(PeerEvent::Interested { addr }).await;
+                }
+                Message::NotInterested => {
+                    last_useful = TokioInstant::now();
+                    let _ = events.send(PeerEvent::NotInterested { addr }).await;
+                }
                 Message::Piece { index, begin, block } => {
                     last_useful = TokioInstant::now();
                     let _ = events.send(PeerEvent::Block { addr, index, begin, block }).await;
                 }
-                _ => {}
+                Message::Request { index, begin, length } => {
+                    last_useful = TokioInstant::now();
+                    match decide_request(
+                        we_choke,
+                        ServeRequest { index, begin, length },
+                        piece_count,
+                        piece_length,
+                        total_length,
+                        &have,
+                    ) {
+                        RequestDecision::Close => break Ok(()),
+                        RequestDecision::Ignore => {}
+                        RequestDecision::Serve => {
+                            let request = ServeRequest { index, begin, length };
+                            if serve_tx.try_send(request).is_err() {
+                                break Ok(());
+                            }
+                        }
+                    }
+                }
+                Message::Cancel { index, begin, length } => {
+                    last_useful = TokioInstant::now();
+                    cancelled
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert((index, begin, length));
+                }
+                Message::Unknown { .. } => {}
+                Message::Port(_) => {}
             },
         }
+    };
+
+    drop(serve_tx);
+    serve_task.abort();
+    drop(write_tx);
+    let _ = writer_task.await;
+    outcome
+}
+
+async fn writer_loop<W: AsyncWrite + Unpin>(
+    mut writer: crate::peer::PeerWriteHalf<W>,
+    mut rx: mpsc::Receiver<Message>,
+) {
+    while let Some(message) = rx.recv().await {
+        if writer.write_message(&message).await.is_err() {
+            break;
+        }
+    }
+}
+
+struct ServeRequest {
+    index: u32,
+    begin: u32,
+    length: u32,
+}
+
+struct ServeContext {
+    addr: SocketAddr,
+    storage: Arc<Storage>,
+    uploads: Arc<UploadBucket>,
+    write_tx: mpsc::Sender<Message>,
+    cancelled: Arc<Mutex<HashSet<(u32, u32, u32)>>>,
+    events: mpsc::Sender<PeerEvent>,
+}
+
+async fn serve_loop(mut rx: mpsc::Receiver<ServeRequest>, ctx: ServeContext) {
+    let ServeContext {
+        addr,
+        storage,
+        uploads,
+        write_tx,
+        cancelled,
+        events,
+    } = ctx;
+    while let Some(request) = rx.recv().await {
+        let key = (request.index, request.begin, request.length);
+        if is_cancelled(&cancelled, &key) {
+            continue;
+        }
+        let storage = storage.clone();
+        let index = request.index;
+        let begin = request.begin;
+        let length = request.length;
+        let read = spawn_blocking(move || {
+            storage.read_block(index as usize, begin as usize, length as usize)
+        })
+        .await;
+        if is_cancelled(&cancelled, &key) {
+            continue;
+        }
+        match read {
+            Ok(Ok(block)) => {
+                uploads.acquire(block.len() as u64).await;
+                if is_cancelled(&cancelled, &key) {
+                    continue;
+                }
+                let sent = write_tx
+                    .send(Message::Piece {
+                        index: request.index,
+                        begin: request.begin,
+                        block,
+                    })
+                    .await;
+                if sent.is_err() {
+                    break;
+                }
+                let _ = events
+                    .send(PeerEvent::Uploaded {
+                        addr,
+                        bytes: length as u64,
+                    })
+                    .await;
+            }
+            _ => break,
+        }
+    }
+}
+
+fn is_cancelled(cancelled: &Mutex<HashSet<(u32, u32, u32)>>, key: &(u32, u32, u32)) -> bool {
+    cancelled
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(key)
+}
+
+enum RequestDecision {
+    Serve,
+    Ignore,
+    Close,
+}
+
+fn decide_request(
+    we_choke: bool,
+    request: ServeRequest,
+    piece_count: usize,
+    piece_length: u32,
+    total_length: u64,
+    have: &HaveMap,
+) -> RequestDecision {
+    let (index, begin, length) = (request.index, request.begin, request.length);
+    if we_choke || length == 0 {
+        return RequestDecision::Ignore;
+    }
+    if length as usize > MAX_TOLERATED_LENGTH {
+        return RequestDecision::Close;
+    }
+    if length as usize > MAX_REQUEST_LENGTH {
+        return RequestDecision::Ignore;
+    }
+    if index as usize >= piece_count {
+        return RequestDecision::Ignore;
+    }
+    let Some(size) = piece_size(piece_length, total_length, index as usize) else {
+        return RequestDecision::Ignore;
+    };
+    let begin = begin as usize;
+    let length = length as usize;
+    if begin >= size || length > size - begin {
+        return RequestDecision::Ignore;
+    }
+    if !have
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(index as usize)
+    {
+        return RequestDecision::Ignore;
+    }
+    RequestDecision::Serve
+}
+
+fn piece_size(piece_length: u32, total_length: u64, index: usize) -> Option<usize> {
+    let start = (index as u64).checked_mul(piece_length as u64)?;
+    if start >= total_length {
+        return None;
+    }
+    Some((total_length - start).min(piece_length as u64) as usize)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::BLOCK_SIZE;
+
+    fn have_of(pieces: &[usize], piece_count: usize) -> HaveMap {
+        let mut bitfield = Bitfield::new(piece_count);
+        for &index in pieces {
+            bitfield.set(index).unwrap();
+        }
+        Arc::new(RwLock::new(bitfield))
+    }
+
+    fn decide(
+        we_choke: bool,
+        index: u32,
+        begin: u32,
+        length: u32,
+        have: &HaveMap,
+    ) -> RequestDecision {
+        decide_request(
+            we_choke,
+            ServeRequest {
+                index,
+                begin,
+                length,
+            },
+            3,
+            64 * 1024,
+            3 * 64 * 1024,
+            have,
+        )
+    }
+
+    #[test]
+    fn serves_valid_requests_for_verified_pieces() {
+        let have = have_of(&[0], 3);
+        assert!(matches!(
+            decide(false, 0, 0, BLOCK_SIZE as u32, &have),
+            RequestDecision::Serve
+        ));
+        assert!(matches!(
+            decide(false, 0, BLOCK_SIZE as u32, BLOCK_SIZE as u32, &have),
+            RequestDecision::Serve
+        ));
+    }
+
+    #[test]
+    fn ignores_requests_while_choked() {
+        let have = have_of(&[0], 3);
+        assert!(matches!(
+            decide(true, 0, 0, BLOCK_SIZE as u32, &have),
+            RequestDecision::Ignore
+        ));
+    }
+
+    #[test]
+    fn ignores_requests_for_unverified_pieces() {
+        let have = have_of(&[0], 3);
+        assert!(matches!(
+            decide(false, 1, 0, BLOCK_SIZE as u32, &have),
+            RequestDecision::Ignore
+        ));
+    }
+
+    #[test]
+    fn ignores_out_of_range_requests() {
+        let have = have_of(&[0, 1, 2], 3);
+        assert!(matches!(
+            decide(false, 3, 0, BLOCK_SIZE as u32, &have),
+            RequestDecision::Ignore
+        ));
+        assert!(matches!(
+            decide(false, 0, 64 * 1024, BLOCK_SIZE as u32, &have),
+            RequestDecision::Ignore
+        ));
+        assert!(matches!(
+            decide(false, 0, 0, 0, &have),
+            RequestDecision::Ignore
+        ));
+    }
+
+    #[test]
+    fn rejects_oversized_requests_by_closing() {
+        let have = have_of(&[0], 3);
+        assert!(matches!(
+            decide(false, 0, 0, (MAX_TOLERATED_LENGTH + 1) as u32, &have),
+            RequestDecision::Close
+        ));
+        assert!(matches!(
+            decide(false, 0, 0, (MAX_REQUEST_LENGTH + 1) as u32, &have),
+            RequestDecision::Ignore
+        ));
     }
 }
