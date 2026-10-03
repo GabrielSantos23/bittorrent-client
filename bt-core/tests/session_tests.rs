@@ -138,7 +138,7 @@ async fn pause_resume_completes() {
         let snapshot = summaries.borrow().clone();
         let entry = snapshot.iter().find(|t| t.id == id).unwrap();
         assert_ne!(entry.state, State::Checking, "resume must not recheck");
-        if entry.state == State::Completed {
+        if matches!(entry.state, State::Completed | State::Seeding) {
             assert_eq!(entry.verified_bytes, entry.total_length);
             break;
         }

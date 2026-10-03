@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bt-core", "bt-cli", "bt-app"]
+members = ["bt-core", "bt-cli", "src-tauri"]
 
 [workspace.package]
 version = "0.1.0"

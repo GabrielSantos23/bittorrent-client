@@ -7,13 +7,13 @@
     "devUrl": "http://localhost:5183",
     "beforeDevCommand": {
       "script": "npm run dev",
-      "cwd": "../bt-app/ui"
+      "cwd": "ui"
     },
     "beforeBuildCommand": {
       "script": "npm run build",
-      "cwd": "../bt-app/ui"
+      "cwd": "ui"
     },
-    "frontendDist": "../bt-app/ui/dist"
+    "frontendDist": "ui/dist"
   },
   "app": {
     "windows": [

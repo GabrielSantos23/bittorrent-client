@@ -1,0 +1,11 @@
+{
+  "name": "bittorrent-client",
+  "private": true,
+  "scripts": {
+    "dev": "tauri dev",
+    "bundle": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}
