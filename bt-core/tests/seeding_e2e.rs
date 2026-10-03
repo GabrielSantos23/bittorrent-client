@@ -11,8 +11,8 @@ use bt_core::listener::{ListenerOptions, Registry};
 use bt_core::peer_id;
 use bt_core::ratelimit::UploadBucket;
 use common::{
-    temp_dir, test_data, torrent_meta, FakeLeecherDial, LeecherConfig, LeecherReport, DATA_LENGTH,
-    PIECE_LENGTH,
+    temp_dir, test_data, torrent_meta, FakeDial, FakeLeecherDial, LeecherConfig, LeecherReport,
+    SeederKind, DATA_LENGTH, PIECE_LENGTH,
 };
 
 fn addr(port: u16) -> SocketAddr {
@@ -543,4 +543,87 @@ async fn two_engines_transfer_torrents_to_each_other_over_loopback() {
     }
     listener_a.shutdown();
     listener_b.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn endgame_requests_last_piece_from_multiple_peers() {
+    let data = test_data();
+    let meta = torrent_meta(&data);
+    let last_piece = (meta.info.pieces.len() - 1) as u32;
+    let slow = Duration::from_millis(1_500);
+    let (dial, mut reports) = FakeDial::with_reports(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![
+            (
+                addr(7101),
+                SeederKind::Slow {
+                    delay: slow,
+                    only_piece: Some(last_piece),
+                },
+            ),
+            (
+                addr(7102),
+                SeederKind::Slow {
+                    delay: slow,
+                    only_piece: None,
+                },
+            ),
+        ],
+    );
+    let dir = temp_dir("endgame");
+    std::fs::create_dir_all(&dir).unwrap();
+    let torrent = Torrent::spawn_with_options(
+        meta,
+        dir.clone(),
+        TorrentOptions {
+            bootstrap_peers: vec![addr(7101), addr(7102)],
+            dial: Arc::new(dial),
+            listen_active: Arc::new(AtomicBool::new(false)),
+            announce_port: Arc::new(AtomicU16::new(6881)),
+            registry: Arc::new(Registry::default()),
+            choke_interval: Duration::from_millis(100),
+            optimistic_interval: Duration::from_millis(200),
+            ..TorrentOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stats = torrent.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let snapshot = stats.borrow().clone();
+        if matches!(snapshot.state, State::Completed | State::Seeding)
+            && snapshot.verified_bytes == snapshot.total_length
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "download never completed: {snapshot:?}"
+        );
+        assert!(stats.changed().await.is_ok());
+    }
+    let mut report_a = reports.recv().await.unwrap();
+    let mut report_b = reports.recv().await.unwrap();
+    if report_a.addr > report_b.addr {
+        std::mem::swap(&mut report_a, &mut report_b);
+    }
+    assert!(
+        report_a.last_piece_requests >= 1 && report_b.last_piece_requests >= 1,
+        "both seeders must be asked for the last piece: {report_a:?} {report_b:?}"
+    );
+    assert!(
+        report_a.cancels_received + report_b.cancels_received >= 1,
+        "the duplicate last-piece request must be cancelled: {report_a:?} {report_b:?}"
+    );
+    let served_total = report_a.blocks_served + report_b.blocks_served;
+    assert!(
+        served_total >= 3,
+        "all three blocks must have been served: {report_a:?} {report_b:?}"
+    );
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }

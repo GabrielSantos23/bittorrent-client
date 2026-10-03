@@ -71,6 +71,7 @@ impl Dial for TcpDial {
 #[derive(Debug)]
 pub enum PeerCommand {
     Request { index: u32, begin: u32, length: u32 },
+    Cancel { index: u32, begin: u32, length: u32 },
     Have(u32),
     Choke,
     Unchoke,
@@ -293,6 +294,15 @@ where
             command = commands.recv() => match command {
                 Some(PeerCommand::Request { index, begin, length }) => {
                     if write_tx.send(Message::Request { index, begin, length }).await.is_err() {
+                        break Err(PeerError::ConnectionClosed);
+                    }
+                }
+                Some(PeerCommand::Cancel { index, begin, length }) => {
+                    if write_tx
+                        .send(Message::Cancel { index, begin, length })
+                        .await
+                        .is_err()
+                    {
                         break Err(PeerError::ConnectionClosed);
                     }
                 }

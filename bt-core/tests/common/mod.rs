@@ -27,6 +27,18 @@ pub enum SeederKind {
     CorruptOnce,
     Choking,
     NeverReads,
+    Slow {
+        delay: Duration,
+        only_piece: Option<u32>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SeederReport {
+    pub addr: SocketAddr,
+    pub blocks_served: usize,
+    pub cancels_received: usize,
+    pub last_piece_requests: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +301,7 @@ pub struct FakeDial {
     data: Arc<Vec<u8>>,
     piece_count: usize,
     peers: Mutex<HashMap<SocketAddr, SeederKind>>,
+    reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
 }
 
 impl FakeDial {
@@ -303,7 +316,27 @@ impl FakeDial {
             data,
             piece_count,
             peers: Mutex::new(peers.into_iter().collect()),
+            reports: None,
         }
+    }
+}
+
+impl FakeDial {
+    pub fn with_reports(
+        info_hash: [u8; 20],
+        data: Arc<Vec<u8>>,
+        piece_count: usize,
+        peers: Vec<(SocketAddr, SeederKind)>,
+    ) -> (FakeDial, tokio::sync::mpsc::Receiver<SeederReport>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let dial = FakeDial {
+            info_hash,
+            data,
+            piece_count,
+            peers: Mutex::new(peers.into_iter().collect()),
+            reports: Some(tx),
+        };
+        (dial, rx)
     }
 }
 
@@ -316,6 +349,7 @@ impl Dial for FakeDial {
         let info_hash = self.info_hash;
         let data = self.data.clone();
         let piece_count = self.piece_count;
+        let reports = self.reports.clone();
         Box::pin(async move {
             let Some(kind) = kind else {
                 return Err(std::io::Error::new(
@@ -326,10 +360,12 @@ impl Dial for FakeDial {
             let (client_side, server_side) = duplex(256 * 1024);
             tokio::spawn(run_seeder(
                 Box::new(server_side),
+                addr,
                 info_hash,
                 data,
                 piece_count,
                 kind,
+                reports,
             ));
             Ok(Box::new(client_side) as BoxedStream)
         })
@@ -381,10 +417,32 @@ pub fn temp_dir(name: &str) -> std::path::PathBuf {
 
 async fn run_seeder(
     stream: BoxedStream,
+    addr: SocketAddr,
     info_hash: [u8; 20],
     data: Arc<Vec<u8>>,
     piece_count: usize,
     kind: SeederKind,
+    reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
+) {
+    let mut report = SeederReport {
+        addr,
+        blocks_served: 0,
+        cancels_received: 0,
+        last_piece_requests: 0,
+    };
+    serve_seeder(stream, info_hash, data, piece_count, kind, &mut report).await;
+    if let Some(sender) = reports {
+        let _ = sender.send(report).await;
+    }
+}
+
+async fn serve_seeder(
+    stream: BoxedStream,
+    info_hash: [u8; 20],
+    data: Arc<Vec<u8>>,
+    piece_count: usize,
+    kind: SeederKind,
+    report: &mut SeederReport,
 ) {
     let mut conn = PeerConnection::connect_stream(
         stream,
@@ -408,9 +466,44 @@ async fn run_seeder(
     }
     let mut corrupted = false;
     let mut served = 0usize;
+    struct PendingSend {
+        deadline: tokio::time::Instant,
+        message: Message,
+        key: (u32, u32, u32),
+    }
+    let mut pending: Vec<PendingSend> = Vec::new();
     loop {
-        let Ok(message) = conn.read_message().await else {
-            break;
+        let wake = async {
+            let earliest = pending.iter().map(|send| send.deadline).min();
+            match earliest {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let message = tokio::select! {
+            _ = wake => {
+                let now = tokio::time::Instant::now();
+                let mut due: Vec<(usize, Message)> = Vec::new();
+                pending.retain(|send| {
+                    if send.deadline <= now {
+                        due.push((0, send.message.clone()));
+                        false
+                    } else {
+                        true
+                    }
+                });
+                for (_, message) in due {
+                    report.blocks_served += 1;
+                    if conn.write_message(&message).await.is_err() {
+                        return;
+                    }
+                }
+                continue;
+            }
+            read = conn.read_message() => match read {
+                Ok(message) => message,
+                Err(_) => return,
+            },
         };
         match message {
             Message::Request {
@@ -420,8 +513,34 @@ async fn run_seeder(
             } => {
                 let start = index as usize * PIECE_LENGTH + begin as usize;
                 let mut block = data[start..start + length as usize].to_vec();
+                if index as usize == piece_count - 1 {
+                    report.last_piece_requests += 1;
+                }
+                let slow_delay = match kind {
+                    SeederKind::Slow { delay, only_piece } => {
+                        if only_piece.is_none_or(|piece| piece == index) {
+                            Some(delay)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(delay) = slow_delay {
+                    pending.push(PendingSend {
+                        deadline: tokio::time::Instant::now() + delay,
+                        message: Message::Piece {
+                            index,
+                            begin,
+                            block,
+                        },
+                        key: (index, begin, length),
+                    });
+                    continue;
+                }
                 match kind {
                     SeederKind::Good | SeederKind::NeverReads => {}
+                    SeederKind::Slow { .. } => {}
                     SeederKind::CorruptOnce => {
                         if index == 1 && !corrupted {
                             block[0] ^= 0xFF;
@@ -430,19 +549,37 @@ async fn run_seeder(
                     }
                     SeederKind::Choking => {
                         if served >= 2 {
-                            conn.write_message(&Message::Choke).await.unwrap();
+                            if conn.write_message(&Message::Choke).await.is_err() {
+                                return;
+                            }
                             continue;
                         }
                         served += 1;
                     }
                 }
-                conn.write_message(&Message::Piece {
-                    index,
-                    begin,
-                    block,
-                })
-                .await
-                .unwrap();
+                report.blocks_served += 1;
+                if conn
+                    .write_message(&Message::Piece {
+                        index,
+                        begin,
+                        block,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Message::Cancel {
+                index,
+                begin,
+                length,
+            } => {
+                let before = pending.len();
+                pending.retain(|send| send.key != (index, begin, length));
+                if pending.len() != before {
+                    report.cancels_received += 1;
+                }
             }
             Message::Interested | Message::KeepAlive | Message::NotInterested => {}
             _ => {}

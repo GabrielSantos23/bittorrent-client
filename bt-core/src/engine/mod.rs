@@ -21,7 +21,7 @@ use crate::tracker::{self, AnnounceRequest, Event};
 
 use self::assembly::{BlockOutcome, PieceAssembler};
 use self::peer_task::{HaveMap, PeerCommand, PeerEvent};
-use self::picker::PiecePicker;
+use self::picker::{pipeline_depth, PiecePicker};
 use self::storage::Storage;
 
 mod assembly;
@@ -35,7 +35,6 @@ pub use storage::delete_torrent_files;
 pub const BLOCK_SIZE: usize = assembly::BLOCK_SIZE;
 const MAX_PEERS: usize = 50;
 const MAX_PEERS_PER_IP: usize = 8;
-const REFILL_LIMIT: usize = 8;
 const RANDOM_FIRST: usize = 4;
 const MAX_ACTIVE_PIECES: usize = 25;
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
@@ -48,6 +47,9 @@ const BAN_STRIKES: u32 = 3;
 const DEFAULT_ANNOUNCE_PORT: u16 = 6881;
 const NUMWANT: u32 = 50;
 const CHOKE_SLOTS: usize = 4;
+const TARGET_RTT: f64 = 1.5;
+const RATE_WINDOW: Duration = Duration::from_secs(6);
+const INITIAL_PIPELINE_DEPTH: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[ts(export)]
@@ -263,6 +265,8 @@ struct PeerHandle {
     upload_rate_base: u64,
     window_down: u64,
     window_up: u64,
+    depth: usize,
+    rate_samples: VecDeque<(TokioInstant, u64)>,
 }
 
 struct Engine {
@@ -660,6 +664,8 @@ impl Engine {
                 upload_rate_base: 0,
                 window_down: 0,
                 window_up: 0,
+                depth: INITIAL_PIPELINE_DEPTH,
+                rate_samples: VecDeque::new(),
             },
         );
         let task = peer_task::PeerTask {
@@ -713,6 +719,8 @@ impl Engine {
                 upload_rate_base: 0,
                 window_down: 0,
                 window_up: 0,
+                depth: INITIAL_PIPELINE_DEPTH,
+                rate_samples: VecDeque::new(),
             },
         );
         let task = peer_task::IncomingPeer {
@@ -853,7 +861,18 @@ impl Engine {
                     handle.window_down += block.len() as u64;
                 }
                 self.session_downloaded += block.len() as u64;
-                self.picker.block_received(index, begin, addr);
+                let cancel_targets = self.picker.block_received(index, begin, addr);
+                let size = self.piece_size(index);
+                let length = BLOCK_SIZE.min(size.saturating_sub(begin)) as u32;
+                for target in cancel_targets {
+                    if let Some(handle) = self.peers.get(&target) {
+                        let _ = handle.commands.try_send(PeerCommand::Cancel {
+                            index: index as u32,
+                            begin: begin as u32,
+                            length,
+                        });
+                    }
+                }
             }
             _ => return,
         }
@@ -947,14 +966,28 @@ impl Engine {
             return;
         }
         loop {
+            let depth = match self.peers.get(&addr) {
+                Some(handle) => handle.depth,
+                None => return,
+            };
             let bitfield = match self.peers.get(&addr) {
                 Some(handle) => match handle.bitfield.as_ref() {
-                    Some(bitfield) if !handle.choked && handle.in_flight < REFILL_LIMIT => bitfield,
+                    Some(bitfield) if !handle.choked && handle.in_flight < depth => bitfield,
                     _ => return,
                 },
                 None => return,
             };
-            let Some((index, begin, length)) = self.picker.next_block(addr, bitfield) else {
+            let next = match self.picker.next_block(addr, bitfield) {
+                Some(next) => Some(next),
+                None => {
+                    if !self.picker.is_endgame() {
+                        None
+                    } else {
+                        self.picker.next_endgame_block(addr, bitfield)
+                    }
+                }
+            };
+            let Some((index, begin, length)) = next else {
                 return;
             };
             if !self.assembler.is_open(index) {
@@ -1066,15 +1099,26 @@ impl Engine {
     }
 
     fn tick_stats(&mut self) {
+        let now = TokioInstant::now();
         for handle in self.peers.values_mut() {
             handle.rate_base = handle.received_bytes;
             handle.upload_rate_base = handle.uploaded_bytes;
+            handle.rate_samples.push_back((now, handle.received_bytes));
+            while let Some((at, _)) = handle.rate_samples.front() {
+                if now.duration_since(*at) <= RATE_WINDOW {
+                    break;
+                }
+                handle.rate_samples.pop_front();
+            }
+            let rate = match (handle.rate_samples.front(), handle.rate_samples.back()) {
+                (Some((start, start_bytes)), Some((end, end_bytes))) if end > start => {
+                    (*end_bytes - *start_bytes) as f64 / (*end - *start).as_secs_f64()
+                }
+                _ => 0.0,
+            };
+            handle.depth = pipeline_depth(rate, TARGET_RTT, BLOCK_SIZE);
         }
-        self.last_rate = (
-            TokioInstant::now(),
-            self.session_downloaded,
-            self.session_uploaded,
-        );
+        self.last_rate = (now, self.session_downloaded, self.session_uploaded);
         self.publish();
     }
 
