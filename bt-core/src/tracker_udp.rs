@@ -361,6 +361,15 @@ mod tests {
     }
 
     #[test]
+    fn transaction_ids_come_from_a_random_source() {
+        let first = rand_transaction_id();
+        let second = rand_transaction_id();
+        assert_ne!(first, second);
+        assert_ne!(rand_transaction_id(), rand_transaction_id());
+        assert_ne!(rand_transaction_id(), rand_transaction_id());
+    }
+
+    #[test]
     fn parses_udp_urls_including_ipv6_literals() {
         assert_eq!(
             parse_udp_tracker_url("udp://tracker.example.com:1337/announce").unwrap(),
