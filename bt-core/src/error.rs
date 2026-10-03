@@ -156,6 +156,8 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
     #[error("session channel is closed")]
     Closed,
+    #[error("{0}")]
+    Listen(String),
 }
 
 #[derive(Debug, Error)]

@@ -114,7 +114,6 @@ async fn set_settings(
         upload_limit_bps,
     };
     let path = state.data_dir.join("settings.json");
-    save_settings(&path, &settings).map_err(|err| err.to_string())?;
     state
         .session
         .set_upload_limit(upload_limit_bps)
@@ -125,6 +124,7 @@ async fn set_settings(
         .set_listen_port(listen_port)
         .await
         .map_err(|err| err.to_string())?;
+    save_settings(&path, &settings).map_err(|err| err.to_string())?;
     *lock_settings(&state) = settings;
     Ok(())
 }

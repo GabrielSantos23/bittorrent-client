@@ -5,6 +5,9 @@ use std::time::Duration;
 
 use bt_core::engine::State;
 use bt_core::error::SessionError;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use bt_core::peer::handshake::{self, Handshake};
 use bt_core::session::{Session, SessionOptions};
 use common::{temp_dir, test_data, torrent_bytes, FakeDial, SeederKind};
 
@@ -247,6 +250,68 @@ async fn rebinds_listener_and_applies_upload_limit() {
         assert!(
             tokio::time::Instant::now() < deadline,
             "listener never rebound: {snapshot:?}"
+        );
+        if status.changed().await.is_err() {
+            panic!("listener status channel closed");
+        }
+    }
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_rebind_keeps_original_listener_working() {
+    let session = Session::spawn_with_options(None, SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    let mut status = session.listener_status();
+    while !status.borrow().active {
+        assert!(status.changed().await.is_ok());
+    }
+    let original_port = status.borrow().port;
+
+    let data = test_data();
+    let bytes = torrent_bytes(&data);
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
+    let out = temp_dir("rebind-out");
+    std::fs::create_dir_all(&out).unwrap();
+    session.add_torrent(&bytes, out.clone()).await.unwrap();
+
+    let blocker = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let taken_port = blocker.local_addr().unwrap().port();
+    assert!(session.set_listen_port(taken_port).await.is_err());
+
+    let snapshot = status.borrow().clone();
+    assert!(snapshot.active);
+    assert_eq!(snapshot.port, original_port);
+    assert!(snapshot.error.is_none());
+
+    let mut peer = tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, original_port))
+        .await
+        .unwrap();
+    let request = handshake::encode(&Handshake {
+        info_hash: meta.info_hash,
+        reserved: [0; 8],
+        peer_id: [9u8; 20],
+    });
+    peer.write_all(&request).await.unwrap();
+    let mut reply = [0u8; 68];
+    tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut reply))
+        .await
+        .expect("original listener stopped answering")
+        .unwrap();
+    let echoed = handshake::decode(&reply).unwrap();
+    assert_eq!(echoed.info_hash, meta.info_hash);
+
+    session.set_listen_port(0).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = status.borrow().clone();
+        if snapshot.active && snapshot.port != original_port {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener never rebound to a free port: {snapshot:?}"
         );
         if status.changed().await.is_err() {
             panic!("listener status channel closed");

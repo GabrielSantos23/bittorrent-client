@@ -53,6 +53,7 @@ export default function App() {
   const [listener, setListener] = useState<ListenerStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState<SettingsForm | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
 
   useEffect(() => {
     api.list().then(setSummaries).catch(setNotice);
@@ -127,6 +128,7 @@ export default function App() {
   };
 
   const openSettings = () => {
+    setSettingsError(null);
     api
       .getSettings()
       .then((settings) => {
@@ -138,6 +140,7 @@ export default function App() {
 
   const handleSaveSettings = () => {
     if (settingsForm === null) return;
+    setSettingsError(null);
     api
       .setSettings({
         downloadDir: settingsForm.downloadDir,
@@ -145,7 +148,7 @@ export default function App() {
         uploadLimitBps: settingsForm.uploadLimitBps,
       })
       .then(() => setSettingsOpen(false))
-      .catch((err) => setNotice(String(err)));
+      .catch((err) => setSettingsError(String(err)));
   };
 
   return (
@@ -311,6 +314,11 @@ export default function App() {
                   }
                 />
               </div>
+              {settingsError !== null && (
+                <p role="alert" className="text-sm text-destructive">
+                  {settingsError}
+                </p>
+              )}
             </div>
           )}
           <DialogFooter>

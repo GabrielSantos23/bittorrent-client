@@ -119,6 +119,22 @@ pub fn spawn(options: ListenerOptions, registry: Arc<Registry>) -> Listener {
     }
 }
 
+pub async fn bind(options: ListenerOptions, registry: Arc<Registry>) -> Result<Listener, String> {
+    let bound = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, options.port))
+        .await
+        .map_err(|err| format!("cannot bind listen port {}: {err}", options.port))?;
+    let (status_tx, status_rx) = watch::channel(ListenerStatus {
+        active: false,
+        port: options.port,
+        error: None,
+    });
+    let task = tokio::spawn(run_bound(bound, options, registry, status_tx));
+    Ok(Listener {
+        status: status_rx,
+        abort: task.abort_handle(),
+    })
+}
+
 #[derive(Default)]
 struct PendingState {
     total: usize,
@@ -130,17 +146,27 @@ async fn run(
     registry: Arc<Registry>,
     status: watch::Sender<ListenerStatus>,
 ) {
-    let listener = match TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, options.port)).await {
-        Ok(listener) => listener,
+    let bound = TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, options.port)).await;
+    match bound {
+        Ok(listener) => {
+            let _ = run_bound(listener, options, registry, status).await;
+        }
         Err(err) => {
             let _ = status.send(ListenerStatus {
                 active: false,
                 port: options.port,
                 error: Some(format!("cannot bind listen port {}: {err}", options.port)),
             });
-            return;
         }
-    };
+    }
+}
+
+async fn run_bound(
+    listener: TcpListener,
+    options: ListenerOptions,
+    registry: Arc<Registry>,
+    status: watch::Sender<ListenerStatus>,
+) {
     let port = listener
         .local_addr()
         .map(|addr| addr.port())

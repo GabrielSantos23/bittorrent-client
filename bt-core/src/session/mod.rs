@@ -454,17 +454,18 @@ struct SessionActor {
 }
 
 impl SessionActor {
-    fn rebind_listener(&mut self, port: u16) {
-        self.listener.shutdown();
-        self.listener_forwarder.abort();
-        let listener = listener::spawn(
+    async fn rebind_listener(&mut self, port: u16) -> Result<(), String> {
+        let listener = listener::bind(
             ListenerOptions {
                 port,
                 our_peer_id: self.wiring.peer_id,
                 ..ListenerOptions::default()
             },
             self.wiring.registry.clone(),
-        );
+        )
+        .await?;
+        self.listener.shutdown();
+        self.listener_forwarder.abort();
         self.listener_forwarder = spawn_status_forwarder(
             &listener,
             self.status_tx.clone(),
@@ -473,6 +474,7 @@ impl SessionActor {
             self.wiring.announce_port.clone(),
         );
         self.listener = listener;
+        Ok(())
     }
 }
 
@@ -531,8 +533,11 @@ impl SessionActor {
                 let _ = reply.send(Ok(()));
             }
             SessionCommand::SetListenPort { port, reply } => {
-                self.rebind_listener(port);
-                let _ = reply.send(Ok(()));
+                let result = self
+                    .rebind_listener(port)
+                    .await
+                    .map_err(SessionError::Listen);
+                let _ = reply.send(result);
             }
             SessionCommand::Shutdown { reply } => {
                 self.shutdown().await;
