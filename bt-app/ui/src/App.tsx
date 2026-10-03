@@ -31,7 +31,9 @@ export default function App() {
       setHistory((current) => [...current.slice(-(HISTORY_LIMIT - 1)), total]);
     });
     const unDetail = api.onDetail(setDetail);
-    const unDragEnter = api.onDragEnter(() => setDragActive(true));
+    const unDragEnter = api.onDragEnter((paths) => {
+      setDragActive(paths.some(isTorrentPath));
+    });
     const unDragLeave = api.onDragLeave(() => setDragActive(false));
     const unDrop = api.onTorrentDrop((paths) => {
       setDragActive(false);
