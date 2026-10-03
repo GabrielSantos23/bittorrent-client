@@ -236,7 +236,7 @@ async fn run_leecher(
         read_timeout: Duration::from_secs(30),
         ..PeerConfig::default()
     };
-    let mut conn = PeerConnection::new(raw, remote, piece_count, config_for_conn);
+    let mut conn = PeerConnection::new(raw, remote, Some(piece_count), config_for_conn);
     if config.send_interested && conn.write_message(&Message::Interested).await.is_err() {
         report.closed = true;
         return report;
@@ -462,7 +462,7 @@ async fn serve_seeder(
         stream,
         info_hash,
         SEEDER_PEER_ID,
-        piece_count,
+        Some(piece_count),
         PeerConfig::default(),
     )
     .await

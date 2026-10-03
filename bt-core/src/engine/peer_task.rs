@@ -75,6 +75,7 @@ pub enum PeerCommand {
     Have(u32),
     Choke,
     Unchoke,
+    Extended { extension_id: u8, payload: Vec<u8> },
     Stop,
 }
 
@@ -114,6 +115,11 @@ pub enum PeerEvent {
         addr: SocketAddr,
         bytes: u64,
     },
+    Extended {
+        addr: SocketAddr,
+        extension_id: u8,
+        payload: Vec<u8>,
+    },
     Disconnected {
         addr: SocketAddr,
     },
@@ -123,26 +129,24 @@ pub(crate) struct PeerTask {
     pub addr: SocketAddr,
     pub info_hash: [u8; 20],
     pub our_peer_id: [u8; 20],
-    pub piece_count: usize,
-    pub piece_length: u32,
-    pub total_length: u64,
+    pub piece_count: Option<usize>,
     pub config: PeerConfig,
     pub dial: Arc<dyn Dial>,
+    pub extension_handshake: Option<Vec<u8>>,
     pub have: HaveMap,
-    pub storage: Arc<Storage>,
+    pub storage: Option<Arc<Storage>>,
     pub uploads: Arc<UploadBucket>,
 }
 
 pub(crate) struct IncomingPeer {
     pub addr: SocketAddr,
-    pub piece_count: usize,
-    pub piece_length: u32,
-    pub total_length: u64,
+    pub piece_count: Option<usize>,
     pub config: PeerConfig,
     pub remote: Handshake,
     pub stream: BoxedStream,
+    pub extension_handshake: Option<Vec<u8>>,
     pub have: HaveMap,
-    pub storage: Arc<Storage>,
+    pub storage: Option<Arc<Storage>>,
     pub uploads: Arc<UploadBucket>,
 }
 
@@ -163,8 +167,7 @@ pub(crate) async fn run_peer_task(
             task.addr,
             connection,
             task.piece_count,
-            task.piece_length,
-            task.total_length,
+            task.extension_handshake,
             task.have,
             task.storage,
             task.uploads,
@@ -195,8 +198,7 @@ pub(crate) async fn run_incoming_peer_task(
         task.addr,
         connection,
         task.piece_count,
-        task.piece_length,
-        task.total_length,
+        task.extension_handshake,
         task.have,
         task.storage,
         task.uploads,
@@ -230,11 +232,10 @@ async fn connect_outgoing(
 async fn serve_established<S>(
     addr: SocketAddr,
     connection: PeerConnection<S>,
-    piece_count: usize,
-    piece_length: u32,
-    total_length: u64,
+    piece_count: Option<usize>,
+    extension_handshake: Option<Vec<u8>>,
     have: HaveMap,
-    storage: Arc<Storage>,
+    storage: Option<Arc<Storage>>,
     uploads: Arc<UploadBucket>,
     commands: &mut mpsc::Receiver<PeerCommand>,
     events: &mpsc::Sender<PeerEvent>,
@@ -243,6 +244,9 @@ async fn serve_established<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let serving = storage
+        .as_ref()
+        .map(|storage| (storage.piece_length(), storage.total_length()));
     let (mut reader, writer) = connection.into_halves();
     let (write_tx, write_rx) = mpsc::channel::<Message>(WRITE_QUEUE_CAPACITY);
     let writer_task = tokio::spawn(writer_loop(writer, write_rx));
@@ -267,12 +271,19 @@ where
     if snapshot.count() > 0 {
         let _ = write_tx.send(Message::Bitfield(snapshot.clone())).await;
     }
-    let initial_interest = if snapshot.count() >= piece_count {
-        Message::NotInterested
-    } else {
-        Message::Interested
+    let initial_interest = match piece_count {
+        Some(count) if snapshot.count() >= count => Message::NotInterested,
+        _ => Message::Interested,
     };
     let _ = write_tx.send(initial_interest).await;
+    if let Some(payload) = extension_handshake {
+        let _ = write_tx
+            .send(Message::Extended {
+                extension_id: crate::extensions::EXTENSION_HANDSHAKE_ID,
+                payload,
+            })
+            .await;
+    }
 
     let mut last_useful = TokioInstant::now();
     let mut keep_alive = interval_at(
@@ -308,6 +319,18 @@ where
                 }
                 Some(PeerCommand::Have(index)) => {
                     if write_tx.send(Message::Have(index)).await.is_err() {
+                        break Err(PeerError::ConnectionClosed);
+                    }
+                }
+                Some(PeerCommand::Extended { extension_id, payload }) => {
+                    if write_tx
+                        .send(Message::Extended {
+                            extension_id,
+                            payload,
+                        })
+                        .await
+                        .is_err()
+                    {
                         break Err(PeerError::ConnectionClosed);
                     }
                 }
@@ -361,8 +384,7 @@ where
                         we_choke,
                         ServeRequest { index, begin, length },
                         piece_count,
-                        piece_length,
-                        total_length,
+                        serving,
                         &have,
                     ) {
                         RequestDecision::Close => break Ok(()),
@@ -385,6 +407,12 @@ where
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .insert((index, begin, length));
+                }
+                Message::Extended { extension_id, payload } => {
+                    last_useful = TokioInstant::now();
+                    let _ = events
+                        .send(PeerEvent::Extended { addr, extension_id, payload })
+                        .await;
                 }
                 Message::Unknown { .. } => {}
                 Message::Port(_) => {}
@@ -418,7 +446,7 @@ struct ServeRequest {
 
 struct ServeContext {
     addr: SocketAddr,
-    storage: Arc<Storage>,
+    storage: Option<Arc<Storage>>,
     uploads: Arc<UploadBucket>,
     write_tx: mpsc::Sender<Message>,
     cancelled: Arc<Mutex<HashSet<(u32, u32, u32)>>>,
@@ -439,7 +467,9 @@ async fn serve_loop(mut rx: mpsc::Receiver<ServeRequest>, ctx: ServeContext) {
         if is_cancelled(&cancelled, &key) {
             continue;
         }
-        let storage = storage.clone();
+        let Some(storage) = storage.clone() else {
+            break;
+        };
         let index = request.index;
         let begin = request.begin;
         let length = request.length;
@@ -494,12 +524,18 @@ enum RequestDecision {
 fn decide_request(
     we_choke: bool,
     request: ServeRequest,
-    piece_count: usize,
-    piece_length: u32,
-    total_length: u64,
+    piece_count: Option<usize>,
+    serving: Option<(u32, u64)>,
     have: &HaveMap,
 ) -> RequestDecision {
     let (index, begin, length) = (request.index, request.begin, request.length);
+    let Some((piece_length, total_length)) = serving else {
+        return RequestDecision::Ignore;
+    };
+    let piece_count = match piece_count {
+        Some(count) => count,
+        None => return RequestDecision::Ignore,
+    };
     if we_choke || length == 0 {
         return RequestDecision::Ignore;
     }
@@ -565,9 +601,8 @@ mod tests {
                 begin,
                 length,
             },
-            3,
-            64 * 1024,
-            3 * 64 * 1024,
+            Some(3),
+            Some((64 * 1024, 3 * 64 * 1024)),
             have,
         )
     }

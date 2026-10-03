@@ -55,6 +55,14 @@ pub fn decode(input: &[u8]) -> Result<Value, BencodeError> {
     Ok(value)
 }
 
+pub fn decode_prefix(input: &[u8]) -> Result<(Value, usize), BencodeError> {
+    decode_value(input, 0, 0)
+}
+
+pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
+    write_value(value, out);
+}
+
 pub fn encode(value: &Value) -> Vec<u8> {
     let mut out = Vec::new();
     write_value(value, &mut out);

@@ -55,6 +55,9 @@ const CHOKE_SLOTS: usize = 4;
 const ANNOUNCE_BACKOFF_START: Duration = Duration::from_secs(15);
 const ANNOUNCE_BACKOFF_CAP: Duration = Duration::from_secs(600);
 const STOP_ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
+const METADATA_TICK: Duration = Duration::from_millis(500);
+const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_IN_FLIGHT_METADATA: usize = 8;
 const TARGET_RTT: f64 = 1.5;
 const RATE_WINDOW: Duration = Duration::from_secs(6);
 const INITIAL_PIPELINE_DEPTH: usize = 8;
@@ -63,6 +66,7 @@ const INITIAL_PIPELINE_DEPTH: usize = 8;
 #[ts(export)]
 pub enum State {
     Checking,
+    FetchingMetadata,
     Downloading,
     Paused,
     Completed,
@@ -131,7 +135,15 @@ pub struct Stats {
     pub outgoing_peers: usize,
     pub peers: Vec<PeerStats>,
     pub trackers: Vec<TrackerStatus>,
+    pub metadata_progress: Option<MetadataProgress>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct MetadataProgress {
+    pub received: u32,
+    pub total: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +186,13 @@ impl Default for TorrentOptions {
 pub struct Torrent {
     commands: mpsc::Sender<EngineCommand>,
     stats: watch::Receiver<Stats>,
+    metadata: watch::Receiver<Option<Arc<Vec<u8>>>>,
+}
+
+impl Torrent {
+    pub fn subscribe_metadata(&self) -> watch::Receiver<Option<Arc<Vec<u8>>>> {
+        self.metadata.clone()
+    }
 }
 
 impl Torrent {
@@ -214,6 +233,8 @@ impl Torrent {
         let (events_tx, events) = mpsc::channel(1024);
         let (incoming_tx, incoming_rx) = mpsc::channel(8);
         let (announce_results_tx, announce_results) = mpsc::channel(64);
+        let (metadata_tx, metadata_rx) = watch::channel(None);
+        let raw_metainfo = Arc::new(std::sync::Mutex::new(Vec::new()));
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         let name = meta.info.name.clone();
@@ -234,12 +255,16 @@ impl Torrent {
             outgoing_peers: 0,
             peers: Vec::new(),
             trackers: Vec::new(),
+            metadata_progress: None,
             error: None,
         });
         options.registry.register(meta.info_hash, incoming_tx);
         let engine = Engine::new(
             meta,
             storage,
+            raw_metainfo,
+            None,
+            metadata_tx.clone(),
             http,
             options,
             stats_tx,
@@ -254,6 +279,7 @@ impl Torrent {
         Ok(Torrent {
             commands,
             stats: stats_rx,
+            metadata: metadata_rx,
         })
     }
 
@@ -289,6 +315,8 @@ struct PeerHandle {
     client: String,
     peer_id: [u8; 20],
     commands: mpsc::Sender<PeerCommand>,
+    extensions: Option<crate::extensions::ExtensionHandshake>,
+    metadata_trusted: bool,
     bitfield: Option<Bitfield>,
     choked: bool,
     interested: bool,
@@ -305,9 +333,37 @@ struct PeerHandle {
     rate_window: RateWindow,
 }
 
+struct PendingMetadata {
+    info_hash: [u8; 20],
+    display_name: Option<String>,
+    output_dir: PathBuf,
+    size: Option<u64>,
+    pieces: HashMap<u32, Vec<u8>>,
+    in_flight: HashMap<u32, TokioInstant>,
+    round_robin: usize,
+    contributors: HashSet<SocketAddr>,
+}
+
+impl PendingMetadata {
+    fn total_pieces(&self) -> Option<u32> {
+        self.size
+            .map(|size| size.div_ceil(crate::extensions::METADATA_PIECE_SIZE as u64) as u32)
+    }
+
+    fn received_of_total(&self) -> MetadataProgress {
+        MetadataProgress {
+            received: self.pieces.len() as u32,
+            total: self.total_pieces(),
+        }
+    }
+}
+
 struct Engine {
-    meta: Arc<MetaInfo>,
-    storage: Arc<Storage>,
+    meta: Option<Arc<MetaInfo>>,
+    storage: Option<Arc<Storage>>,
+    pending: Option<PendingMetadata>,
+    metadata_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
+    raw_metainfo: Arc<std::sync::Mutex<Vec<u8>>>,
     dial: Arc<dyn Dial>,
     http: reqwest::Client,
     our_peer_id: [u8; 20],
@@ -327,8 +383,9 @@ struct Engine {
     optimistic_peer: Option<SocketAddr>,
     optimistic_cursor: usize,
     total_length: u64,
-    picker: PiecePicker,
-    assembler: PieceAssembler,
+    picker: Option<PiecePicker>,
+    spare_picker: PiecePicker,
+    assembler: Option<PieceAssembler>,
     peers: HashMap<SocketAddr, PeerHandle>,
     backlog: PeerBacklog,
     banned: HashSet<SocketAddr>,
@@ -477,11 +534,55 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+fn metadata_info_and_size(raw: &[u8]) -> Result<(Vec<u8>, u64), crate::error::MetaInfoError> {
+    let root = crate::bencode::decode(raw)?;
+    let dict = root
+        .as_dict()
+        .ok_or(crate::error::MetaInfoError::NotADictionary)?;
+    let info = dict
+        .get(&b"info".to_vec())
+        .ok_or(crate::error::MetaInfoError::MissingInfo)?;
+    let mut bytes = Vec::new();
+    crate::bencode::encode_into(info, &mut bytes);
+    let total_size = match info {
+        crate::bencode::Value::Dict(entries) => entries
+            .get(&b"length".to_vec())
+            .and_then(crate::bencode::Value::as_int)
+            .map(|value| value as u64),
+        _ => None,
+    };
+    let total_size = match total_size {
+        Some(size) => size,
+        None => {
+            let files = info
+                .as_dict()
+                .and_then(|dict| dict.get(&b"files".to_vec()))
+                .and_then(crate::bencode::Value::as_list)
+                .ok_or(crate::error::MetaInfoError::MissingKey("length"))?;
+            let mut total = 0u64;
+            for file in files {
+                let length = file
+                    .as_dict()
+                    .and_then(|dict| dict.get(&b"length".to_vec()))
+                    .and_then(crate::bencode::Value::as_int)
+                    .ok_or(crate::error::MetaInfoError::MissingKey("length"))?;
+                total += length as u64;
+            }
+            total
+        }
+    };
+    Ok((bytes, total_size))
+}
+
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
     fn new(
         meta: Arc<MetaInfo>,
         storage: Arc<Storage>,
+        raw_metainfo: Arc<std::sync::Mutex<Vec<u8>>>,
+        pending: Option<PendingMetadata>,
+        metadata_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
         http: reqwest::Client,
         options: TorrentOptions,
         stats_tx: watch::Sender<Stats>,
@@ -512,16 +613,20 @@ impl Engine {
             ..
         } = options;
         Engine {
-            picker: PiecePicker::new(
+            spare_picker: PiecePicker::new(0, 16384, 0, 0, 1),
+            picker: Some(PiecePicker::new(
                 piece_count,
                 meta.info.piece_length,
                 total_length,
                 RANDOM_FIRST,
                 MAX_ACTIVE_PIECES,
-            ),
-            assembler: PieceAssembler::new(meta.info.piece_length, total_length),
-            meta,
-            storage,
+            )),
+            assembler: Some(PieceAssembler::new(meta.info.piece_length, total_length)),
+            meta: Some(meta),
+            pending,
+            metadata_tx,
+            raw_metainfo,
+            storage: Some(storage),
             dial,
             http,
             our_peer_id,
@@ -566,12 +671,14 @@ impl Engine {
         let mut connect_tick = tokio::time::interval(CONNECT_INTERVAL);
         let mut choke_tick = tokio::time::interval(self.choke_interval);
         let mut optimistic_tick = tokio::time::interval(self.optimistic_interval);
+        let mut metadata_tick = tokio::time::interval(METADATA_TICK);
         for tick in [
             &mut stats_tick,
             &mut reap_tick,
             &mut connect_tick,
             &mut choke_tick,
             &mut optimistic_tick,
+            &mut metadata_tick,
         ] {
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
@@ -609,9 +716,49 @@ impl Engine {
                 _ = connect_tick.tick() => self.try_connect(),
                 _ = choke_tick.tick() => self.apply_choke(false),
                 _ = optimistic_tick.tick() => self.apply_choke(true),
+                _ = metadata_tick.tick() => self.metadata_tick().await,
             }
         }
-        self.registry.unregister(&self.meta.info_hash);
+        self.registry.unregister(&self.info_hash());
+    }
+
+    fn picker(&mut self) -> &mut PiecePicker {
+        match self.picker.as_mut() {
+            Some(picker) => picker,
+            None => {
+                self.error = Some("picker unavailable".to_string());
+                &mut self.spare_picker
+            }
+        }
+    }
+
+    fn piece_size(&self, index: usize) -> usize {
+        match &self.storage {
+            Some(storage) => storage.piece_size(index),
+            None => 0,
+        }
+    }
+
+    fn info_hash(&self) -> [u8; 20] {
+        match &self.meta {
+            Some(meta) => meta.info_hash,
+            None => self
+                .pending
+                .as_ref()
+                .map(|pending| pending.info_hash)
+                .unwrap_or([0; 20]),
+        }
+    }
+
+    fn display_name(&self) -> String {
+        match &self.meta {
+            Some(meta) => meta.info.name.clone(),
+            None => self
+                .pending
+                .as_ref()
+                .and_then(|pending| pending.display_name.clone())
+                .unwrap_or_else(|| crate::hex::encode(&self.info_hash())),
+        }
     }
 
     async fn handle_command(&mut self, command: EngineCommand) {
@@ -628,10 +775,14 @@ impl Engine {
     }
 
     async fn run_check(&mut self) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let Some(meta) = self.meta.clone() else {
+            return;
+        };
         self.state = State::Checking;
         self.publish();
-        let storage = self.storage.clone();
-        let meta = self.meta.clone();
         let progress = self.stats_tx.clone();
         let have = spawn_blocking(move || {
             storage::recheck(&storage, &meta.info.pieces, |done| {
@@ -639,22 +790,26 @@ impl Engine {
             })
         })
         .await;
+        let meta = match &self.meta {
+            Some(meta) => meta.clone(),
+            None => return,
+        };
         match have {
             Ok(have) => {
                 *self
                     .have_map
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = have.clone();
-                self.picker.set_have(&have);
+                self.picker().set_have(&have);
                 let mut verified = 0u64;
-                for index in 0..self.meta.info.pieces.len() {
+                for index in 0..meta.info.pieces.len() {
                     if have.get(index) {
                         verified += self.piece_size(index) as u64;
                     }
                 }
                 self.verified_bytes = verified;
                 self.error = None;
-                if self.picker.is_complete() {
+                if self.picker().is_complete() {
                     self.state = self.completed_state();
                     self.queue_event(Event::Completed);
                     self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
@@ -699,7 +854,11 @@ impl Engine {
 
     fn resume(&mut self) {
         if self.state == State::Paused {
-            self.state = if self.picker.is_complete() {
+            self.state = if self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.is_complete())
+            {
                 self.completed_state()
             } else {
                 State::Downloading
@@ -715,12 +874,12 @@ impl Engine {
         let mut waits = tokio::task::JoinSet::new();
         for tracker in &self.trackers {
             let request = AnnounceRequest {
-                info_hash: self.meta.info_hash,
+                info_hash: self.info_hash(),
                 peer_id: self.our_peer_id,
                 port: self.announce_port.load(Ordering::Relaxed),
                 uploaded: self.session_uploaded,
                 downloaded: self.session_downloaded,
-                left: self.total_length - self.verified_bytes,
+                left: self.left_for_announce(),
                 numwant: 0,
                 event: Some(Event::Stopped),
             };
@@ -742,7 +901,7 @@ impl Engine {
     fn earliest_announce(&self) -> Option<TokioInstant> {
         if !matches!(
             self.state,
-            State::Downloading | State::Completed | State::Seeding
+            State::FetchingMetadata | State::Downloading | State::Completed | State::Seeding
         ) {
             return None;
         }
@@ -756,11 +915,17 @@ impl Engine {
     async fn run_announce(&mut self) {
         if !matches!(
             self.state,
-            State::Downloading | State::Completed | State::Seeding
+            State::FetchingMetadata | State::Downloading | State::Completed | State::Seeding
         ) {
             return;
         }
         let now = TokioInstant::now();
+        let left = self.left_for_announce();
+        let info_hash = self.info_hash();
+        let our_peer_id = self.our_peer_id;
+        let announce_port = self.announce_port.load(Ordering::Relaxed);
+        let uploaded = self.session_uploaded;
+        let downloaded = self.session_downloaded;
         let mut due: Vec<(usize, String, TrackerTransport, AnnounceRequest)> = Vec::new();
         for tracker in &mut self.trackers {
             if !tracker.active || tracker.next_announce > now {
@@ -768,12 +933,12 @@ impl Engine {
             }
             let event = tracker.pending_event.take();
             let request = AnnounceRequest {
-                info_hash: self.meta.info_hash,
-                peer_id: self.our_peer_id,
-                port: self.announce_port.load(Ordering::Relaxed),
-                uploaded: self.session_uploaded,
-                downloaded: self.session_downloaded,
-                left: self.total_length - self.verified_bytes,
+                info_hash,
+                peer_id: our_peer_id,
+                port: announce_port,
+                uploaded,
+                downloaded,
+                left,
                 numwant: NUMWANT,
                 event,
             };
@@ -824,6 +989,372 @@ impl Engine {
                 };
                 TrackerOutcome { id, result }
             }),
+        }
+    }
+
+    fn extension_handshake_payload(&self) -> Option<Vec<u8>> {
+        match (&self.meta, &self.pending) {
+            (Some(meta), _) => Some(crate::extensions::encode_extension_handshake(
+                &crate::extensions::ExtensionHandshake::with_metadata_size(
+                    meta.info.total_length().ok()?,
+                ),
+            )),
+            (None, Some(pending)) => Some(crate::extensions::encode_extension_handshake(
+                &crate::extensions::ExtensionHandshake {
+                    ut_metadata: Some(1),
+                    metadata_size: pending.size,
+                    client: Some(concat!("bt-core/", env!("CARGO_PKG_VERSION")).to_string()),
+                },
+            )),
+            (None, None) => None,
+        }
+    }
+
+    async fn metadata_tick(&mut self) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        if pending.size.is_none() {
+            return;
+        }
+        let now = TokioInstant::now();
+        let expired: Vec<u32> = pending
+            .in_flight
+            .iter()
+            .filter(|(_, sent_at)| now.duration_since(**sent_at) >= METADATA_REQUEST_TIMEOUT)
+            .map(|(piece, _)| *piece)
+            .collect();
+        for piece in &expired {
+            pending.pieces.remove(piece);
+            pending.in_flight.remove(piece);
+        }
+
+        let candidates: Vec<SocketAddr> = self
+            .peers
+            .iter()
+            .filter(|(_, handle)| {
+                handle.metadata_trusted
+                    && handle
+                        .extensions
+                        .as_ref()
+                        .is_some_and(|ext| ext.ut_metadata.is_some())
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
+
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        let Some(total) = pending.total_pieces() else {
+            return;
+        };
+        if candidates.is_empty() {
+            return;
+        }
+
+        let mut in_flight = pending.in_flight.len();
+        let mut round_robin = pending.round_robin;
+        for piece in 0..total {
+            if in_flight >= MAX_IN_FLIGHT_METADATA {
+                break;
+            }
+            if pending.pieces.contains_key(&piece) || pending.in_flight.contains_key(&piece) {
+                continue;
+            }
+            let addr = candidates[round_robin % candidates.len()];
+            round_robin += 1;
+            let Some(extension_id) = self
+                .peers
+                .get(&addr)
+                .and_then(|handle| handle.extensions.as_ref().and_then(|ext| ext.ut_metadata))
+            else {
+                continue;
+            };
+            let payload = crate::extensions::encode_ut_metadata(
+                extension_id,
+                &crate::extensions::UtMetadata::Request { piece },
+            );
+            if let Some(handle) = self.peers.get(&addr) {
+                let _ = handle.commands.try_send(PeerCommand::Extended {
+                    extension_id,
+                    payload,
+                });
+                pending.in_flight.insert(piece, now);
+                in_flight += 1;
+            }
+        }
+        pending.round_robin = round_robin;
+    }
+
+    async fn handle_extended_event(&mut self, addr: SocketAddr, extension_id: u8, payload: &[u8]) {
+        if extension_id == crate::extensions::EXTENSION_HANDSHAKE_ID {
+            let handshake = match crate::extensions::decode_extension_handshake(payload) {
+                Ok(handshake) => handshake,
+                Err(_) => return,
+            };
+            if let Some(handle) = self.peers.get_mut(&addr) {
+                handle.extensions = Some(handshake.clone());
+            }
+            if let Some(pending) = &self.pending {
+                let advertised = handshake.metadata_size;
+                if let Some(advertised) = advertised {
+                    let valid =
+                        advertised > 0 && advertised <= crate::extensions::MAX_METADATA_SIZE;
+                    let consistent = pending.size.is_none_or(|locked| locked == advertised);
+                    if !valid || !consistent {
+                        if let Some(handle) = self.peers.get_mut(&addr) {
+                            handle.metadata_trusted = false;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let Some(handle) = self.peers.get(&addr) else {
+            return;
+        };
+        let remote_ut_metadata = handle.extensions.as_ref().and_then(|ext| ext.ut_metadata);
+        if Some(extension_id) != remote_ut_metadata {
+            return;
+        }
+        let message = match crate::extensions::decode_ut_metadata(payload) {
+            Ok(message) => message,
+            Err(_) => return,
+        };
+        match message {
+            crate::extensions::UtMetadata::Request { piece } => {
+                self.serve_metadata_piece(addr, piece).await;
+            }
+            crate::extensions::UtMetadata::Reject { piece } => {
+                if let Some(pending) = &mut self.pending {
+                    pending.in_flight.remove(&piece);
+                }
+            }
+            crate::extensions::UtMetadata::Data {
+                piece,
+                total_size,
+                data,
+            } => {
+                self.accept_metadata_piece(addr, piece, total_size, data)
+                    .await;
+            }
+        }
+    }
+
+    async fn serve_metadata_piece(&mut self, addr: SocketAddr, piece: u32) {
+        let raw = self
+            .raw_metainfo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Ok((info_bytes, total_size)) = metadata_info_and_size(&raw) else {
+            return;
+        };
+        let total_pieces =
+            total_size.div_ceil(crate::extensions::METADATA_PIECE_SIZE as u64) as u32;
+        let Some(extension_id) = self
+            .peers
+            .get(&addr)
+            .and_then(|handle| handle.extensions.as_ref().and_then(|ext| ext.ut_metadata))
+        else {
+            return;
+        };
+        let payload = if piece < total_pieces {
+            let start = piece as usize * crate::extensions::METADATA_PIECE_SIZE;
+            let mut end = (start + crate::extensions::METADATA_PIECE_SIZE).min(total_size as usize);
+            if end < start {
+                end = start;
+            }
+            crate::extensions::encode_ut_metadata(
+                extension_id,
+                &crate::extensions::UtMetadata::Data {
+                    piece,
+                    total_size,
+                    data: info_bytes[start..end].to_vec(),
+                },
+            )
+        } else {
+            crate::extensions::encode_ut_metadata(
+                extension_id,
+                &crate::extensions::UtMetadata::Reject { piece },
+            )
+        };
+        if let Some(handle) = self.peers.get(&addr) {
+            let _ = handle.commands.try_send(PeerCommand::Extended {
+                extension_id,
+                payload,
+            });
+        }
+    }
+
+    async fn accept_metadata_piece(
+        &mut self,
+        addr: SocketAddr,
+        piece: u32,
+        total_size: u64,
+        data: Vec<u8>,
+    ) {
+        let Some(pending) = self.pending.as_mut() else {
+            return;
+        };
+        {
+            if let Some(locked) = pending.size {
+                if locked != total_size {
+                    if let Some(handle) = self.peers.get_mut(&addr) {
+                        handle.metadata_trusted = false;
+                    }
+                    pending.in_flight.remove(&piece);
+                    return;
+                }
+            } else {
+                if total_size == 0
+                    || total_size > crate::extensions::MAX_METADATA_SIZE
+                    || data.len() > crate::extensions::METADATA_PIECE_SIZE
+                {
+                    return;
+                }
+                pending.size = Some(total_size);
+            }
+            let total_pieces = pending
+                .size
+                .unwrap_or(total_size)
+                .div_ceil(crate::extensions::METADATA_PIECE_SIZE as u64)
+                as u32;
+            if piece >= total_pieces
+                || pending.pieces.contains_key(&piece)
+                || data.len() != crate::extensions::metadata_piece_len(total_size, piece)
+            {
+                return;
+            }
+            pending.pieces.insert(piece, data);
+            pending.in_flight.remove(&piece);
+            pending.contributors.insert(addr);
+            if pending.pieces.len() != total_pieces as usize {
+                return;
+            }
+        }
+        let Some(pending) = self.pending.as_ref() else {
+            return;
+        };
+        let info_hash = pending.info_hash;
+        let output_dir = pending.output_dir.clone();
+        let mut assembled = Vec::with_capacity(pending.size.unwrap_or(0) as usize);
+        let Some(total) = pending.total_pieces() else {
+            return;
+        };
+        for piece in 0..total {
+            match pending.pieces.get(&piece) {
+                Some(data) => assembled.extend_from_slice(data),
+                None => return,
+            }
+        }
+        let contributors: HashSet<SocketAddr> = pending.contributors.iter().copied().collect();
+        if crate::extensions::sha1(&assembled) != info_hash {
+            for contributor in contributors {
+                self.strike(contributor).await;
+            }
+            let Some(pending) = self.pending.as_mut() else {
+                return;
+            };
+            pending.size = None;
+            pending.pieces.clear();
+            pending.in_flight.clear();
+            pending.contributors.clear();
+            return;
+        }
+        self.upgrade_with_metadata(assembled, output_dir).await;
+    }
+
+    async fn upgrade_with_metadata(&mut self, info_dict: Vec<u8>, output_dir: PathBuf) {
+        let trackers: Vec<Vec<String>> = self
+            .trackers
+            .iter()
+            .map(|tracker| vec![tracker.url.clone()])
+            .collect();
+        let mut root = std::collections::BTreeMap::new();
+        let Ok(info) = crate::bencode::decode(&info_dict) else {
+            return;
+        };
+        root.insert(b"info".to_vec(), info);
+        root.insert(
+            b"announce-list".to_vec(),
+            crate::bencode::Value::List(
+                trackers
+                    .iter()
+                    .map(|tier| {
+                        crate::bencode::Value::List(
+                            tier.iter()
+                                .map(|url| crate::bencode::Value::Bytes(url.clone().into_bytes()))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+        let raw = crate::bencode::encode(&crate::bencode::Value::Dict(root));
+        let Ok(meta) = MetaInfo::from_bytes(&raw) else {
+            return;
+        };
+        if meta.info_hash != self.info_hash() {
+            return;
+        }
+        let meta = Arc::new(meta);
+        let output = output_dir.clone();
+        let storage_meta = meta.clone();
+        let storage = match tokio::task::spawn_blocking(move || {
+            Storage::create(&storage_meta, &output)
+        })
+        .await
+        {
+            Ok(Ok(storage)) => Arc::new(storage),
+            _ => {
+                self.error = Some("storage creation failed".to_string());
+                self.state = State::Error;
+                self.publish();
+                return;
+            }
+        };
+        let piece_count = meta.info.pieces.len();
+        let total_length = storage.total_length();
+        self.total_length = total_length;
+        self.picker = Some(PiecePicker::new(
+            piece_count,
+            meta.info.piece_length,
+            total_length,
+            RANDOM_FIRST,
+            MAX_ACTIVE_PIECES,
+        ));
+        self.assembler = Some(PieceAssembler::new(meta.info.piece_length, total_length));
+        self.meta = Some(meta);
+        self.storage = Some(storage);
+        self.raw_metainfo = Arc::new(std::sync::Mutex::new(raw.clone()));
+        self.pending = None;
+        let _ = self.metadata_tx.send(Some(Arc::new(raw)));
+        self.disconnect_all().await;
+        self.run_check().await;
+        let targets: Vec<(u8, mpsc::Sender<PeerCommand>)> = self
+            .peers
+            .values()
+            .filter_map(|handle| {
+                let extension_id = handle.extensions.as_ref().and_then(|ext| ext.ut_metadata)?;
+                Some((extension_id, handle.commands.clone()))
+            })
+            .collect();
+        if let Some(payload) = self.extension_handshake_payload() {
+            for (_, commands) in targets {
+                let _ = commands.try_send(PeerCommand::Extended {
+                    extension_id: crate::extensions::EXTENSION_HANDSHAKE_ID,
+                    payload: payload.clone(),
+                });
+            }
+        }
+        self.try_connect();
+    }
+
+    fn left_for_announce(&self) -> u64 {
+        match &self.pending {
+            Some(pending) => pending.size.unwrap_or(0),
+            None => self.total_length - self.verified_bytes,
         }
     }
 
@@ -985,6 +1516,8 @@ impl Engine {
                 client: String::new(),
                 peer_id: [0; 20],
                 commands,
+                extensions: None,
+                metadata_trusted: true,
                 bitfield: None,
                 choked: true,
                 interested: false,
@@ -1003,13 +1536,12 @@ impl Engine {
         );
         let task = peer_task::PeerTask {
             addr,
-            info_hash: self.meta.info_hash,
+            info_hash: self.info_hash(),
             our_peer_id: self.our_peer_id,
-            piece_count: self.meta.info.pieces.len(),
-            piece_length: self.meta.info.piece_length,
-            total_length: self.total_length,
+            piece_count: self.meta.as_ref().map(|meta| meta.info.pieces.len()),
             config: PeerConfig::default(),
             dial: self.dial.clone(),
+            extension_handshake: self.extension_handshake_payload(),
             have: self.have_map.clone(),
             storage: self.storage.clone(),
             uploads: self.uploads.clone(),
@@ -1040,6 +1572,8 @@ impl Engine {
                 client: String::new(),
                 peer_id: [0; 20],
                 commands,
+                extensions: None,
+                metadata_trusted: true,
                 bitfield: None,
                 choked: true,
                 interested: false,
@@ -1058,12 +1592,11 @@ impl Engine {
         );
         let task = peer_task::IncomingPeer {
             addr,
-            piece_count: self.meta.info.pieces.len(),
-            piece_length: self.meta.info.piece_length,
-            total_length: self.total_length,
+            piece_count: self.meta.as_ref().map(|meta| meta.info.pieces.len()),
             config: PeerConfig::default(),
             remote: incoming.remote,
             stream: incoming.stream,
+            extension_handshake: self.extension_handshake_payload(),
             have: self.have_map.clone(),
             storage: self.storage.clone(),
             uploads: self.uploads.clone(),
@@ -1097,19 +1630,25 @@ impl Engine {
                 self.publish();
             }
             PeerEvent::Bitfield { addr, bitfield } => {
-                self.picker.add_peer(&bitfield);
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.add_peer(&bitfield);
+                }
                 if let Some(handle) = self.peers.get_mut(&addr) {
                     handle.bitfield = Some(bitfield);
                 }
                 self.refill(addr).await;
             }
             PeerEvent::Have { addr, index } => {
-                self.picker.add_have(index as usize);
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.add_have(index as usize);
+                }
                 if let Some(handle) = self.peers.get_mut(&addr) {
-                    let bitfield = handle
-                        .bitfield
-                        .get_or_insert_with(|| Bitfield::new(self.meta.info.pieces.len()));
-                    let _ = bitfield.set(index as usize);
+                    if let Some(meta) = &self.meta {
+                        let bitfield = handle
+                            .bitfield
+                            .get_or_insert_with(|| Bitfield::new(meta.info.pieces.len()));
+                        let _ = bitfield.set(index as usize);
+                    }
                 }
                 self.refill(addr).await;
             }
@@ -1118,7 +1657,9 @@ impl Engine {
                     handle.choked = true;
                     handle.in_flight = 0;
                 }
-                self.picker.return_blocks(addr);
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.return_blocks(addr);
+                }
                 self.refill_all().await;
             }
             PeerEvent::Unchoke { addr } => {
@@ -1153,14 +1694,24 @@ impl Engine {
                 }
                 self.publish();
             }
+            PeerEvent::Extended {
+                addr,
+                extension_id,
+                payload,
+            } => {
+                self.handle_extended_event(addr, extension_id, &payload)
+                    .await;
+            }
             PeerEvent::Disconnected { addr } => {
                 let mut direction = None;
                 if let Some(handle) = self.peers.remove(&addr) {
                     direction = Some(handle.direction);
-                    if let Some(bitfield) = &handle.bitfield {
-                        self.picker.remove_peer(bitfield);
+                    if let Some(picker) = self.picker.as_mut() {
+                        if let Some(bitfield) = &handle.bitfield {
+                            picker.remove_peer(bitfield);
+                        }
+                        picker.return_blocks(addr);
                     }
-                    self.picker.return_blocks(addr);
                 }
                 if direction == Some(PeerDirection::Outgoing) {
                     if self.state == State::Downloading {
@@ -1183,10 +1734,24 @@ impl Engine {
         }
         let index = index as usize;
         let begin = begin as usize;
-        if index >= self.meta.info.pieces.len() {
+        let Some(meta) = &self.meta else {
+            return;
+        };
+        if index >= meta.info.pieces.len() {
             return;
         }
-        match self.assembler.write_block(index, begin, &block) {
+        let Some(assembler) = self.assembler.as_mut() else {
+            return;
+        };
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let piece_size = self
+            .storage
+            .as_ref()
+            .map(|storage| storage.piece_size(index))
+            .unwrap_or(0);
+        match assembler.write_block(index, begin, &block) {
             BlockOutcome::Accepted | BlockOutcome::Completed => {
                 if let Some(handle) = self.peers.get_mut(&addr) {
                     handle.in_flight = handle.in_flight.saturating_sub(1);
@@ -1194,9 +1759,8 @@ impl Engine {
                     handle.window_down += block.len() as u64;
                 }
                 self.session_downloaded += block.len() as u64;
-                let cancel_targets = self.picker.block_received(index, begin, addr);
-                let size = self.piece_size(index);
-                let length = BLOCK_SIZE.min(size.saturating_sub(begin)) as u32;
+                let cancel_targets = picker.block_received(index, begin, addr);
+                let length = BLOCK_SIZE.min(piece_size.saturating_sub(begin)) as u32;
                 for target in cancel_targets {
                     if let Some(handle) = self.peers.get(&target) {
                         let _ = handle.commands.try_send(PeerCommand::Cancel {
@@ -1209,7 +1773,8 @@ impl Engine {
             }
             _ => return,
         }
-        if self.assembler.is_complete(index) {
+        let complete = assembler.is_complete(index);
+        if complete {
             self.finish_piece(index).await;
         } else {
             self.refill(addr).await;
@@ -1217,11 +1782,16 @@ impl Engine {
     }
 
     async fn finish_piece(&mut self, index: usize) {
-        let Some(data) = self.assembler.take(index) else {
+        let Some(data) = self.assembler.as_mut().and_then(|asm| asm.take(index)) else {
             return;
         };
-        let storage = self.storage.clone();
-        let expected = self.meta.info.pieces[index];
+        let Some(meta) = &self.meta else {
+            return;
+        };
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let expected = meta.info.pieces[index];
         let outcome = spawn_blocking(move || {
             let digest: [u8; 20] = Sha1::digest(&data).into();
             if digest != expected {
@@ -1235,14 +1805,14 @@ impl Engine {
         .await;
         match outcome {
             Ok(PieceWriteOutcome::Verified) => {
-                self.picker.mark_have(index);
+                self.picker().mark_have(index);
                 let _ = self
                     .have_map
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .set(index);
                 self.verified_bytes += self.piece_size(index) as u64;
-                if self.picker.is_complete() {
+                if self.picker().is_complete() {
                     self.state = self.completed_state();
                     self.queue_event(Event::Completed);
                     self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
@@ -1252,10 +1822,10 @@ impl Engine {
                 }
             }
             Ok(PieceWriteOutcome::HashMismatch) => {
-                for contributor in self.picker.contributors(index) {
+                for contributor in self.picker().contributors(index) {
                     self.strike(contributor).await;
                 }
-                self.picker.requeue_piece(index);
+                self.picker().requeue_piece(index);
                 self.refill_all().await;
             }
             Ok(PieceWriteOutcome::Failed(err)) => {
@@ -1272,10 +1842,12 @@ impl Engine {
             return;
         }
         if let Some(handle) = self.peers.remove(&addr) {
-            if let Some(bitfield) = &handle.bitfield {
-                self.picker.remove_peer(bitfield);
+            if let Some(picker) = self.picker.as_mut() {
+                if let Some(bitfield) = &handle.bitfield {
+                    picker.remove_peer(bitfield);
+                }
+                picker.return_blocks(addr);
             }
-            self.picker.return_blocks(addr);
             let _ = handle.commands.try_send(PeerCommand::Stop);
         }
         self.refill_all().await;
@@ -1310,27 +1882,31 @@ impl Engine {
                 },
                 None => return,
             };
-            let next = match self.picker.next_block(addr, bitfield) {
+            let Some((picker, assembler)) = self.picker.as_mut().zip(self.assembler.as_mut())
+            else {
+                return;
+            };
+            let next = match picker.next_block(addr, bitfield) {
                 Some(next) => Some(next),
                 None => {
-                    if !self.picker.is_endgame() {
+                    if !picker.is_endgame() {
                         None
                     } else {
-                        self.picker.next_endgame_block(addr, bitfield)
+                        picker.next_endgame_block(addr, bitfield)
                     }
                 }
             };
             let Some((index, begin, length)) = next else {
                 return;
             };
-            if !self.assembler.is_open(index) {
-                self.assembler.open(index);
+            if !assembler.is_open(index) {
+                assembler.open(index);
             }
             let sent = {
                 let Some(handle) = self.peers.get(&addr) else {
                     return;
                 };
-                dispatch_request(&handle.commands, &mut self.picker, index, begin, length)
+                dispatch_request(&handle.commands, picker, index, begin, length)
             };
             if !sent {
                 return;
@@ -1355,7 +1931,10 @@ impl Engine {
     }
 
     async fn reap_stale_requests(&mut self) {
-        let reaped = self.picker.reap_stale(REQUEST_TIMEOUT, TokioInstant::now());
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let reaped = picker.reap_stale(REQUEST_TIMEOUT, TokioInstant::now());
         if reaped.is_empty() {
             return;
         }
@@ -1418,17 +1997,18 @@ impl Engine {
     }
 
     fn reevaluate_completed_state(&mut self) {
-        if self.picker.is_complete() && matches!(self.state, State::Completed | State::Seeding) {
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.is_complete())
+            && matches!(self.state, State::Completed | State::Seeding)
+        {
             let want = self.completed_state();
             if want != self.state {
                 self.state = want;
                 self.publish();
             }
         }
-    }
-
-    fn piece_size(&self, index: usize) -> usize {
-        self.storage.piece_size(index)
     }
 
     fn tick_stats(&mut self) {
@@ -1465,8 +2045,12 @@ impl Engine {
             .count();
         Stats {
             state: self.state,
-            name: self.meta.info.name.clone(),
-            total_length: self.storage.total_length(),
+            name: self.display_name(),
+            total_length: self
+                .storage
+                .as_ref()
+                .map(|storage| storage.total_length())
+                .unwrap_or(self.total_length),
             verified_bytes: self.verified_bytes,
             session_downloaded: self.session_downloaded,
             session_uploaded: self.session_uploaded,
@@ -1476,8 +2060,16 @@ impl Engine {
             } else {
                 0.0
             },
-            verified_pieces: self.picker.have().count(),
-            piece_count: self.meta.info.pieces.len(),
+            verified_pieces: self
+                .picker
+                .as_ref()
+                .map(|picker| picker.have().count())
+                .unwrap_or(0),
+            piece_count: self
+                .meta
+                .as_ref()
+                .map(|meta| meta.info.pieces.len())
+                .unwrap_or(0),
             download_rate: (self.session_downloaded - self.last_rate.1) as f64 / dt,
             peer_count: self.peers.len(),
             incoming_peers,
@@ -1495,6 +2087,10 @@ impl Engine {
                     last_error: tracker.last_error.clone(),
                 })
                 .collect(),
+            metadata_progress: self
+                .pending
+                .as_ref()
+                .map(|pending| pending.received_of_total()),
             error: self.error.clone(),
         }
     }

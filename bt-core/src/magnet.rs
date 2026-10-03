@@ -53,9 +53,7 @@ pub fn parse(uri: &str) -> Result<MagnetLink, MagnetError> {
     if uri.len() > MAX_MAGNET_LENGTH {
         return Err(MagnetError::TooLong(uri.len(), MAX_MAGNET_LENGTH));
     }
-    let query = uri
-        .strip_prefix("magnet:?")
-        .ok_or(MagnetError::MissingXt)?;
+    let query = uri.strip_prefix("magnet:?").ok_or(MagnetError::MissingXt)?;
 
     let mut info_hash: Option<[u8; 20]> = None;
     let mut display_name: Option<String> = None;
@@ -205,8 +203,8 @@ mod tests {
 
     const HEX_HASH: &str = "7acf8fb590b2060dd9c3146ef770169d593433b0";
     const HASH_BYTES: [u8; 20] = [
-        0x7a, 0xcf, 0x8f, 0xb5, 0x90, 0xb2, 0x06, 0x0d, 0xd9, 0xc3, 0x14, 0x6e, 0xf7, 0x70,
-        0x16, 0x9d, 0x59, 0x34, 0x33, 0xb0,
+        0x7a, 0xcf, 0x8f, 0xb5, 0x90, 0xb2, 0x06, 0x0d, 0xd9, 0xc3, 0x14, 0x6e, 0xf7, 0x70, 0x16,
+        0x9d, 0x59, 0x34, 0x33, 0xb0,
     ];
 
     #[test]
@@ -249,7 +247,10 @@ mod tests {
             "magnet:?xt=urn:btih:{HEX_HASH}&tr=udp%3A%2F%2Ft1%3A80&tr=udp%3A%2F%2Ft1%3A80&tr=ftp%3A%2F%2Fnope&tr=https%3A%2F%2Ft2"
         );
         let link = parse(&uri).unwrap();
-        assert_eq!(link.trackers, vec!["udp://t1:80".to_string(), "https://t2".to_string()]);
+        assert_eq!(
+            link.trackers,
+            vec!["udp://t1:80".to_string(), "https://t2".to_string()]
+        );
     }
 
     #[test]
@@ -279,9 +280,8 @@ mod tests {
 
     #[test]
     fn rejects_btmh_only() {
-        let uri = "magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4a76c1"
-            .to_string()
-            + &"0".repeat(32);
+        let uri =
+            "magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4a76c1".to_string() + &"0".repeat(32);
         match parse(&uri).unwrap_err() {
             MagnetError::UnsupportedUrn(urn) => assert!(urn.starts_with("urn:btmh:")),
             other => panic!("expected unsupported urn, got {other:?}"),
@@ -290,12 +290,12 @@ mod tests {
 
     #[test]
     fn rejects_missing_and_garbage_input() {
-        assert_eq!(parse("magnet:?dn=only").unwrap_err(), MagnetError::MissingXt);
-        assert_eq!(parse("not a magnet").unwrap_err(), MagnetError::MissingXt);
         assert_eq!(
-            parse("magnet:?").unwrap_err(),
+            parse("magnet:?dn=only").unwrap_err(),
             MagnetError::MissingXt
         );
+        assert_eq!(parse("not a magnet").unwrap_err(), MagnetError::MissingXt);
+        assert_eq!(parse("magnet:?").unwrap_err(), MagnetError::MissingXt);
     }
 
     #[test]
@@ -316,9 +316,7 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_xt() {
-        let uri = format!(
-            "magnet:?xt=urn:btih:{HEX_HASH}&xt=urn:btih:{HEX_HASH}"
-        );
+        let uri = format!("magnet:?xt=urn:btih:{HEX_HASH}&xt=urn:btih:{HEX_HASH}");
         assert_eq!(parse(&uri).unwrap_err(), MagnetError::DuplicateXt);
     }
 

@@ -4,6 +4,7 @@
 pub mod bencode;
 pub mod engine;
 pub mod error;
+pub mod extensions;
 pub mod hex;
 pub mod listener;
 pub mod magnet;

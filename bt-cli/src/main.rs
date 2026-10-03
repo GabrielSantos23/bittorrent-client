@@ -140,7 +140,7 @@ async fn probe_peer(
         keep_alive_interval: Duration::from_secs(10),
         ..PeerConfig::default()
     };
-    let mut conn = peer::connect(addr, info_hash, our_peer_id, piece_count, config).await?;
+    let mut conn = peer::connect(addr, info_hash, our_peer_id, Some(piece_count), config).await?;
     let client = peer_id::client_name(&conn.remote_peer_id());
     conn.write_message(&Message::Interested).await?;
     let mut completion = None;

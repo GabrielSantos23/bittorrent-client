@@ -14,6 +14,13 @@ impl Bitfield {
         }
     }
 
+    pub fn from_bytes_unchecked(bytes: &[u8]) -> Bitfield {
+        Bitfield {
+            bytes: bytes.to_vec(),
+            piece_count: bytes.len() * 8,
+        }
+    }
+
     pub fn from_bytes(bytes: &[u8], piece_count: usize) -> Result<Bitfield, BitfieldError> {
         let expected = piece_count.div_ceil(8);
         if bytes.len() != expected {

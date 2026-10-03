@@ -38,7 +38,7 @@ pub struct PeerConnection<S> {
     reader: PeerReader<S>,
     writer: PeerWriter<S>,
     remote: Handshake,
-    piece_count: usize,
+    piece_count: Option<usize>,
     config: PeerConfig,
 }
 
@@ -53,7 +53,12 @@ impl<S> std::fmt::Debug for PeerConnection<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite> PeerConnection<S> {
-    pub fn new(stream: S, remote: Handshake, piece_count: usize, config: PeerConfig) -> Self {
+    pub fn new(
+        stream: S,
+        remote: Handshake,
+        piece_count: Option<usize>,
+        config: PeerConfig,
+    ) -> Self {
         let (read, write) = tokio::io::split(stream);
         PeerConnection {
             reader: PeerReader {
@@ -166,7 +171,7 @@ impl<W: AsyncWrite + Unpin> PeerWriter<W> {
 
 pub struct PeerReadHalf<S> {
     inner: PeerReader<S>,
-    piece_count: usize,
+    piece_count: Option<usize>,
     read_timeout: Duration,
 }
 
@@ -219,7 +224,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerConnection<S> {
         mut stream: S,
         info_hash: [u8; 20],
         our_peer_id: [u8; 20],
-        piece_count: usize,
+        piece_count: Option<usize>,
         config: PeerConfig,
     ) -> Result<PeerConnection<S>, PeerError> {
         let remote = handshake::exchange(
@@ -237,7 +242,7 @@ pub async fn connect(
     addr: SocketAddr,
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
-    piece_count: usize,
+    piece_count: Option<usize>,
     config: PeerConfig,
 ) -> Result<PeerConnection<TcpStream>, PeerError> {
     let mut stream = timeout(config.connect_timeout, TcpStream::connect(addr))
@@ -306,7 +311,7 @@ mod tests {
             our_side,
             info_hash,
             *b"-BT0001-abcdefghijkl",
-            16,
+            Some(16),
             test_config(),
         )
         .await
@@ -332,10 +337,15 @@ mod tests {
             their_side.read_exact(&mut request).await.unwrap();
             write_handshake(&mut their_side, &fake_handshake([0x99; 20], [7; 20])).await;
         });
-        let err =
-            PeerConnection::connect_stream(our_side, [0x42; 20], OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap_err();
+        let err = PeerConnection::connect_stream(
+            our_side,
+            [0x42; 20],
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             err,
             PeerError::Handshake(HandshakeError::InfoHashMismatch)
@@ -353,10 +363,15 @@ mod tests {
             write_handshake(&mut their_side, &fake_handshake(info_hash, [7; 20])).await;
             their_side.write_all(&[0, 0, 0, 10, 1, 2]).await.unwrap();
         });
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap();
         let err = conn.read_message().await.unwrap_err();
         assert!(matches!(err, PeerError::ConnectionClosed));
         fake.await.unwrap();
@@ -375,10 +390,15 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap();
         let err = conn.read_message().await.unwrap_err();
         assert!(matches!(err, PeerError::OversizedMessage(1_048_576)));
         fake.await.unwrap();
@@ -397,10 +417,15 @@ mod tests {
             assert_eq!(keep_alive, [0, 0, 0, 0]);
             their_side.write_all(&[0, 0, 0, 0]).await.unwrap();
         });
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap();
         conn.send_keep_alive().await.unwrap();
         assert_eq!(conn.read_message().await.unwrap(), Message::KeepAlive);
         fake.await.unwrap();
@@ -432,9 +457,10 @@ mod tests {
             keep_alive_interval: Duration::from_millis(50),
             ..test_config()
         };
-        let mut conn = PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, config)
-            .await
-            .unwrap();
+        let mut conn =
+            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, Some(16), config)
+                .await
+                .unwrap();
         assert_eq!(conn.read_message().await.unwrap(), Message::Unchoke);
         fake.await.unwrap();
     }
@@ -459,9 +485,10 @@ mod tests {
             read_timeout: Duration::from_millis(80),
             ..test_config()
         };
-        let mut conn = PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, config)
-            .await
-            .unwrap();
+        let mut conn =
+            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, Some(16), config)
+                .await
+                .unwrap();
         assert!(matches!(
             conn.read_message().await.unwrap_err(),
             PeerError::Timeout
@@ -482,10 +509,15 @@ mod tests {
             let mut never = [0u8; 4];
             their_side.read_exact(&mut never).await.unwrap();
         });
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap();
         let err = conn.read_message().await.unwrap_err();
         assert!(matches!(err, PeerError::Timeout));
         fake.abort();
@@ -500,10 +532,15 @@ mod tests {
             let mut never = [0u8; 4];
             their_side.read_exact(&mut never).await.unwrap();
         });
-        let err =
-            PeerConnection::connect_stream(our_side, [0x42; 20], OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap_err();
+        let err = PeerConnection::connect_stream(
+            our_side,
+            [0x42; 20],
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, PeerError::Timeout));
         fake.abort();
     }
@@ -524,10 +561,15 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, 16, test_config())
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            test_config(),
+        )
+        .await
+        .unwrap();
         conn.write_message(&Message::Interested).await.unwrap();
         assert_eq!(
             conn.read_message().await.unwrap(),
