@@ -40,6 +40,7 @@ export function formatAnnounceTime(unixSeconds: number | null, timeZone?: string
 
 export const stateColor: Record<string, string> = {
   Checking: "text-info",
+  FetchingMetadata: "text-info",
   Downloading: "text-primary",
   Paused: "text-muted-foreground",
   Completed: "text-primary",

@@ -53,6 +53,16 @@ async fn add_torrent(state: tauri::State<'_, AppState>, path: String) -> Result<
 }
 
 #[tauri::command]
+async fn add_magnet(state: tauri::State<'_, AppState>, uri: String) -> Result<String, String> {
+    let download_dir = lock_settings(&state).download_dir.clone();
+    state
+        .session
+        .add_magnet(&uri, download_dir)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 async fn list_torrents(state: tauri::State<'_, AppState>) -> Result<Vec<TorrentSummary>, String> {
     Ok(state.session.list().await)
 }
@@ -273,6 +283,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             add_torrent,
+            add_magnet,
             list_torrents,
             pause_torrent,
             resume_torrent,

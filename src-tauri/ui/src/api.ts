@@ -10,6 +10,7 @@ import type { ListenerStatus } from "../../../bt-core/bindings/ListenerStatus";
 export const api = {
   list: () => invoke<TorrentSummary[]>("list_torrents"),
   add: (path: string) => invoke<string>("add_torrent", { path }),
+  addMagnet: (uri: string) => invoke<string>("add_magnet", { uri }),
   pause: (id: string) => invoke<void>("pause_torrent", { id }),
   resume: (id: string) => invoke<void>("resume_torrent", { id }),
   remove: (id: string, deleteFiles: boolean) =>

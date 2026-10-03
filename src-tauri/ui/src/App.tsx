@@ -54,6 +54,9 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState<SettingsForm | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [magnetOpen, setMagnetOpen] = useState(false);
+  const [magnetUri, setMagnetUri] = useState("");
+  const [magnetError, setMagnetError] = useState<string | null>(null);
 
   useEffect(() => {
     api.list().then(setSummaries).catch(setNotice);
@@ -127,6 +130,25 @@ export default function App() {
       .catch((err) => setNotice(String(err)));
   };
 
+  const openMagnet = () => {
+    setMagnetUri("");
+    setMagnetError(null);
+    setMagnetOpen(true);
+  };
+
+  const handleAddMagnet = () => {
+    const uri = magnetUri.trim();
+    if (!uri.startsWith("magnet:?")) {
+      setMagnetError("not a magnet uri");
+      return;
+    }
+    setMagnetError(null);
+    api
+      .addMagnet(uri)
+      .then(() => setMagnetOpen(false))
+      .catch((err) => setMagnetError(String(err)));
+  };
+
   const openSettings = () => {
     setSettingsError(null);
     api
@@ -160,6 +182,9 @@ export default function App() {
         <span className="text-lg font-semibold">BitTorrent Client</span>
         <Button variant="outline" size="sm" onClick={handleAdd}>
           Add torrent
+        </Button>
+        <Button variant="ghost" size="sm" onClick={openMagnet}>
+          Add magnet
         </Button>
         <Button variant="ghost" size="sm" onClick={openSettings}>
           Settings
@@ -256,6 +281,40 @@ export default function App() {
             <Button variant="destructive" onClick={handleConfirmRemove}>
               Remove
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={magnetOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Add magnet</DialogTitle>
+            <DialogDescription>
+              Fetch metadata from peers sharing the info hash.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 py-2">
+            <div className="grid gap-2">
+              <Label htmlFor="magnet-uri">Magnet uri</Label>
+              <Input
+                id="magnet-uri"
+                data-autofocus
+                value={magnetUri}
+                onChange={(event) => setMagnetUri(event.target.value)}
+                placeholder="magnet:?xt=urn:btih:…"
+              />
+            </div>
+            {magnetError !== null && (
+              <p role="alert" className="text-sm text-destructive">
+                {magnetError}
+              </p>
+            )}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setMagnetOpen(false)}>
+              Cancel
+            </Button>
+            <Button onClick={handleAddMagnet}>Add</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>

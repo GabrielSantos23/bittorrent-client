@@ -25,6 +25,7 @@ const badgeVariantByState: Record<
   "default" | "secondary" | "destructive" | "info" | "success"
 > = {
   Checking: "info",
+  FetchingMetadata: "info",
   Downloading: "success",
   Seeding: "info",
   Completed: "success",
@@ -88,16 +89,20 @@ export default function TorrentTable({
                 </TableCell>
                 <TableCell>{formatBytes(summary.total_length)}</TableCell>
                 <TableCell>
-                  <div className="flex items-center gap-2">
-                    <Progress
-                      value={Math.min(Math.max(summary.progress * 100, 0), 100)}
-                      aria-label={`${summary.name} progress`}
-                      className="w-28"
-                    />
-                    <span className="text-muted-foreground">
-                      {(summary.progress * 100).toFixed(1)}%
-                    </span>
-                  </div>
+                  {summary.state === "FetchingMetadata" ? (
+                    <span className="text-xs text-info">fetching metadata…</span>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Progress
+                        value={Math.min(Math.max(summary.progress * 100, 0), 100)}
+                        aria-label={`${summary.name} progress`}
+                        className="w-28"
+                      />
+                      <span className="text-muted-foreground">
+                        {(summary.progress * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                  )}
                 </TableCell>
                 <TableCell>
                   <Badge
