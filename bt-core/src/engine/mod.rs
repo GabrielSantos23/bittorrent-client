@@ -214,6 +214,82 @@ impl Torrent {
         Torrent::spawn_with_options(meta, output_dir, options).await
     }
 
+    pub async fn spawn_from_magnet(
+        link: crate::magnet::MagnetLink,
+        output_dir: PathBuf,
+        options: TorrentOptions,
+    ) -> Result<Torrent, EngineError> {
+        let raw_metainfo: Arc<std::sync::Mutex<Vec<u8>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (commands, command_rx) = mpsc::channel(16);
+        let (events_tx, events) = mpsc::channel(1024);
+        let (incoming_tx, incoming_rx) = mpsc::channel(8);
+        let (announce_results_tx, announce_results) = mpsc::channel(64);
+        let (metadata_tx, metadata_rx) = watch::channel(None);
+        let id = crate::hex::encode(&link.info_hash);
+        let name = link.display_name.clone().unwrap_or_else(|| id.clone());
+        let no_source = link.trackers.is_empty() && link.peers.is_empty();
+        let (stats_tx, stats_rx) = watch::channel(Stats {
+            state: State::FetchingMetadata,
+            name,
+            total_length: 0,
+            verified_bytes: 0,
+            session_downloaded: 0,
+            session_uploaded: 0,
+            upload_rate: 0.0,
+            ratio: 0.0,
+            verified_pieces: 0,
+            piece_count: 0,
+            download_rate: 0.0,
+            peer_count: 0,
+            incoming_peers: 0,
+            outgoing_peers: 0,
+            peers: Vec::new(),
+            trackers: Vec::new(),
+            metadata_progress: Some(MetadataProgress {
+                received: 0,
+                total: None,
+            }),
+            error: if no_source {
+                Some(
+                    "no peer source available: the magnet has no trackers and no x.pe peers"
+                        .to_string(),
+                )
+            } else {
+                None
+            },
+        });
+        options.registry.register(link.info_hash, incoming_tx);
+        let mut bootstrap_peers = Vec::new();
+        for peer in &link.peers {
+            if let Ok(mut addrs) = tokio::net::lookup_host((peer.host.as_str(), peer.port)).await {
+                bootstrap_peers.extend(&mut addrs);
+            }
+        }
+        let mut options = options;
+        options.bootstrap_peers = bootstrap_peers;
+        let engine = Engine::new_from_magnet(
+            link,
+            output_dir,
+            options,
+            stats_tx,
+            command_rx,
+            events_tx,
+            events,
+            incoming_rx,
+            announce_results,
+            announce_results_tx,
+            raw_metainfo,
+            metadata_tx,
+        );
+        tokio::spawn(engine.run());
+        Ok(Torrent {
+            commands,
+            stats: stats_rx,
+            metadata: metadata_rx,
+        })
+    }
+
     pub async fn spawn_with_options(
         meta: MetaInfo,
         output_dir: PathBuf,
@@ -481,11 +557,15 @@ fn shuffle_tier(urls: &[String], rng: &mut impl rand::Rng) -> Vec<String> {
 }
 
 fn build_trackers(meta: &MetaInfo) -> Vec<TrackerRuntime> {
-    let mut rng = rand::rng();
     let mut tiers: Vec<Vec<String>> = meta.announce_list.clone();
     if let Some(announce) = &meta.announce {
         tiers.push(vec![announce.clone()]);
     }
+    build_trackers_from_tiers(tiers)
+}
+
+fn build_trackers_from_tiers(tiers: Vec<Vec<String>>) -> Vec<TrackerRuntime> {
+    let mut rng = rand::rng();
     let mut trackers = Vec::new();
     let mut id = 0usize;
     for (tier, tier_urls) in tiers.iter().enumerate() {
@@ -576,6 +656,102 @@ fn metadata_info_and_size(raw: &[u8]) -> Result<(Vec<u8>, u64), crate::error::Me
 
 impl Engine {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    fn new_from_magnet(
+        link: crate::magnet::MagnetLink,
+        output_dir: PathBuf,
+        options: TorrentOptions,
+        stats_tx: watch::Sender<Stats>,
+        commands: mpsc::Receiver<EngineCommand>,
+        events_tx: mpsc::Sender<PeerEvent>,
+        events: mpsc::Receiver<PeerEvent>,
+        incoming_rx: mpsc::Receiver<Incoming>,
+        announce_results: mpsc::Receiver<TrackerOutcome>,
+        announce_results_tx: mpsc::Sender<TrackerOutcome>,
+        raw_metainfo: Arc<std::sync::Mutex<Vec<u8>>>,
+        metadata_tx: watch::Sender<Option<Arc<Vec<u8>>>>,
+    ) -> Engine {
+        let info_hash = link.info_hash;
+        let mut backlog = PeerBacklog::default();
+        for addr in options.bootstrap_peers {
+            backlog.push(addr);
+        }
+        let have_map: HaveMap = Arc::new(RwLock::new(Bitfield::new(0)));
+        let tiers: Vec<Vec<String>> = if link.trackers.is_empty() {
+            Vec::new()
+        } else {
+            vec![link.trackers.clone()]
+        };
+        let trackers = build_trackers_from_tiers(tiers);
+        let TorrentOptions {
+            dial,
+            listen_active,
+            announce_port,
+            uploads,
+            registry,
+            choke_interval,
+            optimistic_interval,
+            peer_id: our_peer_id,
+            ..
+        } = options;
+        let pending = PendingMetadata {
+            info_hash,
+            display_name: link.display_name,
+            output_dir,
+            size: None,
+            pieces: HashMap::new(),
+            in_flight: HashMap::new(),
+            round_robin: 0,
+            contributors: HashSet::new(),
+        };
+        Engine {
+            picker: None,
+            spare_picker: PiecePicker::new(0, 16384, 0, 0, 1),
+            assembler: None,
+            meta: None,
+            pending: Some(pending),
+            metadata_tx,
+            raw_metainfo,
+            storage: None,
+            dial,
+            http: tracker::http_client().unwrap_or_else(|_| reqwest::Client::new()),
+            our_peer_id,
+            listen_active,
+            announce_port,
+            primary_tier: None,
+            trackers,
+            stats_tx,
+            commands,
+            events_tx,
+            events,
+            incoming_rx,
+            announce_results,
+            announce_results_tx,
+            registry,
+            uploads,
+            have_map,
+            state: State::FetchingMetadata,
+            choke_interval,
+            optimistic_interval,
+            optimistic_peer: None,
+            optimistic_cursor: 0,
+            total_length: 0,
+            peers: HashMap::new(),
+            backlog,
+            banned: HashSet::new(),
+            backoff: HashMap::new(),
+            deferred: HashMap::new(),
+            strikes: HashMap::new(),
+            session_downloaded: 0,
+            session_uploaded: 0,
+            verified_bytes: 0,
+            error: None,
+            last_rate: (TokioInstant::now(), 0, 0),
+            pending_pause: false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new(
         meta: Arc<MetaInfo>,
