@@ -19,6 +19,7 @@ use crate::peer::{Bitfield, PeerConfig};
 use crate::peer_id;
 use crate::ratelimit::{RateWindow, UploadBucket};
 use crate::tracker::{self, AnnounceRequest, AnnounceResponse, Event};
+use crate::tracker_udp::{UdpConfig, UdpTrackerClient};
 
 use self::assembly::{BlockOutcome, PieceAssembler};
 use self::peer_task::{HaveMap, PeerCommand, PeerEvent};
@@ -343,10 +344,17 @@ struct Engine {
     pending_pause: bool,
 }
 
+#[derive(Clone)]
+enum TrackerTransport {
+    Http,
+    Udp(Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<UdpTrackerClient>>>>),
+}
+
 struct TrackerRuntime {
     id: usize,
     url: String,
     tier: usize,
+    transport: TrackerTransport,
     active: bool,
     state: TrackerState,
     last_announce: Option<u64>,
@@ -383,9 +391,13 @@ fn build_trackers(meta: &MetaInfo) -> Vec<TrackerRuntime> {
     for (tier, tier_urls) in tiers.iter().enumerate() {
         let mut first_active = false;
         for (position, url) in shuffle_tier(tier_urls, &mut rng).iter().enumerate() {
-            if !(url.starts_with("http://") || url.starts_with("https://")) {
+            let transport = if url.starts_with("http://") || url.starts_with("https://") {
+                TrackerTransport::Http
+            } else if url.starts_with("udp://") {
+                TrackerTransport::Udp(Arc::new(tokio::sync::OnceCell::new()))
+            } else {
                 continue;
-            }
+            };
             if trackers
                 .iter()
                 .any(|tracker: &TrackerRuntime| tracker.url == *url)
@@ -398,6 +410,7 @@ fn build_trackers(meta: &MetaInfo) -> Vec<TrackerRuntime> {
                 id,
                 url: url.clone(),
                 tier,
+                transport,
                 active,
                 state: TrackerState::Idle,
                 last_announce: None,
@@ -704,7 +717,7 @@ impl Engine {
             return;
         }
         let now = TokioInstant::now();
-        let mut due: Vec<(usize, String, AnnounceRequest)> = Vec::new();
+        let mut due: Vec<(usize, String, TrackerTransport, AnnounceRequest)> = Vec::new();
         for tracker in &mut self.trackers {
             if !tracker.active || tracker.next_announce > now {
                 continue;
@@ -720,27 +733,59 @@ impl Engine {
                 numwant: NUMWANT,
                 event,
             };
-            due.push((tracker.id, tracker.url.clone(), request));
+            due.push((
+                tracker.id,
+                tracker.url.clone(),
+                tracker.transport.clone(),
+                request,
+            ));
             tracker.state = TrackerState::Announcing;
             tracker.next_announce = now + tracker.backoff;
         }
         let due_count = due.len();
-        for (id, url, request) in due {
-            self.spawn_announce(&url, id, request);
+        for (id, url, transport, request) in due {
+            self.spawn_announce(&url, transport, id, request);
         }
         if due_count > 0 {
             self.publish();
         }
     }
 
-    fn spawn_announce(&self, url: &str, id: usize, request: AnnounceRequest) {
-        let http = self.http.clone();
-        let url = url.to_string();
+    fn spawn_announce(
+        &self,
+        url: &str,
+        transport: TrackerTransport,
+        id: usize,
+        request: AnnounceRequest,
+    ) {
         let tx = self.announce_results_tx.clone();
-        tokio::spawn(async move {
-            let result = tracker::http_announce(&http, &url, &request).await;
-            let _ = tx.send(TrackerOutcome { id, result }).await;
-        });
+        match transport {
+            TrackerTransport::Http => {
+                let http = self.http.clone();
+                let url = url.to_string();
+                tokio::spawn(async move {
+                    let result = tracker::http_announce(&http, &url, &request).await;
+                    let _ = tx.send(TrackerOutcome { id, result }).await;
+                });
+            }
+            TrackerTransport::Udp(cell) => {
+                let url = url.to_string();
+                tokio::spawn(async move {
+                    let client = cell
+                        .get_or_try_init(|| async {
+                            UdpTrackerClient::connect_tracker(&url, UdpConfig::default())
+                                .await
+                                .map(|client| Arc::new(tokio::sync::Mutex::new(client)))
+                        })
+                        .await;
+                    let result = match client {
+                        Ok(client) => client.lock().await.announce(&request, -1).await,
+                        Err(err) => Err(err),
+                    };
+                    let _ = tx.send(TrackerOutcome { id, result }).await;
+                });
+            }
+        }
     }
 
     fn handle_tracker_result(&mut self, outcome: TrackerOutcome) {

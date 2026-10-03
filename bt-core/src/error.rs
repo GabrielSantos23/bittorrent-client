@@ -78,6 +78,8 @@ pub enum TrackerError {
     Request(#[from] reqwest::Error),
     #[error("no tracker urls available")]
     NoTrackers,
+    #[error("udp tracker: {0}")]
+    Udp(String),
 }
 
 #[derive(Debug, Error)]
