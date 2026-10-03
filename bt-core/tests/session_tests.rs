@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bt_core::engine::State;
 use bt_core::error::SessionError;
-use bt_core::session::Session;
+use bt_core::session::{Session, SessionOptions};
 use common::{temp_dir, test_data, torrent_bytes, FakeDial, SeederKind};
 
 fn addr(port: u16) -> std::net::SocketAddr {
@@ -224,4 +224,33 @@ async fn skips_corrupted_persistence() {
 
 fn out_display(path: &std::path::Path) -> String {
     path.to_string_lossy().replace('\\', "\\\\")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebinds_listener_and_applies_upload_limit() {
+    let session = Session::spawn_with_options(None, SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    let mut status = session.listener_status();
+    while !status.borrow().active {
+        assert!(status.changed().await.is_ok());
+    }
+    let first = status.borrow().port;
+    session.set_upload_limit(2048).await.unwrap();
+    session.set_listen_port(0).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = status.borrow().clone();
+        if snapshot.active && snapshot.port != first {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "listener never rebound: {snapshot:?}"
+        );
+        if status.changed().await.is_err() {
+            panic!("listener status channel closed");
+        }
+    }
+    session.shutdown().await.unwrap();
 }

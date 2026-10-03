@@ -5,12 +5,12 @@ const MIN_CAPACITY: u64 = 16 * 1024;
 const MAX_WAIT: Duration = Duration::from_secs(60);
 
 struct BucketState {
+    limit: u64,
     tokens: f64,
     last: Instant,
 }
 
 pub struct UploadBucket {
-    limit: u64,
     state: Mutex<BucketState>,
 }
 
@@ -21,8 +21,8 @@ fn capacity(limit: u64) -> u64 {
 impl UploadBucket {
     pub fn new(limit_bytes_per_second: u64) -> UploadBucket {
         UploadBucket {
-            limit: limit_bytes_per_second,
             state: Mutex::new(BucketState {
+                limit: limit_bytes_per_second,
                 tokens: capacity(limit_bytes_per_second) as f64,
                 last: Instant::now(),
             }),
@@ -30,13 +30,22 @@ impl UploadBucket {
     }
 
     pub fn limit(&self) -> u64 {
-        self.limit
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .limit
+    }
+
+    pub fn set_limit(&self, limit_bytes_per_second: u64) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.limit = limit_bytes_per_second;
+        state.tokens = state.tokens.min(capacity(limit_bytes_per_second) as f64);
     }
 
     pub async fn acquire(&self, tokens: u64) {
-        if self.limit == 0 {
-            return;
-        }
         loop {
             let wait = {
                 let mut state = self
@@ -46,14 +55,17 @@ impl UploadBucket {
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.last).as_secs_f64();
                 state.last = now;
-                let cap = capacity(self.limit).max(tokens) as f64;
-                state.tokens = (state.tokens + elapsed * self.limit as f64).min(cap);
+                if state.limit == 0 {
+                    return;
+                }
+                let cap = capacity(state.limit).max(tokens) as f64;
+                state.tokens = (state.tokens + elapsed * state.limit as f64).min(cap);
                 if state.tokens >= tokens as f64 {
                     state.tokens -= tokens as f64;
                     return;
                 }
                 let missing = tokens as f64 - state.tokens;
-                Duration::from_secs_f64((missing / self.limit as f64).clamp(0.001, 60.0))
+                Duration::from_secs_f64((missing / state.limit as f64).clamp(0.001, 60.0))
             };
             let wait = wait.min(MAX_WAIT);
             tokio::time::sleep(wait).await;
@@ -71,6 +83,17 @@ mod tests {
         let start = Instant::now();
         bucket.acquire(1024 * 1024 * 1024).await;
         assert!(start.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn limit_change_applies_immediately() {
+        let bucket = UploadBucket::new(100_000);
+        bucket.set_limit(0);
+        let start = Instant::now();
+        bucket.acquire(1024 * 1024 * 1024).await;
+        assert!(start.elapsed() < Duration::from_millis(100));
+        bucket.set_limit(16 * 1024);
+        assert_eq!(bucket.limit(), 16 * 1024);
     }
 
     #[tokio::test]

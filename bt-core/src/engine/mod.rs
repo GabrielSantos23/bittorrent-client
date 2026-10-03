@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -111,8 +112,8 @@ pub enum EngineCommand {
 pub struct TorrentOptions {
     pub bootstrap_peers: Vec<SocketAddr>,
     pub dial: Arc<dyn Dial>,
-    pub listen_active: bool,
-    pub announce_port: u16,
+    pub listen_active: Arc<AtomicBool>,
+    pub announce_port: Arc<AtomicU16>,
     pub uploads: Arc<UploadBucket>,
     pub registry: Arc<Registry>,
     pub choke_interval: Duration,
@@ -125,8 +126,8 @@ impl Default for TorrentOptions {
         TorrentOptions {
             bootstrap_peers: Vec::new(),
             dial: Arc::new(TcpDial::new(PeerConfig::default().connect_timeout)),
-            listen_active: false,
-            announce_port: DEFAULT_ANNOUNCE_PORT,
+            listen_active: Arc::new(AtomicBool::new(false)),
+            announce_port: Arc::new(AtomicU16::new(DEFAULT_ANNOUNCE_PORT)),
             uploads: Arc::new(UploadBucket::new(0)),
             registry: Arc::new(Registry::default()),
             choke_interval: Duration::from_secs(10),
@@ -270,6 +271,8 @@ struct Engine {
     dial: Arc<dyn Dial>,
     http: reqwest::Client,
     our_peer_id: [u8; 20],
+    listen_active: Arc<AtomicBool>,
+    announce_port: Arc<AtomicU16>,
     stats_tx: watch::Sender<Stats>,
     commands: mpsc::Receiver<EngineCommand>,
     events_tx: mpsc::Sender<PeerEvent>,
@@ -279,8 +282,6 @@ struct Engine {
     uploads: Arc<UploadBucket>,
     have_map: HaveMap,
     state: State,
-    listen_active: bool,
-    announce_port: u16,
     choke_interval: Duration,
     optimistic_interval: Duration,
     optimistic_peer: Option<SocketAddr>,
@@ -500,7 +501,7 @@ impl Engine {
     }
 
     fn completed_state(&self) -> State {
-        if self.listen_active {
+        if self.listen_active.load(Ordering::Relaxed) {
             State::Seeding
         } else {
             State::Completed
@@ -540,7 +541,7 @@ impl Engine {
         let request = AnnounceRequest {
             info_hash: self.meta.info_hash,
             peer_id: self.our_peer_id,
-            port: self.announce_port,
+            port: self.announce_port.load(Ordering::Relaxed),
             uploaded: self.session_uploaded,
             downloaded: self.session_downloaded,
             left: self.total_length - self.verified_bytes,
@@ -564,7 +565,7 @@ impl Engine {
         let request = AnnounceRequest {
             info_hash: self.meta.info_hash,
             peer_id: self.our_peer_id,
-            port: self.announce_port,
+            port: self.announce_port.load(Ordering::Relaxed),
             uploaded: self.session_uploaded,
             downloaded: self.session_downloaded,
             left: self.total_length - self.verified_bytes,
@@ -1003,6 +1004,7 @@ impl Engine {
     }
 
     fn apply_choke(&mut self, rotate: bool) {
+        self.reevaluate_completed_state();
         if self.peers.is_empty() {
             return;
         }
@@ -1045,6 +1047,16 @@ impl Engine {
             for handle in self.peers.values_mut() {
                 handle.window_down = 0;
                 handle.window_up = 0;
+            }
+        }
+    }
+
+    fn reevaluate_completed_state(&mut self) {
+        if self.picker.is_complete() && matches!(self.state, State::Completed | State::Seeding) {
+            let want = self.completed_state();
+            if want != self.state {
+                self.state = want;
+                self.publish();
             }
         }
     }

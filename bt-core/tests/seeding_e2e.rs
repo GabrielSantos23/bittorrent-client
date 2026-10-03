@@ -2,6 +2,7 @@ mod common;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -41,8 +42,8 @@ fn seeder_options(
     TorrentOptions {
         bootstrap_peers: bootstrap,
         dial,
-        listen_active: false,
-        announce_port: 6881,
+        listen_active: Arc::new(AtomicBool::new(false)),
+        announce_port: Arc::new(AtomicU16::new(6881)),
         uploads,
         registry: Arc::new(Registry::default()),
         choke_interval,
@@ -418,8 +419,8 @@ async fn two_engines_transfer_torrents_to_each_other_over_loopback() {
         meta_a.clone(),
         dir_a1.clone(),
         TorrentOptions {
-            listen_active: true,
-            announce_port: port_a,
+            listen_active: Arc::new(AtomicBool::new(true)),
+            announce_port: Arc::new(AtomicU16::new(port_a)),
             registry: registry_a.clone(),
             peer_id: id_a,
             choke_interval: Duration::from_millis(150),
@@ -435,8 +436,8 @@ async fn two_engines_transfer_torrents_to_each_other_over_loopback() {
         dir_b1.clone(),
         TorrentOptions {
             bootstrap_peers: vec![addr(port_a)],
-            listen_active: true,
-            announce_port: port_b,
+            listen_active: Arc::new(AtomicBool::new(true)),
+            announce_port: Arc::new(AtomicU16::new(port_b)),
             registry: registry_b.clone(),
             peer_id: id_b,
             choke_interval: Duration::from_millis(150),
@@ -485,8 +486,8 @@ async fn two_engines_transfer_torrents_to_each_other_over_loopback() {
         meta_b.clone(),
         dir_b2.clone(),
         TorrentOptions {
-            listen_active: true,
-            announce_port: port_b,
+            listen_active: Arc::new(AtomicBool::new(true)),
+            announce_port: Arc::new(AtomicU16::new(port_b)),
             registry: registry_b.clone(),
             peer_id: id_b,
             choke_interval: Duration::from_millis(150),
@@ -502,8 +503,8 @@ async fn two_engines_transfer_torrents_to_each_other_over_loopback() {
         dir_a2.clone(),
         TorrentOptions {
             bootstrap_peers: vec![addr(port_b)],
-            listen_active: true,
-            announce_port: port_a,
+            listen_active: Arc::new(AtomicBool::new(true)),
+            announce_port: Arc::new(AtomicU16::new(port_a)),
             registry: registry_a.clone(),
             peer_id: id_a,
             choke_interval: Duration::from_millis(150),

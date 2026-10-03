@@ -262,7 +262,7 @@ export default function App() {
           <DialogHeader>
             <DialogTitle>Settings</DialogTitle>
             <DialogDescription>
-              Listen port and upload limit apply after a restart.
+              Changes are applied to the running session immediately.
             </DialogDescription>
           </DialogHeader>
           {settingsForm !== null && (

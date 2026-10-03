@@ -2,6 +2,7 @@ mod persist;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use self::persist::{PersistedTorrent, SessionFile};
 use crate::error::SessionError;
 use crate::hex;
 use crate::metainfo::MetaInfo;
+use crate::peer_id;
 
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -116,6 +118,14 @@ enum SessionCommand {
         id: String,
         reply: oneshot::Sender<Option<TorrentDetail>>,
     },
+    SetUploadLimit {
+        bps: u64,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    SetListenPort {
+        port: u16,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -127,6 +137,40 @@ pub struct Session {
     summaries: watch::Receiver<Vec<TorrentSummary>>,
     listener_status: watch::Receiver<ListenerStatus>,
     restore_errors: Arc<Vec<String>>,
+}
+
+fn initial_listener_status(port: u16) -> ListenerStatus {
+    ListenerStatus {
+        active: false,
+        port,
+        error: None,
+    }
+}
+
+fn spawn_status_forwarder(
+    listener: &Listener,
+    status_tx: watch::Sender<ListenerStatus>,
+    configured_port: u16,
+    listen_active: Arc<AtomicBool>,
+    announce_port: Arc<AtomicU16>,
+) -> tokio::task::AbortHandle {
+    let mut status = listener.status();
+    let task = tokio::spawn(async move {
+        loop {
+            let snapshot = status.borrow().clone();
+            listen_active.store(snapshot.active, Ordering::Relaxed);
+            if snapshot.active {
+                announce_port.store(snapshot.port, Ordering::Relaxed);
+            } else {
+                announce_port.store(configured_port, Ordering::Relaxed);
+            }
+            let _ = status_tx.send(snapshot);
+            if status.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    task.abort_handle()
 }
 
 impl Session {
@@ -156,28 +200,35 @@ impl Session {
         options: SessionOptions,
     ) -> Result<Session, SessionError> {
         let registry = Arc::new(Registry::default());
+        let (status_tx, listener_status) =
+            watch::channel(initial_listener_status(options.listen_port));
+        let listen_active = Arc::new(AtomicBool::new(false));
+        let announce_port = Arc::new(AtomicU16::new(options.listen_port));
         let listener = listener::spawn(
             ListenerOptions {
                 port: options.listen_port,
+                our_peer_id: *peer_id::session(),
                 ..ListenerOptions::default()
             },
             registry.clone(),
         );
-        let listener_status = listener.status();
-        let snapshot = listener_status.borrow().clone();
+        let listener_forwarder = spawn_status_forwarder(
+            &listener,
+            status_tx.clone(),
+            options.listen_port,
+            listen_active.clone(),
+            announce_port.clone(),
+        );
         let wiring = EngineWiring {
-            listen_active: snapshot.active,
-            announce_port: if snapshot.active {
-                snapshot.port
-            } else {
-                options.listen_port
-            },
+            listen_active,
+            announce_port,
             uploads: Arc::new(UploadBucket::new(options.upload_limit_bps)),
             registry,
             choke_interval: options.choke_interval,
             optimistic_interval: options.optimistic_interval,
             dial: options.dial,
             bootstrap_peers: options.bootstrap_peers,
+            peer_id: *peer_id::session(),
         };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
@@ -245,6 +296,8 @@ impl Session {
             last: initial,
             commands: command_rx,
             listener,
+            status_tx,
+            listener_forwarder,
         };
         tokio::spawn(actor.run());
         Ok(Session {
@@ -257,6 +310,24 @@ impl Session {
 
     pub fn listener_status(&self) -> watch::Receiver<ListenerStatus> {
         self.listener_status.clone()
+    }
+
+    pub async fn set_upload_limit(&self, bps: u64) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::SetUploadLimit { bps, reply })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
+    pub async fn set_listen_port(&self, port: u16) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::SetListenPort { port, reply })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
     }
 
     pub fn restore_errors(&self) -> &[String] {
@@ -358,14 +429,15 @@ struct SessionTorrent {
 
 #[derive(Clone)]
 struct EngineWiring {
-    listen_active: bool,
-    announce_port: u16,
+    listen_active: Arc<AtomicBool>,
+    announce_port: Arc<AtomicU16>,
     uploads: Arc<UploadBucket>,
     registry: Arc<Registry>,
     choke_interval: Duration,
     optimistic_interval: Duration,
     dial: Arc<dyn crate::engine::Dial>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
+    peer_id: [u8; 20],
 }
 
 struct SessionActor {
@@ -377,6 +449,31 @@ struct SessionActor {
     last: Vec<TorrentSummary>,
     commands: mpsc::Receiver<SessionCommand>,
     listener: Listener,
+    status_tx: watch::Sender<ListenerStatus>,
+    listener_forwarder: tokio::task::AbortHandle,
+}
+
+impl SessionActor {
+    fn rebind_listener(&mut self, port: u16) {
+        self.listener.shutdown();
+        self.listener_forwarder.abort();
+        let listener = listener::spawn(
+            ListenerOptions {
+                port,
+                our_peer_id: self.wiring.peer_id,
+                ..ListenerOptions::default()
+            },
+            self.wiring.registry.clone(),
+        );
+        self.listener_forwarder = spawn_status_forwarder(
+            &listener,
+            self.status_tx.clone(),
+            port,
+            self.wiring.listen_active.clone(),
+            self.wiring.announce_port.clone(),
+        );
+        self.listener = listener;
+    }
 }
 
 impl SessionActor {
@@ -428,6 +525,14 @@ impl SessionActor {
             }
             SessionCommand::Detail { id, reply } => {
                 let _ = reply.send(self.detail(&id));
+            }
+            SessionCommand::SetUploadLimit { bps, reply } => {
+                self.wiring.uploads.set_limit(bps);
+                let _ = reply.send(Ok(()));
+            }
+            SessionCommand::SetListenPort { port, reply } => {
+                self.rebind_listener(port);
+                let _ = reply.send(Ok(()));
             }
             SessionCommand::Shutdown { reply } => {
                 self.shutdown().await;
@@ -598,12 +703,13 @@ async fn spawn_entry(
     let options = crate::engine::TorrentOptions {
         bootstrap_peers: wiring.bootstrap_peers.clone(),
         dial: wiring.dial.clone(),
-        listen_active: wiring.listen_active,
-        announce_port: wiring.announce_port,
+        listen_active: wiring.listen_active.clone(),
+        announce_port: wiring.announce_port.clone(),
         uploads: wiring.uploads.clone(),
         registry: wiring.registry.clone(),
         choke_interval: wiring.choke_interval,
         optimistic_interval: wiring.optimistic_interval,
+        peer_id: wiring.peer_id,
         ..crate::engine::TorrentOptions::default()
     };
     let handle = Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), options).await?;
