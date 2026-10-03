@@ -39,6 +39,8 @@ pub use storage::delete_torrent_files;
 pub const BLOCK_SIZE: usize = assembly::BLOCK_SIZE;
 const MAX_PEERS: usize = 50;
 const MAX_PEERS_PER_IP: usize = 8;
+const QUEUE_CAP: usize = 2000;
+const KNOWN_CAP: usize = 10000;
 const RANDOM_FIRST: usize = 4;
 const MAX_ACTIVE_PIECES: usize = 25;
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
@@ -328,8 +330,7 @@ struct Engine {
     picker: PiecePicker,
     assembler: PieceAssembler,
     peers: HashMap<SocketAddr, PeerHandle>,
-    queue: VecDeque<SocketAddr>,
-    known: HashSet<SocketAddr>,
+    backlog: PeerBacklog,
     banned: HashSet<SocketAddr>,
     backoff: HashMap<SocketAddr, TokioInstant>,
     deferred: HashMap<SocketAddr, TokioInstant>,
@@ -350,6 +351,45 @@ struct Engine {
 enum TrackerTransport {
     Http,
     Udp(Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<UdpTrackerClient>>>>),
+}
+
+#[derive(Default)]
+struct PeerBacklog {
+    queue: VecDeque<SocketAddr>,
+    known: HashSet<SocketAddr>,
+    order: VecDeque<SocketAddr>,
+}
+
+impl PeerBacklog {
+    fn push(&mut self, addr: SocketAddr) {
+        if self.known.contains(&addr) {
+            return;
+        }
+        while self.order.len() >= KNOWN_CAP {
+            match self.order.pop_front() {
+                Some(oldest) => {
+                    self.known.remove(&oldest);
+                }
+                None => break,
+            }
+        }
+        while self.queue.len() >= QUEUE_CAP {
+            self.queue.pop_front();
+        }
+        self.known.insert(addr);
+        self.order.push_back(addr);
+        self.queue.push_back(addr);
+    }
+
+    fn remove(&mut self, addr: &SocketAddr) {
+        self.known.remove(addr);
+        self.order.retain(|known| known != addr);
+        self.queue.retain(|queued| queued != addr);
+    }
+
+    fn is_known(&self, addr: &SocketAddr) -> bool {
+        self.known.contains(addr)
+    }
 }
 
 struct TrackerRuntime {
@@ -453,11 +493,9 @@ impl Engine {
     ) -> Engine {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
-        let mut queue = VecDeque::new();
-        let mut known = HashSet::new();
-        for addr in &options.bootstrap_peers {
-            known.insert(*addr);
-            queue.push_back(*addr);
+        let mut backlog = PeerBacklog::default();
+        for addr in options.bootstrap_peers {
+            backlog.push(addr);
         }
         let have_map: HaveMap = Arc::new(RwLock::new(Bitfield::new(piece_count)));
         let trackers = build_trackers(&meta);
@@ -507,8 +545,7 @@ impl Engine {
             announce_results_tx,
             primary_tier: None,
             peers: HashMap::new(),
-            queue,
-            known,
+            backlog,
             banned: HashSet::new(),
             backoff: HashMap::new(),
             deferred: HashMap::new(),
@@ -829,7 +866,9 @@ impl Engine {
                     .max(1);
                 tracker.next_announce = now + Duration::from_secs(wait);
                 for addr in &response.peers {
-                    self.push_peer(*addr);
+                    if tracker::is_valid_peer_address(*addr) {
+                        self.push_peer(*addr);
+                    }
                 }
                 self.promote_to_tier_front(index);
                 if self.primary_tier.is_none() {
@@ -893,14 +932,10 @@ impl Engine {
     }
 
     fn push_peer(&mut self, addr: SocketAddr) {
-        if self.banned.contains(&addr)
-            || self.known.contains(&addr)
-            || self.peers.contains_key(&addr)
-        {
+        if self.banned.contains(&addr) || self.peers.contains_key(&addr) {
             return;
         }
-        self.known.insert(addr);
-        self.queue.push_back(addr);
+        self.backlog.push(addr);
     }
 
     fn try_connect(&mut self) {
@@ -921,22 +956,21 @@ impl Engine {
     fn pop_eligible(&mut self) -> Option<SocketAddr> {
         let now = TokioInstant::now();
         let mut position = 0;
-        while position < self.queue.len() {
-            let addr = self.queue[position];
+        while position < self.backlog.queue.len() {
+            let addr = self.backlog.queue[position];
             if self.banned.contains(&addr) {
-                self.queue.remove(position);
-                self.known.remove(&addr);
+                self.backlog.remove(&addr);
                 continue;
             }
             if self.peers.contains_key(&addr) {
-                self.queue.remove(position);
+                self.backlog.queue.remove(position);
                 continue;
             }
             if self.backoff.get(&addr).is_some_and(|next| now < *next) {
                 position += 1;
                 continue;
             }
-            self.queue.remove(position);
+            self.backlog.queue.remove(position);
             return Some(addr);
         }
         None
@@ -1132,7 +1166,7 @@ impl Engine {
                         self.backoff
                             .insert(addr, TokioInstant::now() + CONNECT_BACKOFF);
                     }
-                    self.known.remove(&addr);
+                    self.backlog.remove(&addr);
                     self.push_peer(addr);
                 }
                 self.deferred.remove(&addr);
@@ -1680,6 +1714,52 @@ mod tests {
         assert!(unchoke.contains(&addr("5.5.5.5")));
         let (next, _) = rotate_optimistic(&candidates, 4, false, cursor);
         assert_eq!(next, Some(addr("6.6.6.6")));
+    }
+
+    fn backlog_addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], port))
+    }
+
+    #[test]
+    fn backlog_ignores_duplicates() {
+        let mut backlog = PeerBacklog::default();
+        backlog.push(backlog_addr(1));
+        backlog.push(backlog_addr(1));
+        assert_eq!(backlog.queue.len(), 1);
+        assert_eq!(backlog.known.len(), 1);
+    }
+
+    #[test]
+    fn backlog_evicts_oldest_beyond_the_known_cap() {
+        let mut backlog = PeerBacklog::default();
+        for port in 0..(KNOWN_CAP + 2) as u16 {
+            backlog.push(backlog_addr(port));
+        }
+        assert_eq!(backlog.known.len(), KNOWN_CAP);
+        assert!(!backlog.is_known(&backlog_addr(0)));
+        assert!(!backlog.is_known(&backlog_addr(1)));
+        assert!(backlog.is_known(&backlog_addr(2)));
+    }
+
+    #[test]
+    fn backlog_queue_is_capped() {
+        let mut backlog = PeerBacklog::default();
+        for port in 0..(QUEUE_CAP + 2) as u16 {
+            backlog.push(backlog_addr(port));
+        }
+        assert_eq!(backlog.queue.len(), QUEUE_CAP);
+        assert_eq!(backlog.queue.front().copied(), Some(backlog_addr(2)));
+    }
+
+    #[test]
+    fn backlog_remove_drops_everywhere() {
+        let mut backlog = PeerBacklog::default();
+        backlog.push(backlog_addr(1));
+        backlog.push(backlog_addr(2));
+        backlog.remove(&backlog_addr(1));
+        assert!(!backlog.is_known(&backlog_addr(1)));
+        assert_eq!(backlog.queue.len(), 1);
+        assert_eq!(backlog.order.len(), 1);
     }
 
     #[test]

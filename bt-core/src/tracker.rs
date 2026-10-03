@@ -160,6 +160,23 @@ fn candidate_urls(meta: &MetaInfo) -> Vec<&str> {
         .collect()
 }
 
+pub fn is_valid_peer_address(addr: SocketAddr) -> bool {
+    if addr.port() == 0 {
+        return false;
+    }
+    match addr {
+        SocketAddr::V4(v4) => {
+            !(v4.ip().is_unspecified()
+                || v4.ip().is_loopback()
+                || v4.ip().is_broadcast()
+                || v4.ip().is_multicast())
+        }
+        SocketAddr::V6(v6) => {
+            !(v6.ip().is_unspecified() || v6.ip().is_loopback() || v6.ip().is_multicast())
+        }
+    }
+}
+
 pub fn parse_response(raw: &[u8]) -> Result<AnnounceResponse, TrackerError> {
     let value = bencode::decode(raw)?;
     let dict = value.as_dict().ok_or(TrackerError::NotADictionary)?;
@@ -530,6 +547,44 @@ mod tests {
             parse_response(b"i1e"),
             Err(TrackerError::NotADictionary)
         ));
+    }
+
+    #[test]
+    fn filters_invalid_peer_addresses() {
+        assert!(is_valid_peer_address(SocketAddr::from((
+            [192, 168, 1, 10],
+            6881
+        ))));
+        assert!(is_valid_peer_address(SocketAddr::from(([10, 0, 0, 1], 1))));
+        assert!(is_valid_peer_address(SocketAddr::from((
+            [172, 16, 5, 5],
+            5
+        ))));
+        assert!(!is_valid_peer_address(SocketAddr::from(([1, 2, 3, 4], 0))));
+        assert!(!is_valid_peer_address(SocketAddr::from((
+            [0, 0, 0, 0],
+            6881
+        ))));
+        assert!(!is_valid_peer_address(SocketAddr::from((
+            [127, 0, 0, 1],
+            6881
+        ))));
+        assert!(!is_valid_peer_address(SocketAddr::from((
+            [255, 255, 255, 255],
+            6881
+        ))));
+        assert!(!is_valid_peer_address(SocketAddr::from((
+            [224, 0, 0, 1],
+            6881
+        ))));
+        let v6_unspecified: SocketAddr = "[::]:6881".parse().unwrap();
+        let v6_loopback: SocketAddr = "[::1]:6881".parse().unwrap();
+        let v6_multicast: SocketAddr = "[ff02::1]:6881".parse().unwrap();
+        let v6_valid: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
+        assert!(!is_valid_peer_address(v6_unspecified));
+        assert!(!is_valid_peer_address(v6_loopback));
+        assert!(!is_valid_peer_address(v6_multicast));
+        assert!(is_valid_peer_address(v6_valid));
     }
 
     #[test]
