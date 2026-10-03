@@ -302,6 +302,7 @@ pub struct FakeDial {
     piece_count: usize,
     peers: Mutex<HashMap<SocketAddr, SeederKind>>,
     reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
+    dial_counts: Arc<Mutex<HashMap<SocketAddr, usize>>>,
 }
 
 impl FakeDial {
@@ -317,7 +318,17 @@ impl FakeDial {
             piece_count,
             peers: Mutex::new(peers.into_iter().collect()),
             reports: None,
+            dial_counts: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn dial_count(&self, addr: &SocketAddr) -> usize {
+        self.dial_counts
+            .lock()
+            .unwrap()
+            .get(addr)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -335,6 +346,7 @@ impl FakeDial {
             piece_count,
             peers: Mutex::new(peers.into_iter().collect()),
             reports: Some(tx),
+            dial_counts: Arc::new(Mutex::new(HashMap::new())),
         };
         (dial, rx)
     }
@@ -350,6 +362,8 @@ impl Dial for FakeDial {
         let data = self.data.clone();
         let piece_count = self.piece_count;
         let reports = self.reports.clone();
+        let dial_counts = self.dial_counts.clone();
+        *dial_counts.lock().unwrap().entry(addr).or_insert(0) += 1;
         Box::pin(async move {
             let Some(kind) = kind else {
                 return Err(std::io::Error::new(
@@ -584,5 +598,143 @@ async fn serve_seeder(
             Message::Interested | Message::KeepAlive | Message::NotInterested => {}
             _ => {}
         }
+    }
+}
+
+pub struct FakeHttpTracker {
+    pub addr: SocketAddr,
+    requests: tokio::sync::mpsc::Receiver<SocketAddr>,
+    shutdown: tokio::task::AbortHandle,
+}
+
+impl FakeHttpTracker {
+    pub async fn request_count(&mut self) -> u32 {
+        match self.requests.recv().await {
+            Some(_) => 1,
+            None => 0,
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.shutdown.abort();
+    }
+}
+
+fn bencode_announce_body(
+    interval: u64,
+    complete: u64,
+    incomplete: u64,
+    peers: &[SocketAddr],
+) -> Vec<u8> {
+    let mut body = format!(
+        "d8:completei{}e8:intervali{}e10:incompletei{}e5:peers{}:",
+        complete,
+        interval,
+        incomplete,
+        peers.len() * 6
+    )
+    .into_bytes();
+    for peer in peers {
+        if let SocketAddr::V4(v4) = peer {
+            body.extend_from_slice(&v4.ip().octets());
+            body.extend_from_slice(&v4.port().to_be_bytes());
+        }
+    }
+    body.extend_from_slice(b"e");
+    body
+}
+
+fn bencode_failure_body(reason: &str) -> Vec<u8> {
+    let mut body = format!("d14:failure reason{}:", reason.len()).into_bytes();
+    body.extend_from_slice(reason.as_bytes());
+    body.extend_from_slice(b"e");
+    body
+}
+
+pub struct FakeTrackerResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
+impl FakeTrackerResponse {
+    pub fn ok(interval: u64, seeders: u64, leechers: u64, peers: &[SocketAddr]) -> Self {
+        FakeTrackerResponse {
+            status: 200,
+            body: bencode_announce_body(interval, seeders, leechers, peers),
+        }
+    }
+
+    pub fn failure(reason: &str) -> Self {
+        FakeTrackerResponse {
+            status: 200,
+            body: bencode_failure_body(reason),
+        }
+    }
+
+    pub fn http_error(status: u16) -> Self {
+        FakeTrackerResponse {
+            status,
+            body: Vec::new(),
+        }
+    }
+}
+
+pub async fn spawn_fake_http_tracker(response: FakeTrackerResponse) -> (FakeHttpTracker, [u8; 20]) {
+    let info_hash = [0x5au8; 20];
+    (
+        spawn_fake_http_tracker_for(info_hash, response).await,
+        info_hash,
+    )
+}
+
+pub async fn spawn_fake_http_tracker_for(
+    _info_hash: [u8; 20],
+    response: FakeTrackerResponse,
+) -> FakeHttpTracker {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, requests) = tokio::sync::mpsc::channel(64);
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, peer)) = listener.accept().await else {
+                break;
+            };
+            let tx = tx.clone();
+            let response = FakeTrackerResponse {
+                status: response.status,
+                body: response.body.clone(),
+            };
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut byte = [0u8; 1];
+                while let Ok(1) = stream.read(&mut byte).await {
+                    buffer.push(byte[0]);
+                    if buffer.ends_with(b"\r\n\r\n") || buffer.len() > 16 * 1024 {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&buffer);
+                let _ = peer;
+                if !request.contains("info_hash=") {
+                    return;
+                }
+                let _ = tx.send(peer).await;
+                let head = format!(
+                    "HTTP/1.0 {} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.status,
+                    response.body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&response.body).await;
+            });
+        }
+    });
+    FakeHttpTracker {
+        addr,
+        requests,
+        shutdown: task.abort_handle(),
     }
 }

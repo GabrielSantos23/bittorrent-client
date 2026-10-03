@@ -1,4 +1,4 @@
-import { formatBytes, formatRate, formatRatio } from "./format";
+import { formatAnnounceTime, formatBytes, formatRate, formatRatio } from "./format";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Table,
@@ -107,14 +107,27 @@ export default function DetailPanel({ detail }: DetailPanelProps) {
           <dt className="text-muted-foreground">Ratio</dt>
           <dd>{formatRatio(detail.ratio)}</dd>
           <dt className="text-muted-foreground">Trackers</dt>
-          <dd className="flex flex-col gap-1">
+          <dd className="flex flex-col gap-2">
             {detail.trackers.length === 0 ? (
               <span className="text-muted-foreground">none</span>
             ) : (
               detail.trackers.map((tracker) => (
-                <span key={tracker} className="break-all">
-                  {tracker}
-                </span>
+                <div
+                  key={tracker.url}
+                  className="rounded-md border border-border bg-card p-2"
+                >
+                  <div className="break-all">{tracker.url}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {tracker.state} · seeders {tracker.seeders} · leechers{" "}
+                    {tracker.leechers} · last announce{" "}
+                    {formatAnnounceTime(tracker.last_announce)}
+                  </div>
+                  {tracker.last_error !== null && (
+                    <div className="text-xs text-destructive">
+                      {tracker.last_error}
+                    </div>
+                  )}
+                </div>
               ))
             )}
           </dd>

@@ -10,7 +10,7 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::spawn_blocking;
 
-use crate::engine::{PeerStats, State, Torrent};
+use crate::engine::{PeerStats, State, Torrent, TrackerStatus};
 use crate::listener::{self, Listener, ListenerOptions, ListenerStatus, Registry};
 use crate::ratelimit::UploadBucket;
 
@@ -84,7 +84,7 @@ pub struct TorrentDetail {
     pub info_hash: String,
     pub peers: Vec<PeerStats>,
     pub files: Vec<FileSummary>,
-    pub trackers: Vec<String>,
+    pub trackers: Vec<TrackerStatus>,
     pub comment: Option<String>,
     pub output_dir: PathBuf,
     #[ts(type = "number")]
@@ -633,19 +633,12 @@ impl SessionActor {
                 }
             }
         }
-        let mut trackers = Vec::new();
-        if let Some(announce) = &entry.meta.announce {
-            trackers.push(announce.clone());
-        }
-        for tier in &entry.meta.announce_list {
-            trackers.extend(tier.iter().cloned());
-        }
         Some(TorrentDetail {
             id: id.to_string(),
             info_hash: id.to_string(),
             peers: stats.peers,
             files,
-            trackers,
+            trackers: stats.trackers,
             comment: entry.meta.comment.clone(),
             output_dir: entry.output_dir.clone(),
             session_uploaded: stats.session_uploaded,

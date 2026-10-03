@@ -27,6 +27,11 @@ export function formatRatio(ratio: number): string {
   return `${ratio.toFixed(2)}×`;
 }
 
+export function formatAnnounceTime(unixSeconds: number | null): string {
+  if (unixSeconds === null) return "—";
+  return new Date(unixSeconds * 1000).toISOString().slice(11, 19);
+}
+
 export const stateColor: Record<string, string> = {
   Checking: "text-info",
   Downloading: "text-primary",

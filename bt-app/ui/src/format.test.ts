@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatEta, formatRate, formatRatio } from "./format";
+import {
+  formatAnnounceTime,
+  formatBytes,
+  formatEta,
+  formatRate,
+  formatRatio,
+} from "./format";
 
 describe("formatBytes", () => {
   it("formats zero and small values in bytes", () => {
@@ -62,5 +68,16 @@ describe("formatRatio", () => {
     expect(formatRatio(0)).toBe("0.00×");
     expect(formatRatio(0.5)).toBe("0.50×");
     expect(formatRatio(12.345)).toBe("12.35×");
+  });
+});
+
+describe("formatAnnounceTime", () => {
+  it("shows a dash before the first announce", () => {
+    expect(formatAnnounceTime(null)).toBe("—");
+  });
+
+  it("formats the unix timestamp as UTC clock time", () => {
+    expect(formatAnnounceTime(0)).toBe("00:00:00");
+    expect(formatAnnounceTime(1_700_000_000)).toBe("22:13:20");
   });
 });

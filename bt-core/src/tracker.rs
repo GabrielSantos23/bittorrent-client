@@ -95,7 +95,7 @@ pub async fn announce(
 ) -> Result<AnnounceOutcome, TrackerError> {
     let mut last_error: Option<TrackerError> = None;
     for url in candidate_urls(meta) {
-        match announce_single(client, url, request).await {
+        match http_announce(client, url, request).await {
             Ok(response) => {
                 return Ok(AnnounceOutcome {
                     url: url.to_string(),
@@ -111,7 +111,7 @@ pub async fn announce(
     }
 }
 
-async fn announce_single(
+pub async fn http_announce(
     client: &Client,
     url: &str,
     request: &AnnounceRequest,

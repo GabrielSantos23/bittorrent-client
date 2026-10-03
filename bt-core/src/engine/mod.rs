@@ -11,13 +11,14 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::spawn_blocking;
 use tokio::time::{sleep_until, Instant as TokioInstant, MissedTickBehavior};
 
+use crate::error::TrackerError;
 use crate::error::{EngineError, StorageError};
 use crate::listener::{Incoming, Registry};
 use crate::metainfo::MetaInfo;
 use crate::peer::{Bitfield, PeerConfig};
 use crate::peer_id;
 use crate::ratelimit::{RateWindow, UploadBucket};
-use crate::tracker::{self, AnnounceRequest, Event};
+use crate::tracker::{self, AnnounceRequest, AnnounceResponse, Event};
 
 use self::assembly::{BlockOutcome, PieceAssembler};
 use self::peer_task::{HaveMap, PeerCommand, PeerEvent};
@@ -39,7 +40,6 @@ const RANDOM_FIRST: usize = 4;
 const MAX_ACTIVE_PIECES: usize = 25;
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(500);
-const ANNOUNCE_RETRY: Duration = Duration::from_secs(15);
 const CONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const REAP_INTERVAL: Duration = Duration::from_secs(1);
@@ -47,6 +47,9 @@ const BAN_STRIKES: u32 = 3;
 const DEFAULT_ANNOUNCE_PORT: u16 = 6881;
 const NUMWANT: u32 = 50;
 const CHOKE_SLOTS: usize = 4;
+const ANNOUNCE_BACKOFF_START: Duration = Duration::from_secs(15);
+const ANNOUNCE_BACKOFF_CAP: Duration = Duration::from_secs(600);
+const STOP_ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
 const TARGET_RTT: f64 = 1.5;
 const RATE_WINDOW: Duration = Duration::from_secs(6);
 const INITIAL_PIPELINE_DEPTH: usize = 8;
@@ -68,6 +71,29 @@ pub enum State {
 pub enum PeerDirection {
     Incoming,
     Outgoing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub enum TrackerState {
+    Idle,
+    Announcing,
+    Ok,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TrackerStatus {
+    pub url: String,
+    pub state: TrackerState,
+    #[ts(type = "number | null")]
+    pub last_announce: Option<u64>,
+    #[ts(type = "number")]
+    pub seeders: u64,
+    #[ts(type = "number")]
+    pub leechers: u64,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
@@ -99,6 +125,7 @@ pub struct Stats {
     pub incoming_peers: usize,
     pub outgoing_peers: usize,
     pub peers: Vec<PeerStats>,
+    pub trackers: Vec<TrackerStatus>,
     pub error: Option<String>,
 }
 
@@ -181,6 +208,7 @@ impl Torrent {
         let (commands, command_rx) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(1024);
         let (incoming_tx, incoming_rx) = mpsc::channel(8);
+        let (announce_results_tx, announce_results) = mpsc::channel(64);
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         let name = meta.info.name.clone();
@@ -200,6 +228,7 @@ impl Torrent {
             incoming_peers: 0,
             outgoing_peers: 0,
             peers: Vec::new(),
+            trackers: Vec::new(),
             error: None,
         });
         options.registry.register(meta.info_hash, incoming_tx);
@@ -213,6 +242,8 @@ impl Torrent {
             events_tx,
             events,
             incoming_rx,
+            announce_results,
+            announce_results_tx,
         );
         tokio::spawn(engine.run());
         Ok(Torrent {
@@ -305,9 +336,89 @@ struct Engine {
     verified_bytes: u64,
     error: Option<String>,
     last_rate: (TokioInstant, u64, u64),
-    announce_at: Option<TokioInstant>,
-    announce_event: Option<Event>,
+    trackers: Vec<TrackerRuntime>,
+    announce_results: mpsc::Receiver<TrackerOutcome>,
+    announce_results_tx: mpsc::Sender<TrackerOutcome>,
+    primary_tier: Option<usize>,
     pending_pause: bool,
+}
+
+struct TrackerRuntime {
+    id: usize,
+    url: String,
+    tier: usize,
+    active: bool,
+    state: TrackerState,
+    last_announce: Option<u64>,
+    seeders: u64,
+    leechers: u64,
+    last_error: Option<String>,
+    next_announce: TokioInstant,
+    backoff: Duration,
+    pending_event: Option<Event>,
+}
+
+struct TrackerOutcome {
+    id: usize,
+    result: Result<AnnounceResponse, TrackerError>,
+}
+
+fn shuffle_tier(urls: &[String], rng: &mut impl rand::Rng) -> Vec<String> {
+    let mut shuffled: Vec<String> = urls.to_vec();
+    for index in (1..shuffled.len()).rev() {
+        let swap = rng.random_range(0..=index);
+        shuffled.swap(index, swap);
+    }
+    shuffled
+}
+
+fn build_trackers(meta: &MetaInfo) -> Vec<TrackerRuntime> {
+    let mut rng = rand::rng();
+    let mut tiers: Vec<Vec<String>> = meta.announce_list.clone();
+    if let Some(announce) = &meta.announce {
+        tiers.push(vec![announce.clone()]);
+    }
+    let mut trackers = Vec::new();
+    let mut id = 0usize;
+    for (tier, tier_urls) in tiers.iter().enumerate() {
+        let mut first_active = false;
+        for (position, url) in shuffle_tier(tier_urls, &mut rng).iter().enumerate() {
+            if !(url.starts_with("http://") || url.starts_with("https://")) {
+                continue;
+            }
+            if trackers
+                .iter()
+                .any(|tracker: &TrackerRuntime| tracker.url == *url)
+            {
+                continue;
+            }
+            let active = position == 0 && !first_active;
+            first_active |= active;
+            trackers.push(TrackerRuntime {
+                id,
+                url: url.clone(),
+                tier,
+                active,
+                state: TrackerState::Idle,
+                last_announce: None,
+                seeders: 0,
+                leechers: 0,
+                last_error: None,
+                next_announce: TokioInstant::now(),
+                backoff: ANNOUNCE_BACKOFF_START,
+                pending_event: Some(Event::Started),
+            });
+            id += 1;
+        }
+    }
+    trackers
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|span| span.as_secs())
+        .unwrap_or(0)
 }
 
 impl Engine {
@@ -322,6 +433,8 @@ impl Engine {
         events_tx: mpsc::Sender<PeerEvent>,
         events: mpsc::Receiver<PeerEvent>,
         incoming_rx: mpsc::Receiver<Incoming>,
+        announce_results: mpsc::Receiver<TrackerOutcome>,
+        announce_results_tx: mpsc::Sender<TrackerOutcome>,
     ) -> Engine {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
@@ -332,6 +445,7 @@ impl Engine {
             queue.push_back(*addr);
         }
         let have_map: HaveMap = Arc::new(RwLock::new(Bitfield::new(piece_count)));
+        let trackers = build_trackers(&meta);
         let TorrentOptions {
             dial,
             listen_active,
@@ -373,6 +487,10 @@ impl Engine {
             optimistic_peer: None,
             optimistic_cursor: 0,
             total_length,
+            trackers,
+            announce_results,
+            announce_results_tx,
+            primary_tier: None,
             peers: HashMap::new(),
             queue,
             known,
@@ -385,8 +503,6 @@ impl Engine {
             verified_bytes: 0,
             error: None,
             last_rate: (TokioInstant::now(), 0, 0),
-            announce_at: None,
-            announce_event: None,
             pending_pause: false,
         }
     }
@@ -408,7 +524,7 @@ impl Engine {
         }
         self.run_check().await;
         loop {
-            let announce_at = self.announce_at;
+            let announce_at = self.earliest_announce();
             let announce_tick = async move {
                 match announce_at {
                     Some(at) => sleep_until(at).await,
@@ -419,6 +535,11 @@ impl Engine {
                 command = self.commands.recv() => match command {
                     Some(command) => self.handle_command(command).await,
                     None => break,
+                },
+                outcome = self.announce_results.recv() => {
+                    if let Some(outcome) = outcome {
+                        self.handle_tracker_result(outcome);
+                    }
                 },
                 event = self.events.recv() => match event {
                     Some(event) => self.handle_event(event).await,
@@ -482,17 +603,15 @@ impl Engine {
                 self.error = None;
                 if self.picker.is_complete() {
                     self.state = self.completed_state();
-                    self.announce_event = Some(Event::Completed);
-                    self.announce_at = Some(TokioInstant::now() + Duration::from_secs(1));
+                    self.queue_event(Event::Completed);
+                    self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
                 } else {
                     self.state = State::Downloading;
-                    self.announce_event = Some(Event::Started);
-                    self.announce_at = Some(TokioInstant::now());
+                    self.queue_event(Event::Started);
+                    self.wake_trackers(TokioInstant::now());
                 }
                 if self.pending_pause {
                     self.pending_pause = false;
-                    self.announce_at = None;
-                    self.announce_event = None;
                     self.state = State::Paused;
                 }
             }
@@ -518,7 +637,6 @@ impl Engine {
             State::Downloading | State::Completed | State::Seeding => {
                 self.disconnect_all().await;
                 self.backoff.clear();
-                self.announce_at = None;
                 self.state = State::Paused;
                 self.publish();
             }
@@ -533,28 +651,49 @@ impl Engine {
             } else {
                 State::Downloading
             };
-            self.announce_event = Some(Event::Started);
-            self.announce_at = Some(TokioInstant::now());
+            self.queue_event(Event::Started);
+            self.wake_trackers(TokioInstant::now());
             self.publish();
         }
     }
 
     async fn stop(&mut self) {
         self.disconnect_all().await;
-        self.announce_at = None;
-        let request = AnnounceRequest {
-            info_hash: self.meta.info_hash,
-            peer_id: self.our_peer_id,
-            port: self.announce_port.load(Ordering::Relaxed),
-            uploaded: self.session_uploaded,
-            downloaded: self.session_downloaded,
-            left: self.total_length - self.verified_bytes,
-            numwant: 0,
-            event: Some(Event::Stopped),
-        };
-        let _ = tracker::announce(&self.http, &self.meta, &request).await;
+        let mut waits = tokio::task::JoinSet::new();
+        for tracker in &self.trackers {
+            let request = AnnounceRequest {
+                info_hash: self.meta.info_hash,
+                peer_id: self.our_peer_id,
+                port: self.announce_port.load(Ordering::Relaxed),
+                uploaded: self.session_uploaded,
+                downloaded: self.session_downloaded,
+                left: self.total_length - self.verified_bytes,
+                numwant: 0,
+                event: Some(Event::Stopped),
+            };
+            let http = self.http.clone();
+            let url = tracker.url.clone();
+            waits.spawn(async move {
+                let _ = tracker::http_announce(&http, &url, &request).await;
+            });
+        }
+        let _ = tokio::time::timeout(STOP_ANNOUNCE_WAIT, waits.join_all()).await;
         self.state = State::Stopped;
         self.publish();
+    }
+
+    fn earliest_announce(&self) -> Option<TokioInstant> {
+        if !matches!(
+            self.state,
+            State::Downloading | State::Completed | State::Seeding
+        ) {
+            return None;
+        }
+        self.trackers
+            .iter()
+            .filter(|tracker| tracker.active)
+            .map(|tracker| tracker.next_announce)
+            .min()
     }
 
     async fn run_announce(&mut self) {
@@ -562,36 +701,134 @@ impl Engine {
             self.state,
             State::Downloading | State::Completed | State::Seeding
         ) {
-            self.announce_at = None;
             return;
         }
-        let event = self.announce_event.take();
-        let request = AnnounceRequest {
-            info_hash: self.meta.info_hash,
-            peer_id: self.our_peer_id,
-            port: self.announce_port.load(Ordering::Relaxed),
-            uploaded: self.session_uploaded,
-            downloaded: self.session_downloaded,
-            left: self.total_length - self.verified_bytes,
-            numwant: NUMWANT,
-            event,
-        };
-        match tracker::announce(&self.http, &self.meta, &request).await {
-            Ok(outcome) => {
-                for addr in outcome.response.peers {
-                    self.push_peer(addr);
-                }
-                let wait = outcome
-                    .response
-                    .interval
-                    .max(outcome.response.min_interval.unwrap_or(0));
-                self.announce_at = Some(TokioInstant::now() + Duration::from_secs(wait));
+        let now = TokioInstant::now();
+        let mut due: Vec<(usize, String, AnnounceRequest)> = Vec::new();
+        for tracker in &mut self.trackers {
+            if !tracker.active || tracker.next_announce > now {
+                continue;
             }
-            Err(_) => {
-                self.announce_at = Some(TokioInstant::now() + ANNOUNCE_RETRY);
+            let event = tracker.pending_event.take();
+            let request = AnnounceRequest {
+                info_hash: self.meta.info_hash,
+                peer_id: self.our_peer_id,
+                port: self.announce_port.load(Ordering::Relaxed),
+                uploaded: self.session_uploaded,
+                downloaded: self.session_downloaded,
+                left: self.total_length - self.verified_bytes,
+                numwant: NUMWANT,
+                event,
+            };
+            due.push((tracker.id, tracker.url.clone(), request));
+            tracker.state = TrackerState::Announcing;
+            tracker.next_announce = now + tracker.backoff;
+        }
+        let due_count = due.len();
+        for (id, url, request) in due {
+            self.spawn_announce(&url, id, request);
+        }
+        if due_count > 0 {
+            self.publish();
+        }
+    }
+
+    fn spawn_announce(&self, url: &str, id: usize, request: AnnounceRequest) {
+        let http = self.http.clone();
+        let url = url.to_string();
+        let tx = self.announce_results_tx.clone();
+        tokio::spawn(async move {
+            let result = tracker::http_announce(&http, &url, &request).await;
+            let _ = tx.send(TrackerOutcome { id, result }).await;
+        });
+    }
+
+    fn handle_tracker_result(&mut self, outcome: TrackerOutcome) {
+        let now = TokioInstant::now();
+        let Some(index) = self
+            .trackers
+            .iter()
+            .position(|tracker| tracker.id == outcome.id)
+        else {
+            return;
+        };
+        let tier = self.trackers[index].tier;
+        match outcome.result {
+            Ok(response) => {
+                let tracker = &mut self.trackers[index];
+                tracker.state = TrackerState::Ok;
+                tracker.last_announce = Some(unix_now());
+                tracker.seeders = response.complete;
+                tracker.leechers = response.incomplete;
+                tracker.last_error = None;
+                tracker.backoff = ANNOUNCE_BACKOFF_START;
+                let wait = response
+                    .interval
+                    .max(response.min_interval.unwrap_or(0))
+                    .max(1);
+                tracker.next_announce = now + Duration::from_secs(wait);
+                for addr in &response.peers {
+                    self.push_peer(*addr);
+                }
+                self.promote_to_tier_front(index);
+                if self.primary_tier.is_none() {
+                    self.primary_tier = Some(tier);
+                }
+                if self.primary_tier == Some(tier) {
+                    for tracker in &mut self.trackers {
+                        if tracker.tier == tier {
+                            tracker.active = true;
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                let tracker = &mut self.trackers[index];
+                tracker.state = TrackerState::Error;
+                tracker.last_error = Some(err.to_string());
+                tracker.next_announce = now + tracker.backoff;
+                tracker.backoff = (tracker.backoff * 2).min(ANNOUNCE_BACKOFF_CAP);
+                let next: Vec<usize> = self
+                    .trackers
+                    .iter()
+                    .filter(|t| t.tier == tier && !t.active)
+                    .map(|t| t.id)
+                    .collect();
+                if let Some(next_id) = next.first() {
+                    if let Some(t) = self.trackers.iter_mut().find(|t| t.id == *next_id) {
+                        t.active = true;
+                    }
+                }
             }
         }
         self.publish();
+    }
+
+    fn promote_to_tier_front(&mut self, index: usize) {
+        let tier = self.trackers[index].tier;
+        let start = self
+            .trackers
+            .iter()
+            .position(|tracker| tracker.tier == tier)
+            .unwrap_or(index);
+        if index > start {
+            let tracker = self.trackers.remove(index);
+            self.trackers.insert(start, tracker);
+        }
+    }
+
+    fn queue_event(&mut self, event: Event) {
+        for tracker in &mut self.trackers {
+            tracker.pending_event = Some(event);
+        }
+    }
+
+    fn wake_trackers(&mut self, at: TokioInstant) {
+        for tracker in &mut self.trackers {
+            if tracker.active && tracker.next_announce > at {
+                tracker.next_announce = at;
+            }
+        }
     }
 
     fn push_peer(&mut self, addr: SocketAddr) {
@@ -911,8 +1148,8 @@ impl Engine {
                 self.verified_bytes += self.piece_size(index) as u64;
                 if self.picker.is_complete() {
                     self.state = self.completed_state();
-                    self.announce_event = Some(Event::Completed);
-                    self.announce_at = Some(TokioInstant::now() + Duration::from_secs(1));
+                    self.queue_event(Event::Completed);
+                    self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
                     self.disconnect_all().await;
                 } else {
                     self.broadcast_have(index);
@@ -1150,6 +1387,18 @@ impl Engine {
             incoming_peers,
             outgoing_peers: peers.len() - incoming_peers,
             peers,
+            trackers: self
+                .trackers
+                .iter()
+                .map(|tracker| TrackerStatus {
+                    url: tracker.url.clone(),
+                    state: tracker.state,
+                    last_announce: tracker.last_announce,
+                    seeders: tracker.seeders,
+                    leechers: tracker.leechers,
+                    last_error: tracker.last_error.clone(),
+                })
+                .collect(),
             error: self.error.clone(),
         }
     }
@@ -1262,6 +1511,7 @@ fn register_strike(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::SeedableRng;
 
     fn addr(host: &str) -> SocketAddr {
         format!("{host}:1").parse().unwrap()
@@ -1369,6 +1619,27 @@ mod tests {
         assert!(unchoke.contains(&addr("5.5.5.5")));
         let (next, _) = rotate_optimistic(&candidates, 4, false, cursor);
         assert_eq!(next, Some(addr("6.6.6.6")));
+    }
+
+    #[test]
+    fn shuffle_tier_is_a_permutation() {
+        let urls: Vec<String> = [
+            "http://a/announce",
+            "http://b/announce",
+            "http://c/announce",
+            "http://d/announce",
+        ]
+        .iter()
+        .map(|url| url.to_string())
+        .collect();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let shuffled = shuffle_tier(&urls, &mut rng);
+        let mut sorted = shuffled.clone();
+        sorted.sort();
+        let mut expected = urls.clone();
+        expected.sort();
+        assert_eq!(sorted, expected);
+        assert_eq!(shuffled.len(), urls.len());
     }
 
     #[test]
