@@ -764,7 +764,6 @@ impl Engine {
         id: usize,
         request: AnnounceRequest,
     ) -> Pin<Box<dyn Future<Output = TrackerOutcome> + Send>> {
-        let tx = self.announce_results_tx.clone();
         match transport {
             TrackerTransport::Http => {
                 let http = self.http.clone();

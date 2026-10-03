@@ -74,6 +74,8 @@ pub enum TrackerError {
     InvalidPeerEntry,
     #[error("tracker returned HTTP status {0}")]
     HttpStatus(u16),
+    #[error("tracker response of {0} bytes exceeds the {1} byte limit")]
+    ResponseTooLarge(u64, usize),
     #[error("announce request failed: {0}")]
     Request(#[from] reqwest::Error),
     #[error("no tracker urls available")]

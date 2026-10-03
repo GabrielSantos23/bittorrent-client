@@ -249,3 +249,93 @@ async fn stop_returns_within_budget_with_silent_udp_tracker() {
     );
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn announce_for(meta: &MetaInfo) -> bt_core::tracker::AnnounceRequest {
+    bt_core::tracker::AnnounceRequest {
+        info_hash: meta.info_hash,
+        peer_id: *bt_core::peer_id::session(),
+        port: 6881,
+        uploaded: 0,
+        downloaded: 0,
+        left: meta.info.total_length().unwrap(),
+        numwant: 50,
+        event: Some(bt_core::tracker::Event::Started),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endless_tracker_stream_is_capped() {
+    use bt_core::tracker;
+    let addr = common::spawn_endless_http_tracker().await;
+    let (meta, _data) = torrent_with_trackers(vec![vec![format!("http://{addr}/announce")]]);
+    let client = tracker::http_client().unwrap();
+    let started = Instant::now();
+    let result = tracker::http_announce(
+        &client,
+        &format!("http://{addr}/announce"),
+        &announce_for(&meta),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert!(
+        matches!(
+            result,
+            Err(bt_core::error::TrackerError::ResponseTooLarge(_, _))
+        ),
+        "endless stream must be capped, got {result:?}"
+    );
+    assert!(elapsed < Duration::from_secs(5), "cap took {elapsed:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oversized_content_length_is_rejected_before_reading() {
+    use bt_core::tracker;
+    let addr = common::spawn_oversized_content_length_tracker().await;
+    let (meta, _data) = torrent_with_trackers(vec![vec![format!("http://{addr}/announce")]]);
+    let client = tracker::http_client().unwrap();
+    let result = tracker::http_announce(
+        &client,
+        &format!("http://{addr}/announce"),
+        &announce_for(&meta),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(bt_core::error::TrackerError::ResponseTooLarge(2_097_152, _))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redirect_loop_is_bounded() {
+    use bt_core::tracker;
+    let addr = common::spawn_redirect_loop_http_tracker().await;
+    let (meta, _data) = torrent_with_trackers(vec![vec![format!("http://{addr}/announce")]]);
+    let client = tracker::http_client().unwrap();
+    let started = Instant::now();
+    let result = tracker::http_announce(
+        &client,
+        &format!("http://{addr}/announce"),
+        &announce_for(&meta),
+    )
+    .await;
+    assert!(result.is_err(), "redirect loop must fail");
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[tokio::test]
+async fn endless_fake_raw_read() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let addr = common::spawn_endless_http_tracker().await;
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(b"GET /announce?info_hash=x HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buffer = vec![0u8; 70000];
+    let n = stream.read(&mut buffer).await.unwrap();
+    println!(
+        "FIRST READ {n} BYTES: {:?}",
+        String::from_utf8_lossy(&buffer[..n.min(120)])
+    );
+    assert!(n > 0);
+}

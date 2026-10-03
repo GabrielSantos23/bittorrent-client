@@ -738,3 +738,113 @@ pub async fn spawn_fake_http_tracker_for(
         shutdown: task.abort_handle(),
     }
 }
+
+pub async fn spawn_endless_http_tracker() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut byte = [0u8; 1];
+                while let Ok(1) = stream.read(&mut byte).await {
+                    buffer.push(byte[0]);
+                    if buffer.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head =
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+                if stream.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let body = vec![0x41u8; 64 * 1024];
+                let framing = format!("{:x}\r\n", body.len());
+                loop {
+                    if stream.write_all(framing.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if stream.write_all(&body).await.is_err() {
+                        break;
+                    }
+                    if stream.write_all(b"\r\n").await.is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+pub async fn spawn_redirect_loop_http_tracker() -> SocketAddr {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut byte = [0u8; 1];
+                while let Ok(1) = stream.read(&mut byte).await {
+                    buffer.push(byte[0]);
+                    if buffer.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = format!(
+                    "HTTP/1.0 302 Found\r\nLocation: http://{addr}/announce\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+pub async fn spawn_oversized_content_length_tracker() -> SocketAddr {
+    use tokio::io::AsyncWriteExt;
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buffer = Vec::new();
+                let mut byte = [0u8; 1];
+                while let Ok(1) = stream.read(&mut byte).await {
+                    buffer.push(byte[0]);
+                    if buffer.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head =
+                    "HTTP/1.0 200 OK\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\n";
+                let _ = stream.write_all(head.as_bytes()).await;
+            });
+        }
+    });
+    addr
+}
+
+pub async fn spawn_raw_http_listener() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    listener.local_addr().unwrap()
+}

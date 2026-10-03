@@ -55,9 +55,13 @@ pub struct AnnounceOutcome {
     pub response: AnnounceResponse,
 }
 
+pub const MAX_REDIRECTS: usize = 3;
+pub const MAX_TRACKER_RESPONSE_BYTES: usize = 1024 * 1024;
+
 pub fn http_client() -> Result<Client, TrackerError> {
     Client::builder()
         .timeout(REQUEST_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
         .user_agent(concat!("bt-core/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(TrackerError::Request)
@@ -121,7 +125,25 @@ pub async fn http_announce(
     if !status.is_success() {
         return Err(TrackerError::HttpStatus(status.as_u16()));
     }
-    let body = response.bytes().await?;
+    if let Some(length) = response.content_length() {
+        if length as usize > MAX_TRACKER_RESPONSE_BYTES {
+            return Err(TrackerError::ResponseTooLarge(
+                length,
+                MAX_TRACKER_RESPONSE_BYTES,
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_TRACKER_RESPONSE_BYTES {
+            return Err(TrackerError::ResponseTooLarge(
+                (body.len() + chunk.len()) as u64,
+                MAX_TRACKER_RESPONSE_BYTES,
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
     parse_response(&body)
 }
 
