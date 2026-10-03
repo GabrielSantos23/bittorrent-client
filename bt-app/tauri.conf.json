@@ -4,6 +4,15 @@
   "version": "0.1.0",
   "identifier": "com.btcore.desktop",
   "build": {
+    "devUrl": "http://localhost:5183",
+    "beforeDevCommand": {
+      "script": "npm run dev",
+      "cwd": "../bt-app/ui"
+    },
+    "beforeBuildCommand": {
+      "script": "npm run build",
+      "cwd": "../bt-app/ui"
+    },
     "frontendDist": "../bt-app/ui/dist"
   },
   "app": {
