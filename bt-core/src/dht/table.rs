@@ -91,10 +91,16 @@ pub struct RoutingTable {
 }
 
 impl RoutingTable {
-    pub fn new(self_id: NodeId) -> RoutingTable {
+    pub fn new(self_id: NodeId, started_ms: u64) -> RoutingTable {
         RoutingTable {
             self_id,
-            buckets: (0..BUCKET_COUNT).map(|_| Bucket::default()).collect(),
+            buckets: (0..BUCKET_COUNT)
+                .map(|_| Bucket {
+                    nodes: Vec::new(),
+                    pending: None,
+                    last_refresh_ms: Some(started_ms),
+                })
+                .collect(),
         }
     }
 
@@ -253,9 +259,6 @@ impl RoutingTable {
         let Some(bucket) = self.buckets.get(usize::from(bucket_index)) else {
             return false;
         };
-        if bucket.nodes.is_empty() {
-            return false;
-        }
         match bucket.last_refresh_ms {
             Some(last) => now_ms.saturating_sub(last) >= BUCKET_REFRESH_MS,
             None => true,
@@ -361,7 +364,7 @@ mod tests {
     #[test]
     fn nodes_are_split_by_distance_around_our_id() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let mut far_id = [0u8; NODE_ID_LENGTH];
         far_id[0] = 0x80;
         let far = node_at(far_id, [10, 0, 0, 1], 1000);
@@ -382,7 +385,7 @@ mod tests {
     #[test]
     fn own_id_is_rejected() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let outcome = table.offer(node_at([0u8; NODE_ID_LENGTH], [10, 0, 0, 1], 1000), 0);
         assert_eq!(
             outcome,
@@ -395,7 +398,7 @@ mod tests {
     #[test]
     fn invalid_addresses_are_ignored() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         for ip in [
             Ipv4Addr::UNSPECIFIED,
             Ipv4Addr::BROADCAST,
@@ -417,7 +420,7 @@ mod tests {
     #[test]
     fn full_bucket_of_good_nodes_rejects_newcomers() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         fill_bucket_with_good_nodes(&mut table);
         let newcomer = bucket7_node(0x09, 9, 3000);
         assert_eq!(
@@ -432,7 +435,7 @@ mod tests {
     #[test]
     fn bad_node_is_replaced_first() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         fill_bucket_with_good_nodes(&mut table);
         let mut first_id = [0u8; NODE_ID_LENGTH];
         first_id[NODE_ID_LENGTH - 1] = 0x81;
@@ -457,7 +460,7 @@ mod tests {
     #[test]
     fn questionable_node_is_pinged_before_eviction() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let mut oldest_id = [0u8; NODE_ID_LENGTH];
         oldest_id[NODE_ID_LENGTH - 1] = 0x81;
         assert_eq!(
@@ -487,7 +490,7 @@ mod tests {
     #[test]
     fn failed_ping_evicts_the_questionable_node() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let mut oldest_id = [0u8; NODE_ID_LENGTH];
         oldest_id[NODE_ID_LENGTH - 1] = 0x81;
         assert_eq!(
@@ -520,7 +523,7 @@ mod tests {
     #[test]
     fn repeated_offers_update_instead_of_duplicating() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let candidate = bucket7_node(0x01, 1, 2000);
         assert_eq!(table.offer(candidate, 0), OfferOutcome::Accepted);
         assert_eq!(table.offer(candidate, 5000), OfferOutcome::Updated);
@@ -530,7 +533,7 @@ mod tests {
     #[test]
     fn at_most_two_nodes_per_ip_across_the_table() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let first = node_at(
             {
                 let mut id = [0u8; NODE_ID_LENGTH];
@@ -571,7 +574,7 @@ mod tests {
     #[test]
     fn at_most_one_node_per_ip_per_bucket() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let bucket7_first = bucket7_node(0x01, 1, 2000);
         let bucket7_second_same_ip = bucket7_node(0x02, 1, 2001);
         assert_eq!(table.offer(bucket7_first, 0), OfferOutcome::Accepted);
@@ -611,7 +614,7 @@ mod tests {
     #[test]
     fn closest_nodes_are_sorted_by_xor_distance() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let target = NodeId::from_bytes({
             let mut id = [0u8; NODE_ID_LENGTH];
             id[NODE_ID_LENGTH - 1] = 0x42;
@@ -638,7 +641,7 @@ mod tests {
     #[test]
     fn bucket_refresh_timestamps_drive_staleness() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let candidate = bucket7_node(0x01, 1, 2000);
         assert_eq!(table.offer(candidate, 0), OfferOutcome::Accepted);
         let bucket = bucket_index(&distance(&candidate.id, &self_id)).unwrap();
@@ -656,9 +659,67 @@ mod tests {
     }
 
     #[test]
+    fn empty_buckets_become_stale_after_the_refresh_interval() {
+        let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
+        let table = RoutingTable::new(self_id, 0);
+        assert!(!table.bucket_is_stale(100, BUCKET_REFRESH_MS - 1));
+        assert!(table.bucket_is_stale(100, BUCKET_REFRESH_MS));
+        assert!(table.stale_buckets(BUCKET_REFRESH_MS).contains(&100));
+    }
+
+    #[test]
+    fn table_start_anchors_empty_bucket_staleness() {
+        let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
+        let started = 10_000;
+        let table = RoutingTable::new(self_id, started);
+        assert!(!table.bucket_is_stale(159, started + BUCKET_REFRESH_MS - 1));
+        assert!(table.bucket_is_stale(159, started + BUCKET_REFRESH_MS));
+    }
+
+    #[test]
+    fn activity_resets_only_the_touched_bucket() {
+        let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
+        let mut table = RoutingTable::new(self_id, 0);
+        let candidate = bucket7_node(0x01, 1, 2000);
+        assert_eq!(
+            table.offer(candidate, BUCKET_REFRESH_MS - 1_000),
+            OfferOutcome::Accepted
+        );
+        let bucket = bucket_index(&distance(&candidate.id, &self_id)).unwrap();
+        assert_eq!(bucket, 7);
+        assert!(!table.bucket_is_stale(bucket, BUCKET_REFRESH_MS));
+        assert!(
+            table.bucket_is_stale(150, BUCKET_REFRESH_MS),
+            "an untouched empty bucket goes stale from table start"
+        );
+    }
+
+    #[test]
+    fn a_bucket_that_gains_nodes_freshens_only_itself() {
+        let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
+        let mut table = RoutingTable::new(self_id, 0);
+        let far = node_at(
+            {
+                let mut id = [0u8; NODE_ID_LENGTH];
+                id[0] = 0x80;
+                id
+            },
+            [10, 0, 0, 1],
+            2000,
+        );
+        let bucket = bucket_index(&distance(&far.id, &self_id)).unwrap();
+        assert!(table.bucket_is_stale(bucket, BUCKET_REFRESH_MS));
+        assert_eq!(table.offer(far, BUCKET_REFRESH_MS), OfferOutcome::Accepted);
+        assert!(!table.bucket_is_stale(bucket, BUCKET_REFRESH_MS + 1));
+        assert!(!table.bucket_is_stale(bucket, 2 * BUCKET_REFRESH_MS - 1));
+        assert!(table.bucket_is_stale(bucket, 2 * BUCKET_REFRESH_MS));
+        assert!(table.bucket_is_stale(150, 2 * BUCKET_REFRESH_MS));
+    }
+
+    #[test]
     fn refresh_target_lands_in_the_requested_bucket() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let table = RoutingTable::new(self_id);
+        let table = RoutingTable::new(self_id, 0);
         let source = FixedRandom(Mutex::new(vec![0xFFu8; 40]));
         for bucket in [0u8, 1, 7, 8, 152, 159] {
             let target = table.refresh_target(bucket, &source);
@@ -673,7 +734,7 @@ mod tests {
     #[test]
     fn two_failures_make_a_node_bad() {
         let self_id = NodeId::from_bytes([0u8; NODE_ID_LENGTH]);
-        let mut table = RoutingTable::new(self_id);
+        let mut table = RoutingTable::new(self_id, 0);
         let id = NodeId::from_bytes(*bucket7_node(0x01, 1, 0).id.as_bytes());
         assert_eq!(
             table.note_failure(&id, 0),
