@@ -627,3 +627,63 @@ async fn endgame_requests_last_piece_from_multiple_peers() {
     torrent.stop().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_metadata_fetch_and_download_from_one_peer() {
+    let data = test_data();
+    let meta = torrent_meta(&data);
+    let root_value = bt_core::bencode::decode(&common::torrent_bytes(&data)).unwrap();
+    let info_value = match &root_value {
+        bt_core::bencode::Value::Dict(entries) => entries.get(&b"info".to_vec()).unwrap().clone(),
+        _ => unreachable!(),
+    };
+    let info_dict = Arc::new(bt_core::bencode::encode(&info_value));
+    let dial = Arc::new(FakeDial::with_metadata(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![(addr(7201), SeederKind::Good)],
+        info_dict.clone(),
+    ));
+    let magnet = bt_core::magnet::MagnetLink {
+        info_hash: meta.info_hash,
+        display_name: Some("e2e.bin".to_string()),
+        trackers: Vec::new(),
+        peers: vec![bt_core::magnet::MagnetPeer {
+            host: "127.0.0.1".to_string(),
+            port: 7201,
+        }],
+    };
+    let dir = temp_dir("magnet-one");
+    let torrent = Torrent::spawn_from_magnet(
+        magnet,
+        dir.clone(),
+        TorrentOptions {
+            dial,
+            registry: Arc::new(bt_core::listener::Registry::default()),
+            choke_interval: Duration::from_millis(100),
+            optimistic_interval: Duration::from_millis(200),
+            ..TorrentOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut stats = torrent.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = stats.borrow().clone();
+        if matches!(snapshot.state, State::Completed | State::Seeding)
+            && snapshot.verified_bytes == snapshot.total_length
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "magnet torrent never completed: {snapshot:?}"
+        );
+        assert!(stats.changed().await.is_ok());
+    }
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}

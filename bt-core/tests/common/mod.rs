@@ -303,6 +303,7 @@ pub struct FakeDial {
     peers: Mutex<HashMap<SocketAddr, SeederKind>>,
     reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
     dial_counts: Arc<Mutex<HashMap<SocketAddr, usize>>>,
+    metadata: Option<Arc<Vec<u8>>>,
 }
 
 impl FakeDial {
@@ -319,6 +320,25 @@ impl FakeDial {
             peers: Mutex::new(peers.into_iter().collect()),
             reports: None,
             dial_counts: Arc::new(Mutex::new(HashMap::new())),
+            metadata: None,
+        }
+    }
+
+    pub fn with_metadata(
+        info_hash: [u8; 20],
+        data: Arc<Vec<u8>>,
+        piece_count: usize,
+        peers: Vec<(SocketAddr, SeederKind)>,
+        metadata: Arc<Vec<u8>>,
+    ) -> FakeDial {
+        FakeDial {
+            info_hash,
+            data,
+            piece_count,
+            peers: Mutex::new(peers.into_iter().collect()),
+            reports: None,
+            dial_counts: Arc::new(Mutex::new(HashMap::new())),
+            metadata: Some(metadata),
         }
     }
 
@@ -347,6 +367,7 @@ impl FakeDial {
             peers: Mutex::new(peers.into_iter().collect()),
             reports: Some(tx),
             dial_counts: Arc::new(Mutex::new(HashMap::new())),
+            metadata: None,
         };
         (dial, rx)
     }
@@ -363,6 +384,7 @@ impl Dial for FakeDial {
         let piece_count = self.piece_count;
         let reports = self.reports.clone();
         let dial_counts = self.dial_counts.clone();
+        let metadata = self.metadata.clone();
         *dial_counts.lock().unwrap().entry(addr).or_insert(0) += 1;
         Box::pin(async move {
             let Some(kind) = kind else {
@@ -379,6 +401,7 @@ impl Dial for FakeDial {
                 data,
                 piece_count,
                 kind,
+                metadata,
                 reports,
             ));
             Ok(Box::new(client_side) as BoxedStream)
@@ -429,6 +452,7 @@ pub fn temp_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_seeder(
     stream: BoxedStream,
     addr: SocketAddr,
@@ -436,6 +460,7 @@ async fn run_seeder(
     data: Arc<Vec<u8>>,
     piece_count: usize,
     kind: SeederKind,
+    metadata: Option<Arc<Vec<u8>>>,
     reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
 ) {
     let mut report = SeederReport {
@@ -444,7 +469,16 @@ async fn run_seeder(
         cancels_received: 0,
         last_piece_requests: 0,
     };
-    serve_seeder(stream, info_hash, data, piece_count, kind, &mut report).await;
+    serve_seeder(
+        stream,
+        info_hash,
+        data,
+        piece_count,
+        kind,
+        metadata,
+        &mut report,
+    )
+    .await;
     if let Some(sender) = reports {
         let _ = sender.send(report).await;
     }
@@ -456,6 +490,7 @@ async fn serve_seeder(
     data: Arc<Vec<u8>>,
     piece_count: usize,
     kind: SeederKind,
+    metadata: Option<Arc<Vec<u8>>>,
     report: &mut SeederReport,
 ) {
     let mut conn = PeerConnection::connect_stream(
@@ -475,6 +510,16 @@ async fn serve_seeder(
         .await
         .unwrap();
     conn.write_message(&Message::Unchoke).await.unwrap();
+    if let Some(info_dict) = &metadata {
+        let handshake =
+            bt_core::extensions::ExtensionHandshake::with_metadata_size(info_dict.len() as u64);
+        conn.write_message(&Message::Extended {
+            extension_id: bt_core::extensions::EXTENSION_HANDSHAKE_ID,
+            payload: bt_core::extensions::encode_extension_handshake(&handshake),
+        })
+        .await
+        .unwrap();
+    }
     if kind == SeederKind::NeverReads {
         std::future::pending::<()>().await;
     }
@@ -582,6 +627,34 @@ async fn serve_seeder(
                     .is_err()
                 {
                     return;
+                }
+            }
+            Message::Extended {
+                extension_id,
+                payload,
+            } => {
+                eprintln!("[seed-ext] got extended id {extension_id}");
+                if let Some(info_dict) = &metadata {
+                    if extension_id != bt_core::extensions::EXTENSION_HANDSHAKE_ID {
+                        let request = bt_core::extensions::decode_ut_metadata(&payload);
+                        if let Ok(bt_core::extensions::UtMetadata::Request { piece }) = request {
+                            let data = info_dict[piece as usize * 16 * 1024..].to_vec();
+                            let response = bt_core::extensions::encode_ut_metadata(
+                                extension_id,
+                                &bt_core::extensions::UtMetadata::Data {
+                                    piece,
+                                    total_size: info_dict.len() as u64,
+                                    data,
+                                },
+                            );
+                            let _ = conn
+                                .write_message(&Message::Extended {
+                                    extension_id,
+                                    payload: response,
+                                })
+                                .await;
+                        }
+                    }
                 }
             }
             Message::Cancel {

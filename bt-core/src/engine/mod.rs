@@ -1190,9 +1190,6 @@ impl Engine {
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
-        if pending.size.is_none() {
-            return;
-        }
         let now = TokioInstant::now();
         let expired: Vec<u32> = pending
             .in_flight
@@ -1221,8 +1218,9 @@ impl Engine {
         let Some(pending) = self.pending.as_mut() else {
             return;
         };
-        let Some(total) = pending.total_pieces() else {
-            return;
+        let target_pieces: Vec<u32> = match pending.total_pieces() {
+            Some(total) => (0..total).collect(),
+            None => vec![0],
         };
         if candidates.is_empty() {
             return;
@@ -1230,7 +1228,7 @@ impl Engine {
 
         let mut in_flight = pending.in_flight.len();
         let mut round_robin = pending.round_robin;
-        for piece in 0..total {
+        for piece in target_pieces {
             if in_flight >= MAX_IN_FLIGHT_METADATA {
                 break;
             }
@@ -1506,8 +1504,8 @@ impl Engine {
         self.raw_metainfo = Arc::new(std::sync::Mutex::new(raw.clone()));
         self.pending = None;
         let _ = self.metadata_tx.send(Some(Arc::new(raw)));
-        self.disconnect_all().await;
         self.run_check().await;
+        self.refill_all().await;
         let targets: Vec<(u8, mpsc::Sender<PeerCommand>)> = self
             .peers
             .values()
@@ -1649,7 +1647,7 @@ impl Engine {
     fn try_connect(&mut self) {
         if !matches!(
             self.state,
-            State::Downloading | State::Completed | State::Seeding
+            State::FetchingMetadata | State::Downloading | State::Completed | State::Seeding
         ) {
             return;
         }

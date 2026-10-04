@@ -231,6 +231,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerConnection<S> {
             &mut stream,
             info_hash,
             our_peer_id,
+            crate::extensions::reserved_with_extensions(),
             config.handshake_timeout,
         )
         .await?;
@@ -252,6 +253,7 @@ pub async fn connect(
         &mut stream,
         info_hash,
         our_peer_id,
+        crate::extensions::reserved_with_extensions(),
         config.handshake_timeout,
     )
     .await?;

@@ -49,6 +49,7 @@ pub async fn exchange<S>(
     stream: &mut S,
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
+    reserved: [u8; 8],
     handshake_timeout: Duration,
 ) -> Result<Handshake, PeerError>
 where
@@ -56,7 +57,7 @@ where
 {
     let request = encode(&Handshake {
         info_hash,
-        reserved: [0; 8],
+        reserved,
         peer_id: our_peer_id,
     });
     let exchange = async {
@@ -145,6 +146,7 @@ mod tests {
             &mut our_side,
             info_hash,
             our_peer_id,
+            [0; 8],
             Duration::from_millis(200),
         )
         .await
