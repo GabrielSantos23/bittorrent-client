@@ -115,6 +115,117 @@ async fn live_get_peers_for_the_debian_info_hash() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires internet access to the public DHT network"]
+async fn live_announce_from_one_instance_is_visible_to_a_second_instance() {
+    let mut info_hash = [0u8; 20];
+    bt_core::dht::RandomBytes::fill(&bt_core::dht::SystemRandom, &mut info_hash);
+    let announce_port = {
+        let probe = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        probe.local_addr().unwrap().port()
+    };
+    let announcer_id = bt_core::dht::NodeId::random(&bt_core::dht::SystemRandom);
+    let checker_id = bt_core::dht::NodeId::random(&bt_core::dht::SystemRandom);
+    assert_ne!(
+        announcer_id, checker_id,
+        "the two instances need distinct ids"
+    );
+
+    let announcer = bt_core::dht::spawn(
+        DhtOptions::new(0, announcer_id)
+            .with_bootstrap(
+                bt_core::dht::DEFAULT_BOOTSTRAP_ROUTERS
+                    .iter()
+                    .map(|host| host.to_string())
+                    .collect(),
+            )
+            .with_listener_state(
+                Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                Arc::new(std::sync::atomic::AtomicU16::new(announce_port)),
+            ),
+    );
+    let announcer_status = announcer.status();
+    wait_for_table(&announcer_status, 1, 120).await;
+    let (tx, mut rx) = mpsc::channel::<DhtPeers>(1);
+    assert!(announcer.request_lookup(info_hash, tx));
+    let seeded = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+        .await
+        .expect("announcer lookup finished within 60s")
+        .expect("channel open");
+    println!(
+        "LIVE announce: announcer lookup saw {} peers for the random info hash",
+        seeded.peers.len()
+    );
+    let announced_at = Instant::now();
+    let announcer_snapshot = loop {
+        let snapshot = announcer_status.borrow().clone();
+        if snapshot.announces_sent > 0 {
+            break snapshot;
+        }
+        assert!(
+            Instant::now() < announced_at + Duration::from_secs(30),
+            "the announcer never sent an announce_peer: {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    println!(
+        "LIVE announce: announces_sent={} announcing port {announce_port}",
+        announcer_snapshot.announces_sent
+    );
+
+    let checker = bt_core::dht::spawn(
+        DhtOptions::new(0, checker_id).with_bootstrap(
+            bt_core::dht::DEFAULT_BOOTSTRAP_ROUTERS
+                .iter()
+                .map(|host| host.to_string())
+                .collect(),
+        ),
+    );
+    let checker_status = checker.status();
+    wait_for_table(&checker_status, 1, 120).await;
+
+    let mut visible: Option<DhtPeers> = None;
+    for attempt in 1..=3 {
+        let (tx, mut rx) = mpsc::channel::<DhtPeers>(1);
+        assert!(checker.request_lookup(info_hash, tx));
+        let outcome = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+            .await
+            .expect("checker lookup finished within 60s")
+            .expect("channel open");
+        let found = outcome
+            .peers
+            .iter()
+            .any(|peer| peer.port() == announce_port);
+        println!(
+            "LIVE announce: attempt {attempt} saw {} peers, our announced peer visible: {found}",
+            outcome.peers.len()
+        );
+        if found {
+            visible = Some(outcome);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    let checker_snapshot = checker_status.borrow().clone();
+    let announcer_snapshot = announcer_status.borrow().clone();
+    match visible {
+        Some(outcome) => {
+            println!(
+                "LIVE announce: our peer {} appeared after {} announces",
+                outcome.peers.len(),
+                announcer_snapshot.announces_sent
+            );
+        }
+        None => panic!(
+            "our announced peer never appeared in the checker lookups; announcer={announcer_snapshot:?} checker={checker_snapshot:?}"
+        ),
+    }
+    announcer.shutdown();
+    checker.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires internet access to the public DHT network"]
 async fn live_magnet_with_no_trackers_gets_metadata_via_dht() {
     let handle = spawn_live_dht();
     let status = handle.status();
