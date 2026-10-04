@@ -31,9 +31,11 @@ use self::storage::Storage;
 mod assembly;
 mod peer_task;
 mod picker;
+mod resume;
 mod storage;
 
 pub use peer_task::{BoxedStream, Dial, TcpDial};
+pub use resume::remove_snapshot;
 pub use storage::delete_torrent_files;
 
 pub const BLOCK_SIZE: usize = assembly::BLOCK_SIZE;
@@ -44,6 +46,7 @@ const KNOWN_CAP: usize = 10000;
 const RANDOM_FIRST: usize = 4;
 const MAX_ACTIVE_PIECES: usize = 25;
 const STATS_INTERVAL: Duration = Duration::from_millis(500);
+const RESUME_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const CONNECT_INTERVAL: Duration = Duration::from_millis(500);
 const CONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -140,6 +143,9 @@ pub struct Stats {
     pub diag: MetadataDiag,
     pub error: Option<String>,
     pub dht_waiting: bool,
+    pub resumed_from_saved_state: bool,
+    pub startup_pieces_hashed: usize,
+    pub resume_fallback: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
@@ -189,6 +195,7 @@ pub struct TorrentOptions {
     pub optimistic_interval: Duration,
     pub peer_id: [u8; 20],
     pub dht: Option<DhtIntegration>,
+    pub resume_dir: Option<PathBuf>,
 }
 
 impl Default for TorrentOptions {
@@ -204,6 +211,7 @@ impl Default for TorrentOptions {
             optimistic_interval: Duration::from_secs(30),
             peer_id: *peer_id::session(),
             dht: None,
+            resume_dir: None,
         }
     }
 }
@@ -212,6 +220,11 @@ pub struct Torrent {
     commands: mpsc::Sender<EngineCommand>,
     stats: watch::Receiver<Stats>,
     metadata: watch::Receiver<Option<Arc<Vec<u8>>>>,
+}
+
+enum StartupVerification {
+    FullRecheck(Option<String>),
+    Resume(self::resume::ResumeStartup),
 }
 
 impl Torrent {
@@ -285,6 +298,9 @@ impl Torrent {
                 None
             },
             dht_waiting: false,
+            resumed_from_saved_state: false,
+            startup_pieces_hashed: 0,
+            resume_fallback: None,
         });
         options.registry.register(link.info_hash, incoming_tx);
         let mut bootstrap_peers = Vec::new();
@@ -331,6 +347,25 @@ impl Torrent {
         .await
         .map_err(|_| EngineError::Task)??;
         let storage = Arc::new(storage);
+        let startup = match &options.resume_dir {
+            Some(dir) => {
+                let dir = dir.clone();
+                let meta_for_plan = meta.clone();
+                let storage_for_plan = storage.clone();
+                match spawn_blocking(move || {
+                    self::resume::startup_plan(&dir, &meta_for_plan, &storage_for_plan)
+                })
+                .await
+                {
+                    Ok(Ok(plan)) => StartupVerification::Resume(plan),
+                    Ok(Err(err)) => StartupVerification::FullRecheck(Some(err.to_string())),
+                    Err(_) => StartupVerification::FullRecheck(Some(
+                        "resume planning task failed".to_string(),
+                    )),
+                }
+            }
+            None => StartupVerification::FullRecheck(None),
+        };
         let http = tracker::http_client()?;
         let (commands, command_rx) = mpsc::channel(16);
         let (events_tx, events) = mpsc::channel(1024);
@@ -341,16 +376,43 @@ impl Torrent {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         let name = meta.info.name.clone();
+        let resumed = matches!(&startup, StartupVerification::Resume(_));
+        let initial_state = match &startup {
+            StartupVerification::Resume(plan) => {
+                if plan.overlaps.is_empty() {
+                    if plan.trusted.is_complete() && options.listen_active.load(Ordering::Relaxed) {
+                        State::Seeding
+                    } else if plan.trusted.is_complete() {
+                        State::Completed
+                    } else {
+                        State::Downloading
+                    }
+                } else {
+                    State::Checking
+                }
+            }
+            StartupVerification::FullRecheck(_) => State::Checking,
+        };
+        let initial_verified = match &startup {
+            StartupVerification::Resume(plan) => {
+                self::resume::verified_length(&storage, &plan.trusted)
+            }
+            StartupVerification::FullRecheck(_) => 0,
+        };
+        let initial_verified_pieces = match &startup {
+            StartupVerification::Resume(plan) => plan.trusted.count(),
+            StartupVerification::FullRecheck(_) => 0,
+        };
         let (stats_tx, stats_rx) = watch::channel(Stats {
-            state: State::Checking,
+            state: initial_state,
             name,
             total_length,
-            verified_bytes: 0,
+            verified_bytes: initial_verified,
             session_downloaded: 0,
             session_uploaded: 0,
             upload_rate: 0.0,
             ratio: 0.0,
-            verified_pieces: 0,
+            verified_pieces: initial_verified_pieces,
             piece_count,
             download_rate: 0.0,
             peer_count: 0,
@@ -362,6 +424,12 @@ impl Torrent {
             diag: MetadataDiag::default(),
             error: None,
             dht_waiting: false,
+            resumed_from_saved_state: resumed,
+            startup_pieces_hashed: 0,
+            resume_fallback: match &startup {
+                StartupVerification::FullRecheck(reason) => reason.clone(),
+                StartupVerification::Resume(_) => None,
+            },
         });
         options.registry.register(meta.info_hash, incoming_tx);
         let engine = Engine::new(
@@ -379,6 +447,7 @@ impl Torrent {
             incoming_rx,
             announce_results,
             announce_results_tx,
+            startup,
         );
         tokio::spawn(engine.run());
         Ok(Torrent {
@@ -514,6 +583,12 @@ struct Engine {
     dht_results_tx: mpsc::Sender<crate::dht::DhtPeers>,
     dht_lookup_in_flight: bool,
     last_dht_lookup_ms: Option<u64>,
+    resume_dir: Option<PathBuf>,
+    startup: Option<StartupVerification>,
+    resumed_from_saved_state: bool,
+    startup_pieces_hashed: usize,
+    resume_fallback: Option<String>,
+    resume_dirty: bool,
     start: TokioInstant,
 }
 
@@ -705,6 +780,7 @@ impl Engine {
             optimistic_interval,
             peer_id: our_peer_id,
             dht,
+            resume_dir,
             ..
         } = options;
         let (dht_results_tx, dht_results) = mpsc::channel(16);
@@ -769,6 +845,12 @@ impl Engine {
             dht_results_tx,
             dht_lookup_in_flight: false,
             last_dht_lookup_ms: None,
+            resume_dir,
+            startup: None,
+            resumed_from_saved_state: false,
+            startup_pieces_hashed: 0,
+            resume_fallback: None,
+            resume_dirty: false,
             start: TokioInstant::now(),
         }
     }
@@ -789,6 +871,7 @@ impl Engine {
         incoming_rx: mpsc::Receiver<Incoming>,
         announce_results: mpsc::Receiver<TrackerOutcome>,
         announce_results_tx: mpsc::Sender<TrackerOutcome>,
+        startup: StartupVerification,
     ) -> Engine {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
@@ -808,9 +891,14 @@ impl Engine {
             optimistic_interval,
             peer_id: our_peer_id,
             dht,
+            resume_dir,
             ..
         } = options;
         let (dht_results_tx, dht_results) = mpsc::channel(16);
+        let (resumed_from_saved_state, resume_fallback) = match &startup {
+            StartupVerification::Resume(_) => (true, None),
+            StartupVerification::FullRecheck(reason) => (false, reason.clone()),
+        };
         Engine {
             spare_picker: PiecePicker::new(0, 16384, 0, 0, 1),
             picker: Some(PiecePicker::new(
@@ -867,6 +955,12 @@ impl Engine {
             dht_results_tx,
             dht_lookup_in_flight: false,
             last_dht_lookup_ms: None,
+            resume_dir,
+            startup: Some(startup),
+            resumed_from_saved_state,
+            startup_pieces_hashed: 0,
+            resume_fallback,
+            resume_dirty: false,
             start: TokioInstant::now(),
         }
     }
@@ -878,6 +972,7 @@ impl Engine {
         let mut choke_tick = tokio::time::interval(self.choke_interval);
         let mut optimistic_tick = tokio::time::interval(self.optimistic_interval);
         let mut metadata_tick = tokio::time::interval(METADATA_TICK);
+        let mut resume_tick = tokio::time::interval(RESUME_SNAPSHOT_INTERVAL);
         for tick in [
             &mut stats_tick,
             &mut reap_tick,
@@ -885,10 +980,15 @@ impl Engine {
             &mut choke_tick,
             &mut optimistic_tick,
             &mut metadata_tick,
+            &mut resume_tick,
         ] {
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
-        self.run_check().await;
+        match self.startup.take() {
+            Some(StartupVerification::Resume(plan)) => self.run_resume(plan).await,
+            Some(StartupVerification::FullRecheck(_)) => self.run_check().await,
+            None => self.initial_check().await,
+        }
         loop {
             let announce_at = self.earliest_announce();
             let announce_tick = async move {
@@ -931,9 +1031,120 @@ impl Engine {
                 _ = choke_tick.tick() => self.apply_choke(false),
                 _ = optimistic_tick.tick() => self.apply_choke(true),
                 _ = metadata_tick.tick() => self.metadata_tick().await,
+                _ = resume_tick.tick() => {
+                    if self.resume_dirty {
+                        self.write_resume_snapshot().await;
+                    }
+                },
             }
         }
+        self.write_resume_snapshot().await;
         self.registry.unregister(&self.info_hash());
+    }
+
+    async fn initial_check(&mut self) {
+        match self.plan_resume().await {
+            Some(startup) => self.run_resume(startup).await,
+            None => self.run_check().await,
+        }
+    }
+
+    async fn plan_resume(&mut self) -> Option<self::resume::ResumeStartup> {
+        let dir = self.resume_dir.clone()?;
+        let meta = self.meta.clone()?;
+        let storage = self.storage.clone()?;
+        match spawn_blocking(move || self::resume::startup_plan(&dir, &meta, &storage)).await {
+            Ok(Ok(plan)) => Some(plan),
+            Ok(Err(err)) => {
+                self.resumed_from_saved_state = false;
+                self.resume_fallback = Some(err.to_string());
+                None
+            }
+            Err(_) => {
+                self.resumed_from_saved_state = false;
+                self.resume_fallback = Some("resume planning task failed".to_string());
+                None
+            }
+        }
+    }
+
+    async fn run_resume(&mut self, startup: self::resume::ResumeStartup) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let Some(meta) = self.meta.clone() else {
+            return;
+        };
+        self.verified_bytes = self::resume::verified_length(&storage, &startup.trusted);
+        {
+            let mut have = self
+                .have_map
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *have = startup.trusted.clone();
+        }
+        self.picker().set_have(&startup.trusted);
+        self.error = None;
+        if startup.overlaps.is_empty() {
+            self.state = if startup.trusted.is_complete() {
+                self.completed_state()
+            } else {
+                State::Downloading
+            };
+        } else {
+            self.state = State::Checking;
+        }
+        self.publish();
+        let self::resume::ResumeStartup {
+            sample, overlaps, ..
+        } = startup;
+        let hashed_count = sample.len() + overlaps.len();
+        let verify_overlaps = overlaps.clone();
+        let verification = spawn_blocking(move || {
+            let sample_failed = self::resume::verify_pieces(&storage, &meta.info.pieces, &sample);
+            let overlap_failed =
+                self::resume::verify_pieces(&storage, &meta.info.pieces, &verify_overlaps);
+            (sample_failed, overlap_failed)
+        })
+        .await;
+        match verification {
+            Ok((sample_failed, overlap_failed)) => {
+                self.startup_pieces_hashed += hashed_count;
+                if !sample_failed.is_empty() {
+                    self.resume_fallback = Some("resume sample verification failed".to_string());
+                    self.run_check().await;
+                    return;
+                }
+                let mut pieces_restored = 0u64;
+                for index in overlaps {
+                    if overlap_failed.contains(&index) {
+                        continue;
+                    }
+                    let _ = self
+                        .have_map
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .set(index);
+                    self.picker().mark_have(index);
+                    pieces_restored += self.piece_size(index) as u64;
+                }
+                self.verified_bytes += pieces_restored;
+                if !overlap_failed.is_empty() {
+                    self.resume_dirty = true;
+                    self.write_resume_snapshot().await;
+                }
+            }
+            Err(_) => {
+                self.resume_fallback = Some("resume verification task failed".to_string());
+                self.run_check().await;
+                return;
+            }
+        }
+        if self.state == State::Paused {
+            self.publish();
+            return;
+        }
+        self.finish_initial_verification().await;
     }
 
     fn picker(&mut self) -> &mut PiecePicker {
@@ -979,7 +1190,7 @@ impl Engine {
         match command {
             EngineCommand::Start => {
                 if self.state == State::Stopped {
-                    self.run_check().await;
+                    self.initial_check().await;
                 }
             }
             EngineCommand::Pause => self.pause().await,
@@ -997,6 +1208,7 @@ impl Engine {
         };
         self.state = State::Checking;
         self.publish();
+        self.startup_pieces_hashed += meta.info.pieces.len();
         let progress = self.stats_tx.clone();
         let have = spawn_blocking(move || {
             storage::recheck(&storage, &meta.info.pieces, |done| {
@@ -1023,19 +1235,7 @@ impl Engine {
                 }
                 self.verified_bytes = verified;
                 self.error = None;
-                if self.picker().is_complete() {
-                    self.state = self.completed_state();
-                    self.queue_event(Event::Completed);
-                    self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
-                } else {
-                    self.state = State::Downloading;
-                    self.queue_event(Event::Started);
-                    self.wake_trackers(TokioInstant::now());
-                }
-                if self.pending_pause {
-                    self.pending_pause = false;
-                    self.state = State::Paused;
-                }
+                self.finish_initial_verification().await;
             }
             Err(_) => {
                 self.error = Some("recheck failed".to_string());
@@ -1043,6 +1243,70 @@ impl Engine {
             }
         }
         self.publish();
+    }
+
+    async fn finish_initial_verification(&mut self) {
+        let complete = self.picker().is_complete();
+        if complete {
+            self.state = self.completed_state();
+            self.queue_event(Event::Completed);
+            self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
+        } else {
+            self.state = State::Downloading;
+            self.queue_event(Event::Started);
+            self.wake_trackers(TokioInstant::now());
+        }
+        if self.pending_pause {
+            self.pending_pause = false;
+            self.state = State::Paused;
+        }
+        if complete {
+            self.write_resume_snapshot().await;
+        }
+        self.publish();
+    }
+
+    async fn write_resume_snapshot(&mut self) {
+        let Some(dir) = self.resume_dir.clone() else {
+            return;
+        };
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let Some(meta) = self.meta.clone() else {
+            return;
+        };
+        let have = self
+            .have_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if have.count() == 0 {
+            return;
+        }
+        let info_hash_hex = crate::hex::encode(&meta.info_hash);
+        let piece_count = meta.info.pieces.len();
+        let path = self::resume::snapshot_path(&dir, &info_hash_hex);
+        let outcome = spawn_blocking(move || {
+            storage.sync_dirty()?;
+            let fingerprints = self::resume::current_fingerprints(&storage.file_paths());
+            let files: Option<Vec<_>> = fingerprints.into_iter().collect();
+            let Some(files) = files else {
+                return Ok(());
+            };
+            let snapshot = self::resume::ResumeSnapshot {
+                version: self::resume::RESUME_FORMAT_VERSION,
+                info_hash: info_hash_hex,
+                piece_count,
+                bitfield: have.as_raw().to_vec(),
+                files,
+            };
+            self::resume::write_snapshot(&path, &snapshot)
+        })
+        .await;
+        if let Ok(Ok(())) = outcome {
+            self.resume_dirty = false;
+        }
     }
 
     fn completed_state(&self) -> State {
@@ -1061,6 +1325,7 @@ impl Engine {
                 self.backoff.clear();
                 self.state = State::Paused;
                 self.publish();
+                self.write_resume_snapshot().await;
             }
             _ => {}
         }
@@ -1108,6 +1373,7 @@ impl Engine {
             });
         }
         let _ = tokio::time::timeout(STOP_ANNOUNCE_WAIT, waits.join_all()).await;
+        self.write_resume_snapshot().await;
         self.state = State::Stopped;
         self.publish();
     }
@@ -1568,7 +1834,7 @@ impl Engine {
         self.raw_metainfo = Arc::new(std::sync::Mutex::new(raw.clone()));
         self.pending = None;
         let _ = self.metadata_tx.send(Some(Arc::new(raw)));
-        self.run_check().await;
+        self.initial_check().await;
         self.refill_all().await;
         let targets: Vec<(u8, mpsc::Sender<PeerCommand>)> = self
             .peers
@@ -2124,11 +2390,13 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .set(index);
                 self.verified_bytes += self.piece_size(index) as u64;
+                self.resume_dirty = true;
                 if self.picker().is_complete() {
                     self.state = self.completed_state();
                     self.queue_event(Event::Completed);
                     self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
                     self.disconnect_all().await;
+                    self.write_resume_snapshot().await;
                 } else {
                     self.broadcast_have(index);
                 }
@@ -2406,6 +2674,9 @@ impl Engine {
             diag: self.diag.clone(),
             error: self.error.clone(),
             dht_waiting: self.dht_waiting(),
+            resumed_from_saved_state: self.resumed_from_saved_state,
+            startup_pieces_hashed: self.startup_pieces_hashed,
+            resume_fallback: self.resume_fallback.clone(),
         }
     }
 

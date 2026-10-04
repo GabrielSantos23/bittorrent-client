@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use sha1::{Digest, Sha1};
@@ -12,7 +13,9 @@ use crate::peer::Bitfield;
 pub struct FileSlot {
     pub offset: u64,
     pub length: u64,
+    path: PathBuf,
     file: Mutex<File>,
+    dirty: AtomicBool,
 }
 
 pub struct Storage {
@@ -58,7 +61,9 @@ impl Storage {
             slots.push(FileSlot {
                 offset,
                 length,
+                path: full,
                 file: Mutex::new(file),
+                dirty: AtomicBool::new(false),
             });
             offset += length;
         }
@@ -67,6 +72,39 @@ impl Storage {
             piece_length: meta.info.piece_length,
             total_length: offset,
         })
+    }
+
+    pub fn file_paths(&self) -> Vec<PathBuf> {
+        self.slots.iter().map(|slot| slot.path.clone()).collect()
+    }
+
+    pub fn file_lengths(&self) -> Vec<u64> {
+        self.slots.iter().map(|slot| slot.length).collect()
+    }
+
+    pub fn pieces_overlapping_file(&self, file_index: usize) -> Vec<usize> {
+        let Some(slot) = self.slots.get(file_index) else {
+            return Vec::new();
+        };
+        if slot.length == 0 {
+            return Vec::new();
+        }
+        let first = (slot.offset / self.piece_length as u64) as usize;
+        let last = ((slot.offset + slot.length - 1) / self.piece_length as u64) as usize;
+        (first..=last).collect()
+    }
+
+    pub fn sync_dirty(&self) -> Result<(), StorageError> {
+        for slot in &self.slots {
+            if !slot.dirty.swap(false, Ordering::SeqCst) {
+                continue;
+            }
+            if let Err(err) = lock_file(&slot.file).sync_data() {
+                slot.dirty.store(true, Ordering::SeqCst);
+                return Err(err.into());
+            }
+        }
+        Ok(())
     }
 
     pub fn piece_length(&self) -> u32 {
@@ -174,6 +212,7 @@ impl Storage {
             let mut guard = lock_file(&slot.file);
             guard.seek(SeekFrom::Start(file_offset))?;
             guard.write_all(&data[cursor..cursor + length])?;
+            slot.dirty.store(true, Ordering::SeqCst);
             cursor += length;
         }
         Ok(())

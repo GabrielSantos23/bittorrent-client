@@ -52,6 +52,14 @@ impl Bitfield {
         Ok(())
     }
 
+    pub fn clear(&mut self, index: usize) -> Result<(), BitfieldError> {
+        if index >= self.piece_count {
+            return Err(BitfieldError::IndexOutOfRange(index));
+        }
+        self.bytes[index / 8] &= !mask(index % 8);
+        Ok(())
+    }
+
     pub fn count(&self) -> usize {
         self.bytes
             .iter()

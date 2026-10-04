@@ -177,3 +177,33 @@ pub enum BitfieldError {
     #[error("piece index {0} is out of range")]
     IndexOutOfRange(usize),
 }
+
+#[derive(Debug, Error)]
+pub enum ResumeError {
+    #[error("no resume file")]
+    Missing,
+    #[error("resume file of {0} bytes exceeds the {1} byte limit")]
+    TooLarge(u64, u64),
+    #[error("resume file is corrupt or truncated")]
+    Corrupt,
+    #[error("resume file uses unsupported format version {0}")]
+    UnknownVersion(u32),
+    #[error("resume file info hash does not match the torrent")]
+    InfoHashMismatch,
+    #[error("resume file claims {actual} pieces but the torrent has {expected}")]
+    PieceCountMismatch { expected: usize, actual: usize },
+    #[error("resume file lists {actual} files but the torrent has {expected}")]
+    FileCountMismatch { expected: usize, actual: usize },
+    #[error("resume file records length {actual} for file {index} but the torrent has {expected}")]
+    FileLengthMismatch {
+        index: usize,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("resume file bitfield is invalid: {0}")]
+    Bitfield(#[from] BitfieldError),
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+}

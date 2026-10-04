@@ -339,6 +339,7 @@ impl Session {
                 active: dht_active.clone(),
                 port: dht_port.clone(),
             }),
+            resume_dir: persistence.clone(),
         };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
@@ -619,6 +620,7 @@ struct EngineWiring {
     bootstrap_peers: Vec<std::net::SocketAddr>,
     peer_id: [u8; 20],
     dht: Option<crate::engine::DhtIntegration>,
+    resume_dir: Option<PathBuf>,
 }
 
 struct SessionActor {
@@ -889,6 +891,7 @@ impl SessionActor {
         }
         if let Some(data_dir) = &self.persistence {
             let _ = persist::remove_metainfo(data_dir, id);
+            let _ = crate::engine::remove_snapshot(data_dir, id);
         }
         self.persist();
         self.publish();
@@ -1000,6 +1003,7 @@ async fn spawn_magnet_entry(
         optimistic_interval: wiring.optimistic_interval,
         peer_id: wiring.peer_id,
         dht: wiring.dht.clone(),
+        resume_dir: wiring.resume_dir.clone(),
     };
     let handle = Torrent::spawn_from_magnet(link, output_dir.clone(), options).await?;
     let stats = handle.subscribe();
@@ -1050,6 +1054,7 @@ async fn spawn_entry(
         optimistic_interval: wiring.optimistic_interval,
         peer_id: wiring.peer_id,
         dht: wiring.dht.clone(),
+        resume_dir: wiring.resume_dir.clone(),
     };
     let handle = Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), options).await?;
     let stats = handle.subscribe();

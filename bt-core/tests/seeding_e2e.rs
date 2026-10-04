@@ -51,6 +51,7 @@ fn seeder_options(
         optimistic_interval,
         peer_id: *peer_id::session(),
         dht: None,
+        ..TorrentOptions::default()
     }
 }
 

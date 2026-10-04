@@ -190,6 +190,108 @@ async fn persists_and_restores() {
     session2.shutdown().await.unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_restore_uses_the_resume_snapshot() {
+    let data: Arc<Vec<u8>> = Arc::new((0..40 * 16384).map(|i| (i % 251) as u8).collect());
+    let bytes = torrent_bytes(&data);
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
+    let id = bt_core::hex::encode(&meta.info_hash);
+    let data_dir = temp_dir("session-resume-data");
+    let out = temp_dir("session-resume-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("e2e.bin"), data.as_ref()).unwrap();
+
+    let dial = Arc::new(FakeDial::new(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![],
+    ));
+    let first = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![])
+        .await
+        .unwrap();
+    first.add_torrent(&bytes, out.clone()).await.unwrap();
+    let first_id = id.clone();
+    wait_for(
+        &first.subscribe(),
+        move |s| {
+            s.iter()
+                .any(|t| t.id == first_id && matches!(t.state, State::Seeding | State::Completed))
+        },
+        30,
+    )
+    .await;
+    let resume_path = data_dir.join(format!("{id}.resume"));
+    assert!(
+        resume_path.exists(),
+        "the first run must persist a resume file"
+    );
+    first.shutdown().await.unwrap();
+
+    let second = Session::spawn_with_options(Some(data_dir.clone()), SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    assert!(second.restore_errors().is_empty());
+    let resumed_id = id.clone();
+    let summaries = second.subscribe();
+    let initial = summaries.borrow().clone();
+    let entry = initial
+        .iter()
+        .find(|t| t.id == resumed_id)
+        .expect("restored torrent is listed");
+    assert_ne!(
+        entry.state,
+        State::Checking,
+        "a resumed torrent must not enter Checking"
+    );
+    wait_for(
+        &summaries,
+        move |s| {
+            s.iter()
+                .any(|t| t.id == resumed_id && matches!(t.state, State::Seeding | State::Completed))
+        },
+        20,
+    )
+    .await;
+    second.shutdown().await.unwrap();
+    std::fs::remove_dir_all(data_dir).unwrap();
+    std::fs::remove_dir_all(out).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn removing_a_torrent_deletes_its_resume_file() {
+    let data = test_data();
+    let bytes = torrent_bytes(&data);
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
+    let id = bt_core::hex::encode(&meta.info_hash);
+    let data_dir = temp_dir("session-resume-remove");
+    let out = temp_dir("session-resume-remove-out");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("e2e.bin"), data.as_ref()).unwrap();
+
+    let dial = Arc::new(FakeDial::new(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![],
+    ));
+    let session = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![])
+        .await
+        .unwrap();
+    session.add_torrent(&bytes, out.clone()).await.unwrap();
+    let resume_path = data_dir.join(format!("{id}.resume"));
+    let expected = resume_path.clone();
+    wait_for(&session.subscribe(), move |_| expected.exists(), 30).await;
+    session.remove(&id, false).await.unwrap();
+    assert!(
+        !resume_path.exists(),
+        "removing the torrent must delete the resume file"
+    );
+    session.shutdown().await.unwrap();
+    std::fs::remove_dir_all(data_dir).unwrap();
+    std::fs::remove_dir_all(out).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn skips_corrupted_persistence() {
     let data = test_data();
