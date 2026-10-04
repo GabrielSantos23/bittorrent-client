@@ -1263,10 +1263,10 @@ impl Engine {
             else {
                 continue;
             };
-            let payload = crate::extensions::encode_ut_metadata(
-                extension_id,
-                &crate::extensions::UtMetadata::Request { piece },
-            );
+            let payload =
+                crate::extensions::encode_ut_metadata(&crate::extensions::UtMetadata::Request {
+                    piece,
+                });
             if let Some(handle) = self.peers.get(&addr) {
                 if handle
                     .commands
@@ -1319,11 +1319,7 @@ impl Engine {
             }
             return;
         }
-        let Some(handle) = self.peers.get(&addr) else {
-            return;
-        };
-        let remote_ut_metadata = handle.extensions.as_ref().and_then(|ext| ext.ut_metadata);
-        if Some(extension_id) != remote_ut_metadata {
+        if extension_id != crate::extensions::LOCAL_UT_METADATA_ID {
             return;
         }
         let message = match crate::extensions::decode_ut_metadata(payload) {
@@ -1376,19 +1372,13 @@ impl Engine {
             if end < start {
                 end = start;
             }
-            crate::extensions::encode_ut_metadata(
-                extension_id,
-                &crate::extensions::UtMetadata::Data {
-                    piece,
-                    total_size,
-                    data: info_bytes[start..end].to_vec(),
-                },
-            )
+            crate::extensions::encode_ut_metadata(&crate::extensions::UtMetadata::Data {
+                piece,
+                total_size,
+                data: info_bytes[start..end].to_vec(),
+            })
         } else {
-            crate::extensions::encode_ut_metadata(
-                extension_id,
-                &crate::extensions::UtMetadata::Reject { piece },
-            )
+            crate::extensions::encode_ut_metadata(&crate::extensions::UtMetadata::Reject { piece })
         };
         if let Some(handle) = self.peers.get(&addr) {
             let _ = handle.commands.try_send(PeerCommand::Extended {

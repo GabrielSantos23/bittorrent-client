@@ -158,6 +158,7 @@ pub(crate) async fn run_peer_task(
 ) {
     let reason = match connect_outgoing(&task).await {
         Ok((connection, remote)) => {
+            let remote_extensions = crate::extensions::supports_extensions(&remote.reserved);
             let _ = events
                 .send(PeerEvent::Handshaken {
                     addr: task.addr,
@@ -169,6 +170,7 @@ pub(crate) async fn run_peer_task(
                 connection,
                 task.piece_count,
                 task.extension_handshake,
+                remote_extensions,
                 task.have,
                 task.storage,
                 task.uploads,
@@ -195,6 +197,7 @@ pub(crate) async fn run_incoming_peer_task(
     events: mpsc::Sender<PeerEvent>,
 ) {
     let connection = PeerConnection::new(task.stream, task.remote, task.piece_count, task.config);
+    let remote_extensions = crate::extensions::supports_extensions(&task.remote.reserved);
     let _ = events
         .send(PeerEvent::Handshaken {
             addr: task.addr,
@@ -206,6 +209,7 @@ pub(crate) async fn run_incoming_peer_task(
         connection,
         task.piece_count,
         task.extension_handshake,
+        remote_extensions,
         task.have,
         task.storage,
         task.uploads,
@@ -256,6 +260,7 @@ async fn serve_established<S>(
     connection: PeerConnection<S>,
     piece_count: Option<usize>,
     extension_handshake: Option<Vec<u8>>,
+    remote_extensions: bool,
     have: HaveMap,
     storage: Option<Arc<Storage>>,
     uploads: Arc<UploadBucket>,
@@ -298,7 +303,7 @@ where
         _ => Message::Interested,
     };
     let _ = write_tx.send(initial_interest).await;
-    if let Some(payload) = extension_handshake {
+    if let Some(payload) = extension_handshake.filter(|_| remote_extensions) {
         let _ = write_tx
             .send(Message::Extended {
                 extension_id: crate::extensions::EXTENSION_HANDSHAKE_ID,

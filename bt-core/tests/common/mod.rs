@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -20,6 +20,67 @@ pub const PIECE_COUNT: usize = 3;
 pub const DATA_LENGTH: usize = PIECE_LENGTH * PIECE_COUNT;
 pub const SEEDER_PEER_ID: [u8; 20] = *b"-SD0000-seeder000001";
 pub const LEECHER_PEER_ID: [u8; 20] = *b"-LC0000-leecher00001";
+pub const STRICT_UT_METADATA_ID: u8 = 7;
+
+fn strict_handshake_payload(metadata_size: u64) -> Vec<u8> {
+    let mut m: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+    m.insert(
+        b"ut_metadata".to_vec(),
+        Value::Int(STRICT_UT_METADATA_ID as i64),
+    );
+    let mut root: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+    root.insert(b"m".to_vec(), Value::Dict(m));
+    root.insert(b"metadata_size".to_vec(), Value::Int(metadata_size as i64));
+    root.insert(b"v".to_vec(), Value::Bytes(b"strict-fake".to_vec()));
+    bencode::encode(&Value::Dict(root))
+}
+
+fn strict_advertised_ut_metadata(payload: &[u8]) -> Option<u8> {
+    if payload.first() != Some(&b'd') {
+        return None;
+    }
+    let value = bencode::decode(payload).ok()?;
+    let dict = value.as_dict()?;
+    let m = dict.get(&b"m".to_vec())?.as_dict()?;
+    let id = m.get(&b"ut_metadata".to_vec())?.as_int()?;
+    u8::try_from(id).ok()
+}
+
+fn strict_request_piece(payload: &[u8]) -> Option<u32> {
+    if payload.first() != Some(&b'd') {
+        return None;
+    }
+    let value = bencode::decode(payload).ok()?;
+    let dict = value.as_dict()?;
+    let msg_type = dict.get(&b"msg_type".to_vec())?.as_int()?;
+    let piece = dict.get(&b"piece".to_vec())?.as_int()?;
+    if msg_type != 0 {
+        return None;
+    }
+    u32::try_from(piece).ok()
+}
+
+fn strict_data_payload(piece: u32, info_dict: &[u8]) -> Option<Vec<u8>> {
+    let start = (piece as usize).saturating_mul(PIECE_LENGTH);
+    if start >= info_dict.len() {
+        return None;
+    }
+    let end = (start + PIECE_LENGTH).min(info_dict.len());
+    let mut dict: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+    dict.insert(b"msg_type".to_vec(), Value::Int(1));
+    dict.insert(b"piece".to_vec(), Value::Int(piece as i64));
+    dict.insert(b"total_size".to_vec(), Value::Int(info_dict.len() as i64));
+    let mut payload = bencode::encode(&Value::Dict(dict));
+    payload.extend_from_slice(&info_dict[start..end]);
+    Some(payload)
+}
+
+fn strict_reject_payload(piece: u32) -> Vec<u8> {
+    let mut dict: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+    dict.insert(b"msg_type".to_vec(), Value::Int(2));
+    dict.insert(b"piece".to_vec(), Value::Int(piece as i64));
+    bencode::encode(&Value::Dict(dict))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeederKind {
@@ -511,11 +572,12 @@ async fn serve_seeder(
         .unwrap();
     conn.write_message(&Message::Unchoke).await.unwrap();
     if let Some(info_dict) = &metadata {
-        let handshake =
-            bt_core::extensions::ExtensionHandshake::with_metadata_size(info_dict.len() as u64);
+        if conn.reserved()[5] & 0x10 == 0 {
+            return;
+        }
         conn.write_message(&Message::Extended {
             extension_id: bt_core::extensions::EXTENSION_HANDSHAKE_ID,
-            payload: bt_core::extensions::encode_extension_handshake(&handshake),
+            payload: strict_handshake_payload(info_dict.len() as u64),
         })
         .await
         .unwrap();
@@ -524,6 +586,7 @@ async fn serve_seeder(
         std::future::pending::<()>().await;
     }
     let mut corrupted = false;
+    let mut our_ut_metadata: Option<u8> = None;
     let mut served = 0usize;
     struct PendingSend {
         deadline: tokio::time::Instant,
@@ -633,28 +696,38 @@ async fn serve_seeder(
                 extension_id,
                 payload,
             } => {
-                eprintln!("[seed-ext] got extended id {extension_id}");
-                if let Some(info_dict) = &metadata {
-                    if extension_id != bt_core::extensions::EXTENSION_HANDSHAKE_ID {
-                        let request = bt_core::extensions::decode_ut_metadata(&payload);
-                        if let Ok(bt_core::extensions::UtMetadata::Request { piece }) = request {
-                            let data = info_dict[piece as usize * 16 * 1024..].to_vec();
-                            let response = bt_core::extensions::encode_ut_metadata(
-                                extension_id,
-                                &bt_core::extensions::UtMetadata::Data {
-                                    piece,
-                                    total_size: info_dict.len() as u64,
-                                    data,
-                                },
-                            );
-                            let _ = conn
-                                .write_message(&Message::Extended {
-                                    extension_id,
-                                    payload: response,
-                                })
-                                .await;
-                        }
+                let Some(info_dict) = &metadata else {
+                    continue;
+                };
+                if extension_id == bt_core::extensions::EXTENSION_HANDSHAKE_ID {
+                    match strict_advertised_ut_metadata(&payload) {
+                        Some(id) => our_ut_metadata = Some(id),
+                        None => return,
                     }
+                    continue;
+                }
+                if extension_id != STRICT_UT_METADATA_ID {
+                    return;
+                }
+                let Some(reply_id) = our_ut_metadata else {
+                    return;
+                };
+                let Some(piece) = strict_request_piece(&payload) else {
+                    return;
+                };
+                let reply = match strict_data_payload(piece, info_dict) {
+                    Some(payload) => payload,
+                    None => strict_reject_payload(piece),
+                };
+                if conn
+                    .write_message(&Message::Extended {
+                        extension_id: reply_id,
+                        payload: reply,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
             }
             Message::Cancel {
