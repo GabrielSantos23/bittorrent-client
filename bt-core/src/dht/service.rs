@@ -21,13 +21,17 @@ use crate::dht::store::PeerStore;
 use crate::dht::table::{OfferOutcome, RoutingTable, K};
 use crate::dht::tokens::TokenVault;
 
+/// Hostname routers queried for the initial and periodic table bootstrap.
 pub const DEFAULT_BOOTSTRAP_ROUTERS: &[&str] = &[
     "router.bittorrent.com:6881",
     "router.utorrent.com:6881",
     "dht.transmissionbt.com:6881",
-    "212.129.33.59:6881",
-    "87.98.162.88:6881",
 ];
+
+/// Raw-IP routers consulted only when the configured hostname bootstrap
+/// routers resolve to nothing, so a broken or absent resolver cannot leave
+/// the routing table empty. Overridable through [`DhtOptions`].
+pub const DEFAULT_ROUTER_FALLBACKS: &[&str] = &["212.129.33.59:6881", "87.98.162.88:6881"];
 pub const TRANSACTION_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_PENDING_QUERIES: usize = 128;
 pub const MAX_NODES_PER_RESPONSE: usize = 8;
@@ -91,6 +95,9 @@ pub struct DhtOptions {
     pub port: u16,
     pub self_id: NodeId,
     pub bootstrap: Vec<String>,
+    /// Routers tried only when every hostname in `bootstrap` fails to
+    /// resolve; defaults to [`DEFAULT_ROUTER_FALLBACKS`].
+    pub router_fallbacks: Vec<String>,
     listener_active: Arc<AtomicBool>,
     announce_port: Arc<AtomicU16>,
     persist_path: Option<PathBuf>,
@@ -104,6 +111,10 @@ impl DhtOptions {
             port,
             self_id,
             bootstrap: Vec::new(),
+            router_fallbacks: DEFAULT_ROUTER_FALLBACKS
+                .iter()
+                .map(|host| host.to_string())
+                .collect(),
             listener_active: Arc::new(AtomicBool::new(false)),
             announce_port: Arc::new(AtomicU16::new(0)),
             persist_path: None,
@@ -114,6 +125,11 @@ impl DhtOptions {
 
     pub fn with_bootstrap(mut self, bootstrap: Vec<String>) -> DhtOptions {
         self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_router_fallbacks(mut self, fallbacks: Vec<String>) -> DhtOptions {
+        self.router_fallbacks = fallbacks;
         self
     }
 
@@ -339,6 +355,7 @@ struct NodeState {
     port: u16,
     self_id: NodeId,
     bootstrap: Vec<String>,
+    router_fallbacks: Vec<String>,
     filter: AddressFilter,
     listener_active: Arc<AtomicBool>,
     announce_port: Arc<AtomicU16>,
@@ -938,7 +955,10 @@ impl NodeState {
 
     async fn bootstrap(&mut self) {
         self.last_bootstrap_ms = Some(self.now_ms());
-        let targets = resolve_bootstrap(&self.bootstrap).await;
+        let mut targets = resolve_bootstrap(&self.bootstrap).await;
+        if targets.is_empty() && !self.bootstrap.is_empty() {
+            targets = resolve_bootstrap(&self.router_fallbacks).await;
+        }
         self.fill.active = true;
         for addr in targets.into_iter().take(MAX_BOOTSTRAP_TARGETS) {
             if !self.filter.allows(addr) {
@@ -1074,6 +1094,7 @@ async fn run_bound(
         port,
         self_id: options.self_id,
         bootstrap: options.bootstrap,
+        router_fallbacks: options.router_fallbacks,
         filter: options.filter,
         listener_active: options.listener_active,
         announce_port: options.announce_port,
@@ -1941,6 +1962,44 @@ mod tests {
             .await;
         let filled = wait_for_status(status, |s| s.node_count == 3, 10).await;
         assert_eq!(filled.node_count, 3);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn router_fallbacks_are_skipped_when_bootstrap_targets_resolve() {
+        let router = FakeNode::bind(1).await;
+        let fallback = FakeNode::bind(2).await;
+        let handle = spawn(
+            permissive_options(0, solid_id(1))
+                .with_bootstrap(vec![format!("127.0.0.1:{}", router.addr().port())])
+                .with_router_fallbacks(vec![format!("127.0.0.1:{}", fallback.addr().port())]),
+        );
+        let status = handle.status();
+        wait_for_status(status.clone(), |s| s.active, 5).await;
+        let request = router.next_datagram().await;
+        assert!(
+            is_find_node(&request),
+            "the resolving bootstrap router must be queried"
+        );
+        fallback.expect_silence(Duration::from_secs(2)).await;
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn router_fallbacks_are_queried_when_bootstrap_resolution_fails() {
+        let fallback = FakeNode::bind(1).await;
+        let handle = spawn(
+            permissive_options(0, solid_id(1))
+                .with_bootstrap(vec!["bootstrap.invalid:6881".to_string()])
+                .with_router_fallbacks(vec![format!("127.0.0.1:{}", fallback.addr().port())]),
+        );
+        let status = handle.status();
+        wait_for_status(status.clone(), |s| s.active, 5).await;
+        let request = fallback
+            .recv_raw(Duration::from_secs(15))
+            .await
+            .expect("fallback router must be queried when resolution fails");
+        assert!(is_find_node(&request));
         handle.shutdown();
     }
 
