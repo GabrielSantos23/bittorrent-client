@@ -226,12 +226,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PeerConnection<S> {
         our_peer_id: [u8; 20],
         piece_count: Option<usize>,
         config: PeerConfig,
+        reserved: [u8; 8],
     ) -> Result<PeerConnection<S>, PeerError> {
         let remote = handshake::exchange(
             &mut stream,
             info_hash,
             our_peer_id,
-            crate::extensions::reserved_with_extensions(),
+            reserved,
             config.handshake_timeout,
         )
         .await?;
@@ -315,6 +316,7 @@ mod tests {
             *b"-BT0001-abcdefghijkl",
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap();
@@ -345,6 +347,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap_err();
@@ -371,6 +374,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap();
@@ -398,6 +402,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap();
@@ -425,6 +430,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap();
@@ -459,10 +465,16 @@ mod tests {
             keep_alive_interval: Duration::from_millis(50),
             ..test_config()
         };
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, Some(16), config)
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            config,
+            crate::extensions::reserved_with_extensions(),
+        )
+        .await
+        .unwrap();
         assert_eq!(conn.read_message().await.unwrap(), Message::Unchoke);
         fake.await.unwrap();
     }
@@ -487,10 +499,16 @@ mod tests {
             read_timeout: Duration::from_millis(80),
             ..test_config()
         };
-        let mut conn =
-            PeerConnection::connect_stream(our_side, info_hash, OUR_PEER_ID, Some(16), config)
-                .await
-                .unwrap();
+        let mut conn = PeerConnection::connect_stream(
+            our_side,
+            info_hash,
+            OUR_PEER_ID,
+            Some(16),
+            config,
+            crate::extensions::reserved_with_extensions(),
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             conn.read_message().await.unwrap_err(),
             PeerError::Timeout
@@ -517,6 +535,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap();
@@ -540,6 +559,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap_err();
@@ -569,6 +589,7 @@ mod tests {
             OUR_PEER_ID,
             Some(16),
             test_config(),
+            crate::extensions::reserved_with_extensions(),
         )
         .await
         .unwrap();

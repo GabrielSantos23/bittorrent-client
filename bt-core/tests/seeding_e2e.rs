@@ -50,6 +50,7 @@ fn seeder_options(
         choke_interval,
         optimistic_interval,
         peer_id: *peer_id::session(),
+        dht: None,
     }
 }
 

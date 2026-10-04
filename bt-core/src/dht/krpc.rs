@@ -119,7 +119,7 @@ pub fn decode_peers(values: &[Value]) -> Result<Vec<SocketAddr>, KrpcError> {
     for value in values {
         let bytes = value.as_bytes().ok_or(KrpcError::WrongType("values"))?;
         if bytes.len() != PEER_INFO_LENGTH {
-            return Err(KrpcError::InvalidPeerEntry(bytes.len()));
+            continue;
         }
         peers.push(peer_from_bytes(bytes));
     }
@@ -704,15 +704,19 @@ mod tests {
     }
 
     #[test]
-    fn values_entries_must_be_six_bytes() {
+    fn values_entries_that_are_not_ipv4_are_skipped() {
         let values = vec![
             Value::Bytes(vec![1, 2, 3, 4, 5, 6]),
             Value::Bytes(vec![1, 2, 3, 4, 5, 6, 7]),
+            Value::Bytes([9u8; 18].to_vec()),
+            Value::Bytes(vec![7, 7, 7, 7, 7, 8]),
         ];
-        assert!(matches!(
-            decode_peers(&values),
-            Err(KrpcError::InvalidPeerEntry(7))
-        ));
+        let peers = decode_peers(&values).unwrap();
+        assert_eq!(peers.len(), 2, "only six byte ipv4 entries survive");
+        assert_eq!(
+            peers[1],
+            SocketAddr::new(Ipv4Addr::new(7, 7, 7, 7).into(), 0x0708)
+        );
     }
 
     #[test]

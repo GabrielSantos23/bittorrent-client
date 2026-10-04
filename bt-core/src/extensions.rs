@@ -26,6 +26,15 @@ pub fn supports_extensions(reserved: &[u8; 8]) -> bool {
     reserved[5] & 0x10 != 0
 }
 
+pub fn with_dht_bit(mut reserved: [u8; 8]) -> [u8; 8] {
+    reserved[7] |= 0x01;
+    reserved
+}
+
+pub fn supports_dht(reserved: &[u8; 8]) -> bool {
+    reserved[7] & 0x01 != 0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtensionHandshake {
     pub ut_metadata: Option<u8>,
@@ -191,6 +200,20 @@ mod tests {
         let reserved = reserved_with_extensions();
         assert!(supports_extensions(&reserved));
         assert!(!supports_extensions(&[0u8; 8]));
+    }
+
+    #[test]
+    fn dht_reserved_bit_round_trips() {
+        let reserved = with_dht_bit(reserved_with_extensions());
+        assert!(supports_extensions(&reserved));
+        assert!(supports_dht(&reserved));
+        assert!(!supports_dht(&reserved_with_extensions()));
+        assert!(!supports_dht(&[0u8; 8]));
+        assert!(supports_dht(&with_dht_bit([0u8; 8])));
+        let mut other_bits = [0u8; 8];
+        other_bits[7] = 0x02;
+        assert!(supports_dht(&with_dht_bit(other_bits)));
+        assert_eq!(with_dht_bit(other_bits)[7], 0x03);
     }
 
     #[test]

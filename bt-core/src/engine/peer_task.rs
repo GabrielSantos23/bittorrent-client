@@ -26,6 +26,21 @@ pub type BoxedStream = Box<dyn Stream>;
 
 pub type HaveMap = Arc<RwLock<Bitfield>>;
 
+#[derive(Clone, Copy)]
+pub struct DhtHandshake {
+    pub reserved: [u8; 8],
+    pub our_port: Option<u16>,
+}
+
+impl Default for DhtHandshake {
+    fn default() -> Self {
+        DhtHandshake {
+            reserved: crate::extensions::reserved_with_extensions(),
+            our_port: None,
+        }
+    }
+}
+
 const UNPRODUCTIVE_TIMEOUT: Duration = Duration::from_secs(120);
 pub const MAX_REQUEST_LENGTH: usize = 16 * 1024;
 pub const MAX_TOLERATED_LENGTH: usize = 32 * 1024;
@@ -120,6 +135,10 @@ pub enum PeerEvent {
         extension_id: u8,
         payload: Vec<u8>,
     },
+    Port {
+        addr: SocketAddr,
+        port: u16,
+    },
     Disconnected {
         addr: SocketAddr,
         reason: Option<String>,
@@ -137,6 +156,7 @@ pub(crate) struct PeerTask {
     pub have: HaveMap,
     pub storage: Option<Arc<Storage>>,
     pub uploads: Arc<UploadBucket>,
+    pub dht: DhtHandshake,
 }
 
 pub(crate) struct IncomingPeer {
@@ -149,6 +169,7 @@ pub(crate) struct IncomingPeer {
     pub have: HaveMap,
     pub storage: Option<Arc<Storage>>,
     pub uploads: Arc<UploadBucket>,
+    pub dht: DhtHandshake,
 }
 
 pub(crate) async fn run_peer_task(
@@ -158,7 +179,6 @@ pub(crate) async fn run_peer_task(
 ) {
     let reason = match connect_outgoing(&task).await {
         Ok((connection, remote)) => {
-            let remote_extensions = crate::extensions::supports_extensions(&remote.reserved);
             let _ = events
                 .send(PeerEvent::Handshaken {
                     addr: task.addr,
@@ -170,7 +190,8 @@ pub(crate) async fn run_peer_task(
                 connection,
                 task.piece_count,
                 task.extension_handshake,
-                remote_extensions,
+                remote.reserved,
+                task.dht,
                 task.have,
                 task.storage,
                 task.uploads,
@@ -197,7 +218,7 @@ pub(crate) async fn run_incoming_peer_task(
     events: mpsc::Sender<PeerEvent>,
 ) {
     let connection = PeerConnection::new(task.stream, task.remote, task.piece_count, task.config);
-    let remote_extensions = crate::extensions::supports_extensions(&task.remote.reserved);
+    let remote_reserved = task.remote.reserved;
     let _ = events
         .send(PeerEvent::Handshaken {
             addr: task.addr,
@@ -209,7 +230,8 @@ pub(crate) async fn run_incoming_peer_task(
         connection,
         task.piece_count,
         task.extension_handshake,
-        remote_extensions,
+        remote_reserved,
+        task.dht,
         task.have,
         task.storage,
         task.uploads,
@@ -248,6 +270,7 @@ async fn connect_outgoing(
         task.our_peer_id,
         task.piece_count,
         task.config,
+        task.dht.reserved,
     )
     .await?;
     let remote = connection.remote();
@@ -260,7 +283,8 @@ async fn serve_established<S>(
     connection: PeerConnection<S>,
     piece_count: Option<usize>,
     extension_handshake: Option<Vec<u8>>,
-    remote_extensions: bool,
+    remote_reserved: [u8; 8],
+    dht: DhtHandshake,
     have: HaveMap,
     storage: Option<Arc<Storage>>,
     uploads: Arc<UploadBucket>,
@@ -271,6 +295,7 @@ async fn serve_established<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let remote_extensions = crate::extensions::supports_extensions(&remote_reserved);
     let serving = storage
         .as_ref()
         .map(|storage| (storage.piece_length(), storage.total_length()));
@@ -291,6 +316,11 @@ where
         },
     ));
 
+    if crate::extensions::supports_dht(&remote_reserved) {
+        if let Some(port) = dht.our_port {
+            let _ = write_tx.send(Message::Port(port)).await;
+        }
+    }
     let snapshot = have
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -442,7 +472,11 @@ where
                         .await;
                 }
                 Message::Unknown { .. } => {}
-                Message::Port(_) => {}
+                Message::Port(port) => {
+                    if crate::extensions::supports_dht(&dht.reserved) && port != 0 {
+                        let _ = events.send(PeerEvent::Port { addr, port }).await;
+                    }
+                }
             },
         }
     };

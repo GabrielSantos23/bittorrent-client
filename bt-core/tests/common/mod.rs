@@ -844,6 +844,7 @@ async fn serve_seeder(
         SEEDER_PEER_ID,
         Some(piece_count),
         PeerConfig::default(),
+        bt_core::extensions::reserved_with_extensions(),
     )
     .await
     .unwrap();

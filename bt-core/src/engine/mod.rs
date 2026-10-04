@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -170,6 +170,13 @@ pub enum EngineCommand {
 }
 
 #[derive(Clone)]
+pub struct DhtIntegration {
+    pub handle: crate::dht::DhtHandle,
+    pub active: Arc<AtomicBool>,
+    pub port: Arc<AtomicU16>,
+}
+
+#[derive(Clone)]
 pub struct TorrentOptions {
     pub bootstrap_peers: Vec<SocketAddr>,
     pub dial: Arc<dyn Dial>,
@@ -180,6 +187,7 @@ pub struct TorrentOptions {
     pub choke_interval: Duration,
     pub optimistic_interval: Duration,
     pub peer_id: [u8; 20],
+    pub dht: Option<DhtIntegration>,
 }
 
 impl Default for TorrentOptions {
@@ -194,6 +202,7 @@ impl Default for TorrentOptions {
             choke_interval: Duration::from_secs(10),
             optimistic_interval: Duration::from_secs(30),
             peer_id: *peer_id::session(),
+            dht: None,
         }
     }
 }
@@ -497,6 +506,12 @@ struct Engine {
     primary_tier: Option<usize>,
     pending_pause: bool,
     diag: MetadataDiag,
+    dht: Option<DhtIntegration>,
+    dht_results: mpsc::Receiver<crate::dht::DhtPeers>,
+    dht_results_tx: mpsc::Sender<crate::dht::DhtPeers>,
+    dht_lookup_in_flight: bool,
+    last_dht_lookup_ms: Option<u64>,
+    start: TokioInstant,
 }
 
 #[derive(Clone)]
@@ -686,8 +701,10 @@ impl Engine {
             choke_interval,
             optimistic_interval,
             peer_id: our_peer_id,
+            dht,
             ..
         } = options;
+        let (dht_results_tx, dht_results) = mpsc::channel(16);
         let pending = PendingMetadata {
             info_hash,
             display_name: link.display_name,
@@ -744,6 +761,12 @@ impl Engine {
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
             diag: MetadataDiag::default(),
+            dht,
+            dht_results,
+            dht_results_tx,
+            dht_lookup_in_flight: false,
+            last_dht_lookup_ms: None,
+            start: TokioInstant::now(),
         }
     }
 
@@ -781,8 +804,10 @@ impl Engine {
             choke_interval,
             optimistic_interval,
             peer_id: our_peer_id,
+            dht,
             ..
         } = options;
+        let (dht_results_tx, dht_results) = mpsc::channel(16);
         Engine {
             spare_picker: PiecePicker::new(0, 16384, 0, 0, 1),
             picker: Some(PiecePicker::new(
@@ -834,6 +859,12 @@ impl Engine {
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
             diag: MetadataDiag::default(),
+            dht,
+            dht_results,
+            dht_results_tx,
+            dht_lookup_in_flight: false,
+            last_dht_lookup_ms: None,
+            start: TokioInstant::now(),
         }
     }
 
@@ -882,10 +913,18 @@ impl Engine {
                         self.accept_incoming(incoming);
                     }
                 },
+                peers = self.dht_results.recv() => {
+                    if let Some(peers) = peers {
+                        self.handle_dht_peers(peers);
+                    }
+                },
                 _ = announce_tick => self.run_announce().await,
                 _ = reap_tick.tick() => self.reap_stale_requests().await,
                 _ = stats_tick.tick() => self.tick_stats(),
-                _ = connect_tick.tick() => self.try_connect(),
+                _ = connect_tick.tick() => {
+                    self.try_connect();
+                    self.maybe_start_dht_lookup();
+                },
                 _ = choke_tick.tick() => self.apply_choke(false),
                 _ = optimistic_tick.tick() => self.apply_choke(true),
                 _ = metadata_tick.tick() => self.metadata_tick().await,
@@ -1704,6 +1743,62 @@ impl Engine {
         None
     }
 
+    fn is_private(&self) -> bool {
+        self.meta.as_ref().is_some_and(|meta| meta.info.private)
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    fn dht_handshake(&self) -> peer_task::DhtHandshake {
+        let mut handshake = peer_task::DhtHandshake::default();
+        if let Some(dht) = &self.dht {
+            if dht.active.load(Ordering::Relaxed) && !self.is_private() {
+                handshake.reserved = crate::extensions::with_dht_bit(handshake.reserved);
+                handshake.our_port = Some(dht.port.load(Ordering::Relaxed));
+            }
+        }
+        handshake
+    }
+
+    fn maybe_start_dht_lookup(&mut self) {
+        let Some(dht) = self.dht.clone() else {
+            return;
+        };
+        let schedule = crate::dht::LookupSchedule {
+            enabled: dht.active.load(Ordering::Relaxed),
+            private: self.is_private(),
+            fetching_metadata: matches!(self.state, State::FetchingMetadata),
+            connected_peers: self.peers.len(),
+            lookup_in_flight: self.dht_lookup_in_flight,
+            last_lookup_ms: self.last_dht_lookup_ms,
+        };
+        let now_ms = self.now_ms();
+        if !crate::dht::should_lookup(&schedule, now_ms) {
+            return;
+        }
+        if dht
+            .handle
+            .request_lookup(self.info_hash(), self.dht_results_tx.clone())
+        {
+            self.dht_lookup_in_flight = true;
+            self.last_dht_lookup_ms = Some(now_ms);
+        }
+    }
+
+    fn handle_dht_peers(&mut self, peers: crate::dht::DhtPeers) {
+        self.dht_lookup_in_flight = false;
+        if peers.info_hash != self.info_hash() {
+            return;
+        }
+        for addr in peers.peers {
+            if crate::tracker::is_valid_peer_address(addr) {
+                self.backlog.push(addr);
+            }
+        }
+    }
+
     fn spawn_peer(&mut self, addr: SocketAddr) {
         let (commands, command_rx) = mpsc::channel(64);
         self.peers.insert(
@@ -1741,6 +1836,7 @@ impl Engine {
             have: self.have_map.clone(),
             storage: self.storage.clone(),
             uploads: self.uploads.clone(),
+            dht: self.dht_handshake(),
         };
         tokio::spawn(peer_task::run_peer_task(
             task,
@@ -1796,6 +1892,7 @@ impl Engine {
             have: self.have_map.clone(),
             storage: self.storage.clone(),
             uploads: self.uploads.clone(),
+            dht: self.dht_handshake(),
         };
         tokio::spawn(peer_task::run_incoming_peer_task(
             task,
@@ -1806,6 +1903,19 @@ impl Engine {
 
     async fn handle_event(&mut self, event: PeerEvent) {
         match event {
+            PeerEvent::Port { addr, port } => {
+                if self.is_private() || port == 0 {
+                    return;
+                }
+                let SocketAddr::V4(v4) = addr else {
+                    return;
+                };
+                if let Some(dht) = &self.dht {
+                    let _ = dht
+                        .handle
+                        .verify_candidate(SocketAddrV4::new(*v4.ip(), port));
+                }
+            }
             PeerEvent::Handshaken { addr, peer_id } => {
                 self.diag.peers_connected += 1;
                 let duplicate = self

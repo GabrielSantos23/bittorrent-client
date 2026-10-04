@@ -168,14 +168,22 @@ fn spawn_dht_status_forwarder(
     status: Option<watch::Receiver<DhtStatus>>,
     status_tx: watch::Sender<DhtStatus>,
     configured_port: u16,
+    dht_active: Arc<AtomicBool>,
+    dht_port: Arc<AtomicU16>,
 ) -> tokio::task::AbortHandle {
     let task = tokio::spawn(async move {
         let Some(mut status) = status else {
+            dht_active.store(false, Ordering::Relaxed);
             let _ = status_tx.send(DhtStatus::inactive(configured_port, None));
             return;
         };
         loop {
-            let _ = status_tx.send(status.borrow().clone());
+            let snapshot = status.borrow().clone();
+            dht_active.store(snapshot.active, Ordering::Relaxed);
+            if snapshot.active {
+                dht_port.store(snapshot.port, Ordering::Relaxed);
+            }
+            let _ = status_tx.send(snapshot);
             if status.changed().await.is_err() {
                 break;
             }
@@ -244,35 +252,47 @@ impl Session {
         persistence: Option<PathBuf>,
         options: SessionOptions,
     ) -> Result<Session, SessionError> {
-        let (dht_status_tx, dht_status) =
-            watch::channel(DhtStatus::inactive(options.dht_port, None));
-        let dht_node_id = NodeId::random(&SystemRandom);
-        let (dht, dht_forwarder) = if options.dht_enabled {
-            let handle = crate::dht::spawn(
-                DhtOptions::new(options.dht_port, dht_node_id)
-                    .with_bootstrap(options.dht_bootstrap.clone()),
-            );
-            let forwarder = spawn_dht_status_forwarder(
-                Some(handle.status()),
-                dht_status_tx.clone(),
-                options.dht_port,
-            );
-            (Some(handle), forwarder)
-        } else {
-            (
-                None,
-                spawn_dht_status_forwarder(None, dht_status_tx.clone(), options.dht_port),
-            )
-        };
         let registry = Arc::new(Registry::default());
         let (status_tx, listener_status) =
             watch::channel(initial_listener_status(options.listen_port));
         let listen_active = Arc::new(AtomicBool::new(false));
         let announce_port = Arc::new(AtomicU16::new(options.listen_port));
+        let (dht_status_tx, dht_status) =
+            watch::channel(DhtStatus::inactive(options.dht_port, None));
+        let dht_node_id = NodeId::random(&SystemRandom);
+        let dht_active = Arc::new(AtomicBool::new(false));
+        let dht_port = Arc::new(AtomicU16::new(options.dht_port));
+        let (dht, dht_forwarder) = if options.dht_enabled {
+            let handle = crate::dht::spawn(
+                DhtOptions::new(options.dht_port, dht_node_id)
+                    .with_bootstrap(options.dht_bootstrap.clone())
+                    .with_listener_state(listen_active.clone(), announce_port.clone()),
+            );
+            let forwarder = spawn_dht_status_forwarder(
+                Some(handle.status()),
+                dht_status_tx.clone(),
+                options.dht_port,
+                dht_active.clone(),
+                dht_port.clone(),
+            );
+            (Some(handle), forwarder)
+        } else {
+            (
+                None,
+                spawn_dht_status_forwarder(
+                    None,
+                    dht_status_tx.clone(),
+                    options.dht_port,
+                    dht_active.clone(),
+                    dht_port.clone(),
+                ),
+            )
+        };
         let listener = listener::spawn(
             ListenerOptions {
                 port: options.listen_port,
                 our_peer_id: *peer_id::session(),
+                dht_active: dht_active.clone(),
                 ..ListenerOptions::default()
             },
             registry.clone(),
@@ -294,6 +314,11 @@ impl Session {
             dial: options.dial,
             bootstrap_peers: options.bootstrap_peers,
             peer_id: *peer_id::session(),
+            dht: dht.as_ref().map(|handle| crate::engine::DhtIntegration {
+                handle: handle.clone(),
+                active: dht_active.clone(),
+                port: dht_port.clone(),
+            }),
         };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
@@ -394,6 +419,8 @@ impl Session {
             dht_status_tx,
             dht_bootstrap: options.dht_bootstrap,
             dht_node_id,
+            dht_active,
+            dht_port,
         };
         tokio::spawn(actor.run());
         Ok(Session {
@@ -567,6 +594,7 @@ struct EngineWiring {
     dial: Arc<dyn crate::engine::Dial>,
     bootstrap_peers: Vec<std::net::SocketAddr>,
     peer_id: [u8; 20],
+    dht: Option<crate::engine::DhtIntegration>,
 }
 
 struct SessionActor {
@@ -585,6 +613,8 @@ struct SessionActor {
     dht_status_tx: watch::Sender<DhtStatus>,
     dht_bootstrap: Vec<String>,
     dht_node_id: NodeId,
+    dht_active: Arc<AtomicBool>,
+    dht_port: Arc<AtomicU16>,
 }
 
 impl SessionActor {
@@ -593,6 +623,7 @@ impl SessionActor {
             ListenerOptions {
                 port,
                 our_peer_id: self.wiring.peer_id,
+                dht_active: self.dht_active.clone(),
                 ..ListenerOptions::default()
             },
             self.wiring.registry.clone(),
@@ -617,11 +648,22 @@ impl SessionActor {
                 dht.shutdown();
             }
             self.dht_forwarder.abort();
-            self.dht_forwarder = spawn_dht_status_forwarder(None, self.dht_status_tx.clone(), port);
+            self.dht_forwarder = spawn_dht_status_forwarder(
+                None,
+                self.dht_status_tx.clone(),
+                port,
+                self.dht_active.clone(),
+                self.dht_port.clone(),
+            );
+            self.wiring.dht = None;
             return Ok(());
         }
-        let options =
-            DhtOptions::new(port, self.dht_node_id).with_bootstrap(self.dht_bootstrap.clone());
+        let options = DhtOptions::new(port, self.dht_node_id)
+            .with_bootstrap(self.dht_bootstrap.clone())
+            .with_listener_state(
+                self.wiring.listen_active.clone(),
+                self.wiring.announce_port.clone(),
+            );
         let handle = crate::dht::bind(options)
             .await
             .map_err(|err| SessionError::Dht(format!("cannot bind DHT port {port}: {err}")))?;
@@ -629,8 +671,18 @@ impl SessionActor {
         if let Some(old) = self.dht.take() {
             old.shutdown();
         }
-        self.dht_forwarder =
-            spawn_dht_status_forwarder(Some(handle.status()), self.dht_status_tx.clone(), port);
+        self.dht_forwarder = spawn_dht_status_forwarder(
+            Some(handle.status()),
+            self.dht_status_tx.clone(),
+            port,
+            self.dht_active.clone(),
+            self.dht_port.clone(),
+        );
+        self.wiring.dht = Some(crate::engine::DhtIntegration {
+            handle: handle.clone(),
+            active: self.dht_active.clone(),
+            port: self.dht_port.clone(),
+        });
         self.dht = Some(handle);
         Ok(())
     }
@@ -914,6 +966,7 @@ async fn spawn_magnet_entry(
         choke_interval: wiring.choke_interval,
         optimistic_interval: wiring.optimistic_interval,
         peer_id: wiring.peer_id,
+        dht: wiring.dht.clone(),
     };
     let handle = Torrent::spawn_from_magnet(link, output_dir.clone(), options).await?;
     let stats = handle.subscribe();
@@ -963,6 +1016,7 @@ async fn spawn_entry(
         choke_interval: wiring.choke_interval,
         optimistic_interval: wiring.optimistic_interval,
         peer_id: wiring.peer_id,
+        dht: wiring.dht.clone(),
     };
     let handle = Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), options).await?;
     let stats = handle.subscribe();

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -70,13 +71,14 @@ impl Registry {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone)]
 pub struct ListenerOptions {
     pub port: u16,
     pub handshake_timeout: Duration,
     pub global_pending: usize,
     pub per_ip_pending: usize,
     pub our_peer_id: [u8; 20],
+    pub dht_active: Arc<AtomicBool>,
 }
 
 impl Default for ListenerOptions {
@@ -87,6 +89,7 @@ impl Default for ListenerOptions {
             global_pending: DEFAULT_GLOBAL_PENDING,
             per_ip_pending: DEFAULT_PER_IP_PENDING,
             our_peer_id: *peer_id::session(),
+            dht_active: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -182,14 +185,14 @@ async fn run_bound(
             _ = status.closed() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, addr)) => {
-                    if !reserve_pending(&pending, addr.ip(), options) {
+                    if !reserve_pending(&pending, addr.ip(), &options) {
                         continue;
                     }
                     let state = PendingConnection {
                         registry: registry.clone(),
                         pending: pending.clone(),
                         ip: addr.ip(),
-                        options,
+                        options: options.clone(),
                     };
                     tokio::spawn(handle_connection(stream, addr, state));
                 }
@@ -222,7 +225,7 @@ impl PendingConnection {
     }
 }
 
-fn reserve_pending(state: &Mutex<PendingState>, ip: IpAddr, options: ListenerOptions) -> bool {
+fn reserve_pending(state: &Mutex<PendingState>, ip: IpAddr, options: &ListenerOptions) -> bool {
     let mut guard = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -281,9 +284,14 @@ async fn negotiate(
     let Some(sender) = state.registry.route(&remote.info_hash) else {
         return Err(NegotiateError::UnknownInfoHash);
     };
+    let reserved = if state.options.dht_active.load(Ordering::Relaxed) {
+        crate::extensions::with_dht_bit([0; 8])
+    } else {
+        [0; 8]
+    };
     let reply = handshake::encode(&Handshake {
         info_hash: remote.info_hash,
-        reserved: [0; 8],
+        reserved,
         peer_id: state.options.our_peer_id,
     });
     stream.write_all(&reply).await.map_err(NegotiateError::Io)?;

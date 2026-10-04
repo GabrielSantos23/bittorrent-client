@@ -1,10 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
@@ -12,6 +14,7 @@ use crate::dht::filter::AddressFilter;
 use crate::dht::krpc::{self, KrpcMessage, NodeInfo, Query, Response, TransactionId};
 use crate::dht::limiter::ResponseGate;
 use crate::dht::node_id::{cmp_distance_to, NodeId, SystemRandom};
+use crate::dht::schedule;
 use crate::dht::store::PeerStore;
 use crate::dht::table::{OfferOutcome, RoutingTable};
 use crate::dht::tokens::TokenVault;
@@ -25,12 +28,23 @@ pub const TRANSACTION_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_PENDING_QUERIES: usize = 128;
 pub const MAX_NODES_PER_RESPONSE: usize = 8;
 pub const MAX_PEERS_PER_RESPONSE: usize = 25;
+pub const MAX_CONCURRENT_LOOKUPS: usize = 4;
+pub const MAX_LOOKUP_QUERIES: u32 = 100;
+pub const LOOKUP_TIME_LIMIT_MS: u64 = 20_000;
+pub const MAX_LOOKUP_PEERS: usize = 128;
+pub const MAX_VERIFICATIONS: usize = 32;
 const SWEEP_INTERVAL_MS: u64 = 1_000;
 const MAX_FILL_QUERIES: u32 = 64;
 const FILL_ALPHA: usize = 3;
+const LOOKUP_ALPHA: usize = 3;
+const LOOKUP_CANDIDATES: usize = 8;
+const LOOKUP_MAX_CANDIDATES: usize = 256;
+const LOOKUP_MAINTENANCE_RESERVE: usize = 32;
 const REFRESH_QUERIES_PER_SWEEP: usize = 2;
 const REBOOTSTRAP_IDLE_MS: u64 = 30_000;
 const MAX_BOOTSTRAP_TARGETS: usize = 8;
+const COMMAND_CHANNEL_CAPACITY: usize = 64;
+const LOOKUP_QUEUE_CAPACITY: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ts_rs::TS)]
 #[ts(export)]
@@ -45,6 +59,8 @@ pub struct DhtStatus {
     pub queries_sent: u64,
     pub responses_rate_limited: u64,
     pub transaction_timeouts: u64,
+    pub lookups_completed: u64,
+    pub announces_sent: u64,
 }
 
 impl DhtStatus {
@@ -60,6 +76,8 @@ impl DhtStatus {
             queries_sent: 0,
             responses_rate_limited: 0,
             transaction_timeouts: 0,
+            lookups_completed: 0,
+            announces_sent: 0,
         }
     }
 }
@@ -68,6 +86,8 @@ pub struct DhtOptions {
     pub port: u16,
     pub self_id: NodeId,
     pub bootstrap: Vec<String>,
+    listener_active: Arc<AtomicBool>,
+    announce_port: Arc<AtomicU16>,
     filter: AddressFilter,
 }
 
@@ -77,12 +97,24 @@ impl DhtOptions {
             port,
             self_id,
             bootstrap: Vec::new(),
+            listener_active: Arc::new(AtomicBool::new(false)),
+            announce_port: Arc::new(AtomicU16::new(0)),
             filter: AddressFilter::strict(),
         }
     }
 
     pub fn with_bootstrap(mut self, bootstrap: Vec<String>) -> DhtOptions {
         self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_listener_state(
+        mut self,
+        listener_active: Arc<AtomicBool>,
+        announce_port: Arc<AtomicU16>,
+    ) -> DhtOptions {
+        self.listener_active = listener_active;
+        self.announce_port = announce_port;
         self
     }
 
@@ -93,8 +125,27 @@ impl DhtOptions {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DhtPeers {
+    pub info_hash: [u8; 20],
+    pub peers: Vec<SocketAddr>,
+}
+
+#[derive(Debug)]
+pub enum DhtCommand {
+    Lookup {
+        info_hash: [u8; 20],
+        result: mpsc::Sender<DhtPeers>,
+    },
+    VerifyCandidate {
+        addr: SocketAddrV4,
+    },
+}
+
+#[derive(Clone)]
 pub struct DhtHandle {
     status: watch::Receiver<DhtStatus>,
+    commands: mpsc::Sender<DhtCommand>,
     abort: AbortHandle,
 }
 
@@ -106,30 +157,50 @@ impl DhtHandle {
     pub fn shutdown(&self) {
         self.abort.abort();
     }
+
+    pub fn request_lookup(&self, info_hash: [u8; 20], result: mpsc::Sender<DhtPeers>) -> bool {
+        self.commands
+            .try_send(DhtCommand::Lookup { info_hash, result })
+            .is_ok()
+    }
+
+    pub fn verify_candidate(&self, addr: SocketAddrV4) -> bool {
+        self.commands
+            .try_send(DhtCommand::VerifyCandidate { addr })
+            .is_ok()
+    }
 }
 
 pub fn spawn(options: DhtOptions) -> DhtHandle {
+    let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let (status_tx, status_rx) = watch::channel(DhtStatus::inactive(options.port, None));
-    let task = tokio::spawn(run(options, status_tx));
+    let task = tokio::spawn(run(options, status_tx, commands_rx));
     DhtHandle {
         status: status_rx,
+        commands: commands_tx,
         abort: task.abort_handle(),
     }
 }
 
 pub async fn bind(options: DhtOptions) -> Result<DhtHandle, std::io::Error> {
+    let (commands_tx, commands_rx) = mpsc::channel(COMMAND_CHANNEL_CAPACITY);
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, options.port)).await?;
     let (status_tx, status_rx) = watch::channel(DhtStatus::inactive(options.port, None));
-    let task = tokio::spawn(run_bound(socket, options, status_tx));
+    let task = tokio::spawn(run_bound(socket, options, status_tx, commands_rx));
     Ok(DhtHandle {
         status: status_rx,
+        commands: commands_tx,
         abort: task.abort_handle(),
     })
 }
 
-async fn run(options: DhtOptions, status: watch::Sender<DhtStatus>) {
+async fn run(
+    options: DhtOptions,
+    status: watch::Sender<DhtStatus>,
+    commands: mpsc::Receiver<DhtCommand>,
+) {
     match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, options.port)).await {
-        Ok(socket) => run_bound(socket, options, status).await,
+        Ok(socket) => run_bound(socket, options, status, commands).await,
         Err(err) => {
             let _ = status.send(DhtStatus::inactive(
                 options.port,
@@ -143,6 +214,9 @@ async fn run(options: DhtOptions, status: watch::Sender<DhtStatus>) {
 enum PendingKind {
     Fill,
     Refresh,
+    Lookup { id: u32 },
+    Announce,
+    Verify,
 }
 
 struct PendingQuery {
@@ -159,6 +233,8 @@ struct Counters {
     queries_sent: u64,
     rate_limited: u64,
     timeouts: u64,
+    lookups_completed: u64,
+    announces_sent: u64,
 }
 
 struct FillState {
@@ -167,12 +243,71 @@ struct FillState {
     candidates: Vec<NodeInfo>,
 }
 
+struct Lookup {
+    info_hash: [u8; 20],
+    result: mpsc::Sender<DhtPeers>,
+    queried: HashSet<SocketAddrV4>,
+    failed: HashSet<SocketAddrV4>,
+    candidates: Vec<NodeInfo>,
+    responded: Vec<(NodeInfo, Option<Vec<u8>>)>,
+    peers: Vec<SocketAddrV4>,
+    queries_sent: u32,
+    started_ms: u64,
+}
+
+impl Lookup {
+    fn target(&self) -> NodeId {
+        NodeId::from_bytes(self.info_hash)
+    }
+
+    fn is_finished(&self, now_ms: u64, outstanding_queries: usize) -> bool {
+        if self.queries_sent >= MAX_LOOKUP_QUERIES {
+            return true;
+        }
+        if now_ms.saturating_sub(self.started_ms) >= LOOKUP_TIME_LIMIT_MS {
+            return true;
+        }
+        let mut closest: Vec<NodeInfo> = self.candidates.clone();
+        closest.sort_by(|a, b| cmp_distance_to(&a.id, &b.id, &self.target()));
+        closest.truncate(LOOKUP_CANDIDATES);
+        let closest_resolved = !closest.is_empty()
+            && closest.iter().all(|candidate| {
+                self.queried.contains(&candidate.addr)
+                    && (self
+                        .responded
+                        .iter()
+                        .any(|(node, _)| node.addr == candidate.addr)
+                        || self.failed.contains(&candidate.addr))
+            });
+        if closest_resolved {
+            return true;
+        }
+        let unqueried = self
+            .candidates
+            .iter()
+            .any(|candidate| !self.queried.contains(&candidate.addr));
+        !unqueried && outstanding_queries == 0
+    }
+
+    fn closest_with_tokens(&self, count: usize) -> Vec<(SocketAddrV4, Vec<u8>)> {
+        let mut responded = self.responded.clone();
+        responded.sort_by(|a, b| cmp_distance_to(&a.0.id, &b.0.id, &self.target()));
+        responded
+            .into_iter()
+            .filter_map(|(node, token)| token.map(|token| (node.addr, token)))
+            .take(count)
+            .collect()
+    }
+}
+
 struct NodeState {
     socket: UdpSocket,
     port: u16,
     self_id: NodeId,
     bootstrap: Vec<String>,
     filter: AddressFilter,
+    listener_active: Arc<AtomicBool>,
+    announce_port: Arc<AtomicU16>,
     table: RoutingTable,
     store: PeerStore,
     vault: TokenVault,
@@ -180,6 +315,12 @@ struct NodeState {
     pending: HashMap<(TransactionId, SocketAddrV4), PendingQuery>,
     queried: HashSet<SocketAddrV4>,
     fill: FillState,
+    lookups: HashMap<u32, Lookup>,
+    lookup_queue: VecDeque<Lookup>,
+    next_lookup_id: u32,
+    announced_at: HashMap<[u8; 20], u64>,
+    commands: mpsc::Receiver<DhtCommand>,
+    commands_open: bool,
     counters: Counters,
     last_bootstrap_ms: Option<u64>,
     start: TokioInstant,
@@ -346,19 +487,271 @@ impl NodeState {
         if self.filter.allows(source) && responder != self.self_id {
             self.table.offer(NodeInfo::new(responder, source), now);
         }
-        for node in response.nodes {
-            if !self.filter.allows(node.addr) || node.id == self.self_id {
+        let learned: Vec<NodeInfo> = response
+            .nodes
+            .into_iter()
+            .filter(|node| self.filter.allows(node.addr) && node.id != self.self_id)
+            .collect();
+        match pending.kind {
+            PendingKind::Lookup { id } => {
+                let peers: Vec<SocketAddrV4> = response
+                    .peers
+                    .into_iter()
+                    .filter_map(|peer| match peer {
+                        SocketAddr::V4(v4) if self.filter.allows(v4) => Some(v4),
+                        _ => None,
+                    })
+                    .collect();
+                self.absorb_lookup_response(id, source, responder, response.token, peers, learned);
+                self.advance_lookup(id).await;
+            }
+            PendingKind::Fill => {
+                self.fill.candidates.extend(
+                    learned
+                        .into_iter()
+                        .filter(|node| !self.queried.contains(&node.addr)),
+                );
+                self.maybe_dispatch_fill().await;
+            }
+            _ => {}
+        }
+    }
+
+    fn absorb_lookup_response(
+        &mut self,
+        id: u32,
+        source: SocketAddrV4,
+        responder: NodeId,
+        token: Option<Vec<u8>>,
+        peers: Vec<SocketAddrV4>,
+        learned: Vec<NodeInfo>,
+    ) {
+        let Some(lookup) = self.lookups.get_mut(&id) else {
+            return;
+        };
+        if let Some(token) = token {
+            lookup
+                .responded
+                .push((NodeInfo::new(responder, source), Some(token)));
+        } else {
+            lookup
+                .responded
+                .push((NodeInfo::new(responder, source), None));
+        }
+        for peer in peers {
+            if lookup.peers.len() >= MAX_LOOKUP_PEERS {
+                break;
+            }
+            if !lookup.peers.contains(&peer) {
+                lookup.peers.push(peer);
+            }
+        }
+        for node in learned {
+            if lookup.candidates.len() >= LOOKUP_MAX_CANDIDATES {
+                break;
+            }
+            if lookup.queried.contains(&node.addr)
+                || lookup
+                    .candidates
+                    .iter()
+                    .any(|known| known.addr == node.addr)
+            {
                 continue;
             }
-            if !matches!(self.table.offer(node, now), OfferOutcome::Rejected { .. })
-                && pending.kind == PendingKind::Fill
+            lookup.candidates.push(node);
+        }
+    }
+
+    fn outstanding_lookup_queries(&self, id: u32) -> usize {
+        self.pending
+            .values()
+            .filter(|query| {
+                matches!(query.kind, PendingKind::Lookup { id: pending_id } if pending_id == id)
+            })
+            .count()
+    }
+
+    async fn advance_lookup(&mut self, id: u32) {
+        let now = self.now_ms();
+        let outstanding = self.outstanding_lookup_queries(id);
+        let finished = self
+            .lookups
+            .get(&id)
+            .is_some_and(|lookup| lookup.is_finished(now, outstanding));
+        if finished {
+            self.finish_lookup(id).await;
+            return;
+        }
+        self.dispatch_lookup(id).await;
+    }
+
+    async fn dispatch_lookup(&mut self, id: u32) {
+        let now = self.now_ms();
+        let targets: Vec<(SocketAddrV4, NodeId)> = {
+            let Some(lookup) = self.lookups.get_mut(&id) else {
+                return;
+            };
+            if lookup.queries_sent >= MAX_LOOKUP_QUERIES
+                || now.saturating_sub(lookup.started_ms) >= LOOKUP_TIME_LIMIT_MS
             {
-                self.fill.candidates.push(node);
+                return;
             }
+            let room = (MAX_PENDING_QUERIES - LOOKUP_MAINTENANCE_RESERVE)
+                .saturating_sub(self.pending.len());
+            if room == 0 {
+                return;
+            }
+            let target = lookup.target();
+            lookup
+                .candidates
+                .sort_by(|a, b| cmp_distance_to(&a.id, &b.id, &target));
+            let mut targets = Vec::new();
+            for candidate in &lookup.candidates {
+                if targets.len() >= LOOKUP_ALPHA.min(room) {
+                    break;
+                }
+                if lookup.queried.contains(&candidate.addr) {
+                    continue;
+                }
+                targets.push((candidate.addr, candidate.id));
+            }
+            for (addr, _) in &targets {
+                lookup.queried.insert(*addr);
+            }
+            lookup.queries_sent += targets.len() as u32;
+            targets
+        };
+        for (addr, node_id) in targets {
+            let query = Query::GetPeers {
+                info_hash: self
+                    .lookups
+                    .get(&id)
+                    .map(|lookup| lookup.info_hash)
+                    .unwrap_or([0u8; 20]),
+            };
+            self.send_query(addr, query, PendingKind::Lookup { id }, Some(node_id))
+                .await;
         }
-        if pending.kind == PendingKind::Fill {
-            self.maybe_dispatch_fill().await;
+    }
+
+    async fn finish_lookup(&mut self, id: u32) {
+        let Some(lookup) = self.lookups.remove(&id) else {
+            return;
+        };
+        self.counters.lookups_completed = self.counters.lookups_completed.saturating_add(1);
+        let now = self.now_ms();
+        let _ = lookup.result.try_send(DhtPeers {
+            info_hash: lookup.info_hash,
+            peers: lookup
+                .peers
+                .iter()
+                .map(|peer| SocketAddr::V4(*peer))
+                .collect(),
+        });
+        self.maybe_announce(lookup, now).await;
+        self.start_queued_lookups().await;
+    }
+
+    async fn maybe_announce(&mut self, lookup: Lookup, now: u64) {
+        if !self.listener_active.load(Ordering::Relaxed) {
+            return;
         }
+        if !schedule::should_announce_after_lookup(
+            self.announced_at.get(&lookup.info_hash).copied(),
+            now,
+        ) {
+            return;
+        }
+        let targets = lookup.closest_with_tokens(MAX_NODES_PER_RESPONSE);
+        if targets.is_empty() {
+            return;
+        }
+        self.announced_at.insert(lookup.info_hash, now);
+        let port = self.announce_port.load(Ordering::Relaxed);
+        for (addr, token) in targets {
+            self.send_query(
+                addr,
+                Query::AnnouncePeer {
+                    info_hash: lookup.info_hash,
+                    port,
+                    token,
+                    implied_port: false,
+                },
+                PendingKind::Announce,
+                None,
+            )
+            .await;
+            self.counters.announces_sent = self.counters.announces_sent.saturating_add(1);
+        }
+    }
+
+    async fn start_queued_lookups(&mut self) {
+        while self.lookups.len() < MAX_CONCURRENT_LOOKUPS {
+            let Some(lookup) = self.lookup_queue.pop_front() else {
+                return;
+            };
+            let id = self.next_lookup_id;
+            self.next_lookup_id = self.next_lookup_id.wrapping_add(1);
+            let mut lookup = lookup;
+            lookup.started_ms = self.now_ms();
+            self.lookups.insert(id, lookup);
+            self.dispatch_lookup(id).await;
+        }
+    }
+
+    async fn accept_lookup(&mut self, info_hash: [u8; 20], result: mpsc::Sender<DhtPeers>) {
+        let lookup = Lookup {
+            info_hash,
+            result,
+            queried: HashSet::new(),
+            failed: HashSet::new(),
+            candidates: self
+                .table
+                .closest_nodes(&NodeId::from_bytes(info_hash), LOOKUP_CANDIDATES),
+            responded: Vec::new(),
+            peers: Vec::new(),
+            queries_sent: 0,
+            started_ms: self.now_ms(),
+        };
+        if self.lookups.len() >= MAX_CONCURRENT_LOOKUPS {
+            if self.lookup_queue.len() >= LOOKUP_QUEUE_CAPACITY {
+                let _ = lookup.result.try_send(DhtPeers {
+                    info_hash,
+                    peers: Vec::new(),
+                });
+                return;
+            }
+            self.lookup_queue.push_back(lookup);
+            return;
+        }
+        let id = self.next_lookup_id;
+        self.next_lookup_id = self.next_lookup_id.wrapping_add(1);
+        self.lookups.insert(id, lookup);
+        self.dispatch_lookup(id).await;
+    }
+
+    fn outstanding_verifications(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|query| query.kind == PendingKind::Verify)
+            .count()
+    }
+
+    async fn accept_verification(&mut self, addr: SocketAddrV4) {
+        if !self.filter.allows(addr) || addr.port() == 0 {
+            return;
+        }
+        if self.outstanding_verifications() >= MAX_VERIFICATIONS {
+            return;
+        }
+        let already_outstanding = self.pending.iter().any(|((_, destination), query)| {
+            query.kind == PendingKind::Verify && *destination == addr
+        });
+        if already_outstanding {
+            return;
+        }
+        self.send_query(addr, Query::Ping, PendingKind::Verify, None)
+            .await;
     }
 
     async fn maybe_dispatch_fill(&mut self) {
@@ -412,11 +805,18 @@ impl NodeState {
             .filter(|(_, query)| now.saturating_sub(query.sent_ms) >= TRANSACTION_TIMEOUT_MS)
             .map(|(key, _)| *key)
             .collect();
+        let mut expired_lookups: Vec<u32> = Vec::new();
         for key in expired {
             if let Some(query) = self.pending.remove(&key) {
                 self.counters.timeouts = self.counters.timeouts.saturating_add(1);
                 if let Some(node_id) = query.node_id {
                     self.table.note_failure(&node_id, now);
+                }
+                if let PendingKind::Lookup { id } = query.kind {
+                    if let Some(lookup) = self.lookups.get_mut(&id) {
+                        lookup.failed.insert(key.1);
+                    }
+                    expired_lookups.push(id);
                 }
             }
         }
@@ -432,6 +832,25 @@ impl NodeState {
             }
         } else {
             self.refresh_stale_buckets(now).await;
+        }
+        let mut to_finish: Vec<u32> = Vec::new();
+        for id in self.lookups.keys().copied().collect::<Vec<_>>() {
+            let outstanding = self.outstanding_lookup_queries(id);
+            if self
+                .lookups
+                .get(&id)
+                .is_some_and(|lookup| lookup.is_finished(now, outstanding))
+            {
+                to_finish.push(id);
+            }
+        }
+        for id in to_finish {
+            self.finish_lookup(id).await;
+        }
+        for id in expired_lookups {
+            if self.lookups.contains_key(&id) {
+                self.dispatch_lookup(id).await;
+            }
         }
         self.publish(status);
     }
@@ -545,6 +964,8 @@ impl NodeState {
             queries_sent: self.counters.queries_sent,
             responses_rate_limited: self.counters.rate_limited,
             transaction_timeouts: self.counters.timeouts,
+            lookups_completed: self.counters.lookups_completed,
+            announces_sent: self.counters.announces_sent,
         });
     }
 }
@@ -562,7 +983,12 @@ async fn resolve_bootstrap(hosts: &[String]) -> Vec<SocketAddrV4> {
     resolved
 }
 
-async fn run_bound(socket: UdpSocket, options: DhtOptions, status: watch::Sender<DhtStatus>) {
+async fn run_bound(
+    socket: UdpSocket,
+    options: DhtOptions,
+    status: watch::Sender<DhtStatus>,
+    commands: mpsc::Receiver<DhtCommand>,
+) {
     let port = socket
         .local_addr()
         .map(|addr| addr.port())
@@ -574,6 +1000,8 @@ async fn run_bound(socket: UdpSocket, options: DhtOptions, status: watch::Sender
         self_id: options.self_id,
         bootstrap: options.bootstrap,
         filter: options.filter,
+        listener_active: options.listener_active,
+        announce_port: options.announce_port,
         table: RoutingTable::new(options.self_id, 0),
         store: PeerStore::default(),
         vault: TokenVault::new(0, &SystemRandom),
@@ -585,6 +1013,12 @@ async fn run_bound(socket: UdpSocket, options: DhtOptions, status: watch::Sender
             queries_sent: 0,
             candidates: Vec::new(),
         },
+        lookups: HashMap::new(),
+        lookup_queue: VecDeque::new(),
+        next_lookup_id: 1,
+        announced_at: HashMap::new(),
+        commands,
+        commands_open: true,
         counters: Counters::default(),
         last_bootstrap_ms: None,
         start,
@@ -600,6 +1034,17 @@ async fn run_bound(socket: UdpSocket, options: DhtOptions, status: watch::Sender
     loop {
         tokio::select! {
             _ = status.closed() => break,
+            command = node.commands.recv(), if node.commands_open => match command {
+                Some(command) => match command {
+                    DhtCommand::Lookup { info_hash, result } => {
+                        node.accept_lookup(info_hash, result).await;
+                    }
+                    DhtCommand::VerifyCandidate { addr } => {
+                        node.accept_verification(addr).await;
+                    }
+                },
+                None => node.commands_open = false,
+            },
             received = node.socket.recv_from(&mut buffer) => match received {
                 Ok((size, source)) => {
                     node.handle_datagram(&buffer[..size], source).await;
@@ -773,8 +1218,19 @@ mod tests {
             }
         }
 
-        async fn send_raw(&self, destination: SocketAddr, datagram: &[u8]) {
-            self.socket.send_to(datagram, destination).await.unwrap();
+        async fn send_raw(&self, destination: impl Into<SocketAddr>, datagram: &[u8]) {
+            self.socket
+                .send_to(datagram, destination.into())
+                .await
+                .unwrap();
+        }
+
+        async fn recv_from_raw(&self, limit: Duration) -> Option<(Vec<u8>, SocketAddr)> {
+            let mut buffer = [0u8; 4096];
+            match tokio::time::timeout(limit, self.socket.recv_from(&mut buffer)).await {
+                Ok(Ok((size, source))) => Some((buffer[..size].to_vec(), source)),
+                _ => None,
+            }
         }
 
         async fn recv_raw(&self, limit: Duration) -> Option<Vec<u8>> {
@@ -835,6 +1291,30 @@ mod tests {
         ]))
     }
 
+    fn query_announce_peer_implied(
+        tid: [u8; 2],
+        id: &[u8; 20],
+        info_hash: &[u8; 20],
+        port: u16,
+        token: &[u8],
+    ) -> Vec<u8> {
+        wire::encode(&dict(vec![
+            (b"t", b(tid.as_slice())),
+            (b"y", b(b"q")),
+            (b"q", b(b"announce_peer")),
+            (
+                b"a",
+                dict(vec![
+                    (b"id", b(id)),
+                    (b"info_hash", b(info_hash.as_slice())),
+                    (b"port", int(port as i64)),
+                    (b"token", b(token)),
+                    (b"implied_port", int(1)),
+                ]),
+            ),
+        ]))
+    }
+
     fn query_announce_peer(
         tid: [u8; 2],
         id: &[u8; 20],
@@ -887,6 +1367,14 @@ mod tests {
             raw.extend_from_slice(&addr.port().to_be_bytes());
         }
         Value::Bytes(raw)
+    }
+
+    fn reply_error(tid: &[u8], code: i64, message: &str) -> Vec<u8> {
+        wire::encode(&dict(vec![
+            (b"t", b(tid)),
+            (b"y", b(b"e")),
+            (b"e", Value::List(vec![int(code), b(message.as_bytes())])),
+        ]))
     }
 
     fn tid_of(datagram: &[u8]) -> Vec<u8> {
@@ -1008,6 +1496,311 @@ mod tests {
 
     fn solid_id(seed: u8) -> NodeId {
         NodeId::from_bytes([seed; 20])
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum NodeBehavior {
+        Good,
+        GoodNoToken,
+        Garbage,
+        InvalidAddresses,
+        Silent,
+        Oversized,
+        Truncated,
+    }
+
+    type SwarmPeers = HashMap<[u8; 20], Vec<(std::net::Ipv4Addr, u16)>>;
+
+    struct Swarm {
+        peers: std::sync::Mutex<SwarmPeers>,
+        queries: std::sync::Mutex<Vec<([u8; 20], &'static str)>>,
+        secret: u8,
+    }
+
+    impl Swarm {
+        fn new(secret: u8) -> Swarm {
+            Swarm {
+                peers: std::sync::Mutex::new(HashMap::new()),
+                queries: std::sync::Mutex::new(Vec::new()),
+                secret,
+            }
+        }
+
+        fn token_for(&self, ip: std::net::Ipv4Addr) -> Vec<u8> {
+            let octets = ip.octets();
+            vec![
+                octets[3],
+                self.secret,
+                octets[0] ^ self.secret,
+                0x5A,
+                octets[1],
+                self.secret ^ 0x33,
+                octets[2],
+                0x3C,
+            ]
+        }
+
+        fn plant(&self, info_hash: [u8; 20], peer: (std::net::Ipv4Addr, u16)) {
+            self.peers
+                .lock()
+                .unwrap()
+                .entry(info_hash)
+                .or_default()
+                .push(peer);
+        }
+    }
+
+    struct SwarmNode {
+        node: FakeNode,
+        id: NodeId,
+        behavior: NodeBehavior,
+        neighbors: Arc<std::sync::Mutex<Vec<(NodeId, SocketAddrV4)>>>,
+        swarm: Arc<Swarm>,
+    }
+
+    impl SwarmNode {
+        fn addr(&self) -> SocketAddrV4 {
+            self.node.addr()
+        }
+
+        fn spawn_responder(self) {
+            tokio::spawn(async move {
+                loop {
+                    let Some((datagram, source)) =
+                        self.node.recv_from_raw(Duration::from_secs(600)).await
+                    else {
+                        continue;
+                    };
+                    let SocketAddr::V4(source) = source else {
+                        continue;
+                    };
+                    match self.behavior {
+                        NodeBehavior::Silent => {}
+                        NodeBehavior::Garbage => {
+                            self.node.send_raw(source, &[0x07, 0x11, 0x22, 0x33]).await;
+                        }
+                        NodeBehavior::Oversized => {
+                            self.node.send_raw(source, &vec![b'x'; 3000]).await;
+                        }
+                        NodeBehavior::Truncated => {
+                            let reply =
+                                reply_response(&[0x01, 0x02], &self.id.as_bytes().clone(), vec![]);
+                            self.node.send_raw(source, &reply[..reply.len() / 2]).await;
+                        }
+                        NodeBehavior::InvalidAddresses => {
+                            self.reply_invalid_addresses(&datagram, source).await;
+                        }
+                        NodeBehavior::Good => {
+                            self.reply_good(&datagram, source, true).await;
+                        }
+                        NodeBehavior::GoodNoToken => {
+                            self.reply_good(&datagram, source, false).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        async fn reply_invalid_addresses(&self, datagram: &[u8], source: SocketAddrV4) {
+            let Some(parsed) = wire::decode(datagram) else {
+                return;
+            };
+            let Some(Value::Bytes(tid)) = wire::get(&parsed, b"t") else {
+                return;
+            };
+            let bogus = [
+                NodeId::from_bytes([0x51; 20]),
+                NodeId::from_bytes([0x52; 20]),
+            ];
+            let addrs = [
+                SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 6881),
+                SocketAddrV4::new(Ipv4Addr::new(255, 255, 255, 255), 6881),
+                SocketAddrV4::new(Ipv4Addr::new(10, 9, 9, 9), 0),
+                SocketAddrV4::new(Ipv4Addr::new(224, 0, 0, 7), 6881),
+            ];
+            let entries: Vec<(NodeId, SocketAddrV4)> = bogus
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (*id, addrs[index % addrs.len()]))
+                .collect();
+            self.node
+                .send_raw(
+                    source,
+                    &reply_response(
+                        tid,
+                        &self.id.as_bytes().clone(),
+                        vec![(b"nodes" as &[u8], nodes_value(&entries))],
+                    ),
+                )
+                .await;
+        }
+
+        async fn reply_good(&self, datagram: &[u8], source: SocketAddrV4, with_token: bool) {
+            let Some(parsed) = wire::decode(datagram) else {
+                return;
+            };
+            let Some(Value::Bytes(tid)) = wire::get(&parsed, b"t") else {
+                return;
+            };
+            let Some(Value::Bytes(method)) = wire::get(&parsed, b"q") else {
+                return;
+            };
+            let arguments = wire::get(&parsed, b"a")
+                .cloned()
+                .unwrap_or(Value::Dict(Vec::new()));
+            match method.as_slice() {
+                b"ping" | b"find_node" => {
+                    let neighbors = self.neighbors.lock().unwrap().clone();
+                    let nodes: Vec<(NodeId, SocketAddrV4)> = neighbors
+                        .iter()
+                        .filter(|(_, addr)| *addr != self.addr())
+                        .take(8)
+                        .cloned()
+                        .collect();
+                    let mut values = vec![];
+                    if *method == b"find_node" {
+                        values.push((b"nodes" as &[u8], nodes_value(&nodes)));
+                    }
+                    self.node
+                        .send_raw(
+                            source,
+                            &reply_response(tid, &self.id.as_bytes().clone(), values),
+                        )
+                        .await;
+                }
+                b"get_peers" => {
+                    let info_hash = match wire::get(&arguments, b"info_hash") {
+                        Some(Value::Bytes(bytes)) => {
+                            let mut hash = [0u8; 20];
+                            hash.copy_from_slice(bytes);
+                            hash
+                        }
+                        _ => return,
+                    };
+                    self.swarm
+                        .queries
+                        .lock()
+                        .unwrap()
+                        .push((info_hash, "get_peers"));
+                    let token = self.swarm.token_for(*source.ip());
+                    let stored = self
+                        .swarm
+                        .peers
+                        .lock()
+                        .unwrap()
+                        .get(&info_hash)
+                        .cloned()
+                        .unwrap_or_default();
+                    let mut values = vec![];
+                    if stored.is_empty() {
+                        let neighbors = self.neighbors.lock().unwrap().clone();
+                        let nodes: Vec<(NodeId, SocketAddrV4)> = neighbors
+                            .iter()
+                            .filter(|(_, addr)| *addr != self.addr())
+                            .take(8)
+                            .cloned()
+                            .collect();
+                        values.push((b"nodes" as &[u8], nodes_value(&nodes)));
+                    } else {
+                        let entries = stored
+                            .iter()
+                            .map(|(ip, port)| {
+                                let mut raw = Vec::new();
+                                raw.extend_from_slice(&ip.octets());
+                                raw.extend_from_slice(&port.to_be_bytes());
+                                Value::Bytes(raw)
+                            })
+                            .collect();
+                        values.push((b"values" as &[u8], Value::List(entries)));
+                    }
+                    if with_token {
+                        values.push((b"token" as &[u8], Value::Bytes(token)));
+                    }
+                    self.node
+                        .send_raw(
+                            source,
+                            &reply_response(tid, &self.id.as_bytes().clone(), values),
+                        )
+                        .await;
+                }
+                b"announce_peer" => {
+                    let info_hash = match wire::get(&arguments, b"info_hash") {
+                        Some(Value::Bytes(bytes)) => {
+                            let mut hash = [0u8; 20];
+                            hash.copy_from_slice(bytes);
+                            hash
+                        }
+                        _ => return,
+                    };
+                    self.swarm
+                        .queries
+                        .lock()
+                        .unwrap()
+                        .push((info_hash, "announce_peer"));
+                    let token_ok = match wire::get(&arguments, b"token") {
+                        Some(Value::Bytes(token)) => *token == self.swarm.token_for(*source.ip()),
+                        _ => false,
+                    };
+                    if !token_ok {
+                        self.node
+                            .send_raw(source, &reply_error(tid, 203, "Bad token"))
+                            .await;
+                        return;
+                    }
+                    let claimed_port = match wire::get(&arguments, b"port") {
+                        Some(Value::Int(port)) => *port as u16,
+                        _ => 0,
+                    };
+                    let implied =
+                        matches!(wire::get(&arguments, b"implied_port"), Some(Value::Int(1)));
+                    let port = if implied { source.port() } else { claimed_port };
+                    self.swarm
+                        .peers
+                        .lock()
+                        .unwrap()
+                        .entry(info_hash)
+                        .or_default()
+                        .push((*source.ip(), port));
+                    self.node
+                        .send_raw(
+                            source,
+                            &reply_response(tid, &self.id.as_bytes().clone(), vec![]),
+                        )
+                        .await;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    async fn swarm_network(
+        sizes: &[(NodeBehavior, usize)],
+        swarm: Arc<Swarm>,
+    ) -> (Vec<SwarmNode>, SocketAddrV4) {
+        let neighbors: Arc<std::sync::Mutex<Vec<(NodeId, SocketAddrV4)>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut nodes = Vec::new();
+        let mut octet = 1u8;
+        for (behavior, count) in sizes {
+            for _ in 0..*count {
+                let mut id_bytes = [0u8; 20];
+                id_bytes[0] = 0x70;
+                id_bytes[1] = octet;
+                id_bytes[2] = 0x11;
+                let node = SwarmNode {
+                    node: FakeNode::bind(octet).await,
+                    id: NodeId::from_bytes(id_bytes),
+                    behavior: *behavior,
+                    neighbors: neighbors.clone(),
+                    swarm: swarm.clone(),
+                };
+                neighbors.lock().unwrap().push((node.id, node.addr()));
+                nodes.push(node);
+                octet += 1;
+            }
+        }
+        let router = nodes[0].addr();
+        (nodes, router)
     }
 
     #[tokio::test]
@@ -1276,14 +2069,13 @@ mod tests {
     #[tokio::test]
     async fn responses_never_return_more_than_eight_nodes() {
         let router = FakeNode::bind(1).await;
-        let distant: Vec<(NodeId, SocketAddrV4)> = (0..12)
-            .map(|index| {
-                (
-                    solid_id(index + 2),
-                    SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, index + 2), 45990 + index as u16),
-                )
-            })
-            .collect();
+        let mut distant: Vec<(NodeId, SocketAddrV4)> = Vec::new();
+        for index in 0..12u8 {
+            let node = FakeNode::bind(index + 2).await;
+            let id = solid_id(index + 2);
+            distant.push((id, node.addr()));
+            spawn_id_responder(node, id);
+        }
         let handle = spawn(
             permissive_options(0, solid_id(1))
                 .with_bootstrap(vec![format!("127.0.0.1:{}", router.addr().port())]),
@@ -1416,6 +2208,338 @@ mod tests {
             refresh_target, bootstrap_target,
             "the refresh must probe a bucket range, not our own id"
         );
+        handle.shutdown();
+    }
+
+    fn spawn_id_responder(node: FakeNode, id: NodeId) {
+        tokio::spawn(async move {
+            loop {
+                let Some((datagram, source)) = node.recv_from_raw(Duration::from_secs(600)).await
+                else {
+                    continue;
+                };
+                let SocketAddr::V4(source) = source else {
+                    continue;
+                };
+                let Some(parsed) = wire::decode(&datagram) else {
+                    continue;
+                };
+                let Some(Value::Bytes(tid)) = wire::get(&parsed, b"t") else {
+                    continue;
+                };
+                node.send_raw(source, &reply_response(tid, &id.as_bytes().clone(), vec![]))
+                    .await;
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn lookup_on_a_simulated_network_converges_and_survives_hostile_nodes() {
+        let swarm = Arc::new(Swarm::new(0xA1));
+        let info_hash = [0x63u8; 20];
+        let planted: Vec<SocketAddr> = (0..5u8)
+            .map(|index| SocketAddr::from(([93, 1, 0, index], 6800 + index as u16)))
+            .collect();
+        for peer in &planted {
+            let SocketAddr::V4(v4) = *peer else {
+                panic!("planted peers are ipv4");
+            };
+            swarm.plant(info_hash, (*v4.ip(), v4.port()));
+        }
+        let (nodes, router) = swarm_network(
+            &[
+                (NodeBehavior::Good, 45),
+                (NodeBehavior::GoodNoToken, 1),
+                (NodeBehavior::Garbage, 1),
+                (NodeBehavior::InvalidAddresses, 1),
+                (NodeBehavior::Silent, 1),
+                (NodeBehavior::Oversized, 1),
+                (NodeBehavior::Truncated, 1),
+            ],
+            swarm.clone(),
+        )
+        .await;
+        assert_eq!(nodes.len(), 51);
+        for node in nodes {
+            node.spawn_responder();
+        }
+        let handle = spawn(
+            permissive_options(0, solid_id(1))
+                .with_bootstrap(vec![format!("127.0.0.1:{}", router.port())]),
+        );
+        let status = handle.status();
+        wait_for_status(status.clone(), |s| s.active, 5).await;
+        wait_for_status(status.clone(), |s| s.node_count >= 8, 20).await;
+
+        let (result_tx, mut result_rx) = mpsc::channel(1);
+        assert!(handle.request_lookup(info_hash, result_tx));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), result_rx.recv())
+            .await
+            .expect("lookup outcome within timeout")
+            .expect("outcome channel open");
+        assert_eq!(outcome.info_hash, info_hash);
+        let mut got = outcome.peers.clone();
+        got.sort();
+        let mut wanted = planted.clone();
+        wanted.sort();
+        assert_eq!(
+            got, wanted,
+            "the lookup must return exactly the planted peers"
+        );
+        wait_for_status(status, |s| s.lookups_completed >= 1, 5).await;
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn announce_is_stored_then_found_by_a_second_service() {
+        let swarm = Arc::new(Swarm::new(0xB2));
+        let info_hash = [0x64u8; 20];
+        let (nodes, router) = swarm_network(&[(NodeBehavior::Good, 6)], swarm.clone()).await;
+        for node in nodes {
+            node.spawn_responder();
+        }
+        let bootstrap = vec![format!("127.0.0.1:{}", router.port())];
+        let listener_active = Arc::new(AtomicBool::new(true));
+        let announce_port = Arc::new(AtomicU16::new(7777));
+        let announcer = spawn(
+            permissive_options(0, solid_id(1))
+                .with_bootstrap(bootstrap.clone())
+                .with_listener_state(listener_active, announce_port),
+        );
+        let status = announcer.status();
+        wait_for_status(status, |s| s.node_count >= 2, 20).await;
+        let (tx, mut announcer_rx) = mpsc::channel(1);
+        assert!(announcer.request_lookup(info_hash, tx));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), announcer_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outcome.peers.is_empty(), "nothing planted yet");
+        wait_for_status(announcer.status(), |s| s.announces_sent >= 1, 20).await;
+
+        let finder = spawn(permissive_options(0, solid_id(2)).with_bootstrap(bootstrap.clone()));
+        wait_for_status(finder.status(), |s| s.node_count >= 2, 20).await;
+        let (tx, mut finder_rx) = mpsc::channel(1);
+        assert!(finder.request_lookup(info_hash, tx));
+        let outcome = tokio::time::timeout(Duration::from_secs(20), finder_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            outcome.peers,
+            vec![SocketAddr::from(([127, 0, 0, 1], 7777))],
+            "the second service must discover the announced port"
+        );
+        announcer.shutdown();
+        finder.shutdown();
+    }
+
+    #[tokio::test]
+    async fn implied_port_one_uses_the_source_and_the_ip_is_always_the_packets_source() {
+        let node = FakeNode::bind(1).await;
+        let handle = spawn(permissive_options(0, solid_id(1)));
+        let status = handle.status();
+        let service = wait_for_status(status, |s| s.active, 5).await;
+        let destination = SocketAddr::from(([127, 0, 0, 1], service.port));
+        let info_hash = [0x44u8; 20];
+        let requester = [7u8; 20];
+        let source_port = node.addr().port();
+
+        node.send_raw(
+            destination,
+            &query_get_peers([1, 1], &requester, &info_hash),
+        )
+        .await;
+        let token = token_from(&node.next_datagram().await);
+        let smuggled = wire::encode(&dict(vec![
+            (b"t", b([1, 2].as_slice())),
+            (b"y", b(b"q")),
+            (b"q", b(b"announce_peer")),
+            (
+                b"a",
+                dict(vec![
+                    (b"id", b(requester.as_slice())),
+                    (b"info_hash", b(info_hash.as_slice())),
+                    (b"port", int(7001)),
+                    (b"token", b(token.as_slice())),
+                    (b"implied_port", int(0)),
+                    (b"ip", b(&[6, 6, 6, 6])),
+                ]),
+            ),
+        ]));
+        node.send_raw(destination, &smuggled).await;
+        assert!(!is_error(&node.next_datagram().await));
+        node.send_raw(
+            destination,
+            &query_get_peers([1, 3], &requester, &info_hash),
+        )
+        .await;
+        assert_eq!(
+            peers_from(&node.next_datagram().await),
+            vec![SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7001)],
+            "implied_port 0 keeps the claimed port but the source ip"
+        );
+
+        node.send_raw(
+            destination,
+            &query_announce_peer_implied([2, 1], &requester, &info_hash, 9999, &token),
+        )
+        .await;
+        assert!(!is_error(&node.next_datagram().await));
+        node.send_raw(
+            destination,
+            &query_get_peers([2, 2], &requester, &info_hash),
+        )
+        .await;
+        assert_eq!(
+            peers_from(&node.next_datagram().await),
+            vec![
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, source_port),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 7001),
+            ],
+            "implied_port 1 replaces the claimed port with the packet source port"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn port_candidates_are_capped_deduplicated_and_verified_before_insertion() {
+        let answering = FakeNode::bind(1).await;
+        let answering_id = solid_id(0x81);
+        let answering_addr = answering.addr();
+        spawn_id_responder(answering, answering_id);
+        let mut candidates: Vec<FakeNode> = Vec::new();
+        for octet in 2..42u8 {
+            candidates.push(FakeNode::bind(octet).await);
+        }
+        let handle = spawn(permissive_options(0, solid_id(1)));
+        let status = handle.status();
+        wait_for_status(status.clone(), |s| s.active, 5).await;
+
+        assert!(handle.verify_candidate(answering_addr));
+        wait_for_status(status.clone(), |s| s.node_count == 1, 5).await;
+
+        for candidate in candidates.iter().take(40) {
+            assert!(handle.verify_candidate(candidate.addr()));
+        }
+        let mut pinged = 0;
+        for candidate in candidates.iter().take(40) {
+            if candidate
+                .recv_raw(Duration::from_millis(400))
+                .await
+                .is_some()
+            {
+                pinged += 1;
+            }
+        }
+        assert_eq!(pinged, 32, "at most 32 verifications may be outstanding");
+        assert_eq!(status.borrow().node_count, 1);
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn verification_pings_flow_while_lookups_hold_the_budget() {
+        let router = FakeNode::bind(1).await;
+        let mut silent_nodes: Vec<FakeNode> = Vec::new();
+        let mut silent: Vec<(NodeId, SocketAddrV4)> = Vec::new();
+        for octet in 2..32u8 {
+            let mut id = [0u8; 20];
+            id[0] = 0x60;
+            id[1] = octet;
+            let node = FakeNode::bind(octet).await;
+            silent.push((NodeId::from_bytes(id), node.addr()));
+            silent_nodes.push(node);
+        }
+        let handle = spawn(
+            permissive_options(0, solid_id(1))
+                .with_bootstrap(vec![format!("127.0.0.1:{}", router.addr().port())]),
+        );
+        let status = handle.status();
+        let service = wait_for_status(status.clone(), |s| s.active, 5).await;
+        let destination = SocketAddr::from(([127, 0, 0, 1], service.port));
+        let request = router.next_datagram().await;
+        router
+            .send_raw(
+                destination,
+                &reply_response(
+                    &tid_of(&request),
+                    &[0xEEu8; 20],
+                    vec![(b"nodes" as &[u8], nodes_value(&silent))],
+                ),
+            )
+            .await;
+        wait_for_status(status.clone(), |s| s.node_count >= 1, 10).await;
+        for index in 0..4u8 {
+            let mut hash = [0u8; 20];
+            hash[0] = 0x71;
+            hash[1] = index;
+            let (tx, mut rx) = mpsc::channel(1);
+            assert!(handle.request_lookup(hash, tx), "request {index} rejected");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(2_000), rx.recv())
+                    .await
+                    .is_err(),
+                "lookup {index} against silent nodes must stay in flight"
+            );
+        }
+        let mut verifiers: Vec<FakeNode> = Vec::new();
+        for octet in 40..56u8 {
+            verifiers.push(FakeNode::bind(octet).await);
+        }
+        for verifier in &verifiers {
+            assert!(handle.verify_candidate(verifier.addr()));
+        }
+        let mut pinged = 0;
+        for verifier in &verifiers {
+            if verifier
+                .recv_raw(Duration::from_millis(500))
+                .await
+                .is_some()
+            {
+                pinged += 1;
+            }
+        }
+        assert_eq!(
+            pinged,
+            verifiers.len(),
+            "maintenance pings must not be starved"
+        );
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn tokens_are_bound_to_the_requester_ip() {
+        let node_a = FakeNode::bind(1).await;
+        let node_b = FakeNode::bind(2).await;
+        let handle = spawn(permissive_options(0, solid_id(1)));
+        let status = handle.status();
+        let service = wait_for_status(status, |s| s.active, 5).await;
+        let destination = SocketAddr::from(([127, 0, 0, 1], service.port));
+        let info_hash = [0x45u8; 20];
+        node_a
+            .send_raw(
+                destination,
+                &query_get_peers([1, 1], &[7u8; 20], &info_hash),
+            )
+            .await;
+        let token_a = token_from(&node_a.next_datagram().await);
+        node_b
+            .send_raw(
+                destination,
+                &query_announce_peer([1, 2], &[8u8; 20], &info_hash, 7100, &token_a),
+            )
+            .await;
+        assert!(
+            is_error(&node_b.next_datagram().await),
+            "a token minted for another ip must be rejected"
+        );
+        node_b
+            .send_raw(
+                destination,
+                &query_get_peers([1, 3], &[8u8; 20], &info_hash),
+            )
+            .await;
+        assert!(peers_from(&node_b.next_datagram().await).is_empty());
         handle.shutdown();
     }
 }
