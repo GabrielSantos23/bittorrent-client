@@ -377,6 +377,7 @@ struct NodeState {
     last_persist_ms: Option<u64>,
     persist_path: Option<PathBuf>,
     deferred_lookups: Vec<Lookup>,
+    restore_queue: VecDeque<SocketAddrV4>,
     start: TokioInstant,
     random: SystemRandom,
 }
@@ -820,6 +821,16 @@ impl NodeState {
             .await;
     }
 
+    async fn pump_restore_verifications(&mut self) {
+        while !self.restore_queue.is_empty() && self.outstanding_verifications() < MAX_VERIFICATIONS
+        {
+            let Some(addr) = self.restore_queue.pop_front() else {
+                return;
+            };
+            self.accept_verification(addr).await;
+        }
+    }
+
     async fn maybe_dispatch_fill(&mut self) {
         if !self.fill.active {
             return;
@@ -899,6 +910,9 @@ impl NodeState {
             for lookup in std::mem::take(&mut self.deferred_lookups) {
                 self.start_lookup(lookup).await;
             }
+        }
+        if !self.restore_queue.is_empty() {
+            self.pump_restore_verifications().await;
         }
         if self.fill.active {
             self.maybe_dispatch_fill().await;
@@ -1120,12 +1134,17 @@ async fn run_bound(
         last_persist_ms: None,
         persist_path: options.persist_path,
         deferred_lookups: Vec::new(),
+        restore_queue: VecDeque::new(),
         start,
         random: SystemRandom,
     };
     for node_info in options.restore_nodes {
-        if node_info.id != node.self_id && node.filter.allows(node_info.addr) {
-            node.table.offer(node_info, 0);
+        if node_info.id != node.self_id
+            && node_info.addr.port() != 0
+            && node.filter.allows(node_info.addr)
+            && !node.restore_queue.contains(&node_info.addr)
+        {
+            node.restore_queue.push_back(node_info.addr);
         }
     }
     node.publish(&status);
@@ -2000,6 +2019,49 @@ mod tests {
             .await
             .expect("fallback router must be queried when resolution fails");
         assert!(is_find_node(&request));
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn restored_nodes_enter_the_table_only_after_answering_a_ping() {
+        let answering = FakeNode::bind(1).await;
+        let silent = FakeNode::bind(2).await;
+        let handle = spawn(permissive_options(0, solid_id(1)).with_persist(
+            None,
+            vec![
+                NodeInfo::new(solid_id(2), answering.addr()),
+                NodeInfo::new(solid_id(3), silent.addr()),
+            ],
+        ));
+        let status = handle.status();
+        let service = wait_for_status(status.clone(), |s| s.active, 5).await;
+        let destination = SocketAddr::from(([127, 0, 0, 1], service.port));
+        assert_eq!(status.borrow().node_count, 0);
+
+        let ping = answering.next_datagram().await;
+        let parsed = wire::decode(&ping).expect("restored node received a query");
+        assert!(matches!(
+            wire::get(&parsed, b"q"),
+            Some(Value::Bytes(method)) if method == b"ping"
+        ));
+        answering
+            .send_raw(
+                destination,
+                &reply_response(&tid_of(&ping), &[2u8; 20], vec![]),
+            )
+            .await;
+        wait_for_status(status.clone(), |s| s.node_count == 1, 5).await;
+
+        let silent_ping = silent.next_datagram().await;
+        assert!(
+            wire::decode(&silent_ping).is_some_and(|parsed| matches!(
+                wire::get(&parsed, b"q"),
+                Some(Value::Bytes(method)) if method == b"ping"
+            )),
+            "the silent restored node must also be ping-verified"
+        );
+        silent.expect_silence(Duration::from_millis(1500)).await;
+        assert_eq!(status.borrow().node_count, 1);
         handle.shutdown();
     }
 

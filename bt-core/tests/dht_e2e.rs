@@ -571,6 +571,7 @@ async fn dht_state_persists_and_a_restart_reuses_the_node_id_and_table() {
     integration_handle.persist_and_shutdown().await;
     let loaded = bt_core::dht::load_state(&path).unwrap();
     assert_eq!(loaded.node_id, bt_core::dht::NodeId::from_bytes(SERVICE_ID));
+    let pings_before_restart = router.pings();
 
     let restarted = bt_core::dht::spawn(
         DhtOptions::new(0, loaded.node_id)
@@ -578,10 +579,21 @@ async fn dht_state_persists_and_a_restart_reuses_the_node_id_and_table() {
             .with_address_filter_for_tests(AddressFilter::permissive_for_tests()),
     );
     let restarted_status = restarted.status();
+    assert_eq!(
+        restarted_status.borrow().node_count,
+        0,
+        "restored nodes start as unverified candidates"
+    );
+    wait_for(
+        || router.pings() > pings_before_restart,
+        5,
+        "the restored node is ping-verified before it counts",
+    )
+    .await;
     wait_for(
         || restarted_status.borrow().node_count >= 1,
         5,
-        "the restored table is populated",
+        "the restored table is populated after the node answers",
     )
     .await;
     restarted.shutdown();
