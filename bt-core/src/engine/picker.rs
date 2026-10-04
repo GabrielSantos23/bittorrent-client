@@ -41,8 +41,13 @@ pub struct PiecePicker {
     max_active: usize,
     availability: Vec<u32>,
     have: Bitfield,
+    /// Pieces overlapping at least one non-skipped file.
+    wanted: Bitfield,
+    /// Wanted pieces that overlap at least one High priority file.
+    high: Bitfield,
+    /// Wanted pieces that are not verified yet, including active ones.
+    wanted_missing: usize,
     active: HashMap<usize, ActivePiece>,
-    inactive_unverified: usize,
     endgame_threshold: usize,
     endgame_extras: HashMap<(usize, usize), Vec<SocketAddr>>,
 }
@@ -85,6 +90,10 @@ impl PiecePicker {
             let size = (total_length - start).min(piece_length as u64) as usize;
             total_blocks += size.div_ceil(BLOCK_SIZE);
         }
+        let mut wanted = Bitfield::new(piece_count);
+        for index in 0..piece_count {
+            let _ = wanted.set(index);
+        }
         PiecePicker {
             piece_count,
             piece_length,
@@ -93,8 +102,10 @@ impl PiecePicker {
             max_active,
             availability: vec![0; piece_count],
             have: Bitfield::new(piece_count),
+            high: Bitfield::new(piece_count),
+            wanted_missing: piece_count,
+            wanted,
             active: HashMap::new(),
-            inactive_unverified: piece_count,
             endgame_threshold: endgame_threshold(total_blocks),
             endgame_extras: HashMap::new(),
         }
@@ -105,22 +116,60 @@ impl PiecePicker {
     }
 
     pub fn is_complete(&self) -> bool {
-        self.have.count() == self.piece_count
+        self.wanted_missing == 0
     }
 
     pub fn set_have(&mut self, have: &Bitfield) {
-        let before = self.have.count();
         for index in 0..self.piece_count {
             if have.get(index) {
                 let _ = self.have.set(index);
             }
         }
-        let added = self.have.count() - before;
-        self.inactive_unverified = self.inactive_unverified.saturating_sub(added);
+        self.wanted_missing = (0..self.piece_count)
+            .filter(|&index| self.wanted.get(index) && !self.have.get(index))
+            .count();
+    }
+
+    /// Restricts the picker to the wanted piece classes. Returns the in-flight
+    /// blocks of pieces that are no longer wanted, as `(peer, index, begin)`
+    /// cancel targets, and the indices of the dropped pieces.
+    pub fn set_wanted(
+        &mut self,
+        wanted: &Bitfield,
+        high: &Bitfield,
+    ) -> (Vec<(SocketAddr, usize, usize)>, Vec<usize>) {
+        self.wanted = wanted.clone();
+        self.high = high.clone();
+        let dropped: Vec<usize> = self
+            .active
+            .keys()
+            .copied()
+            .filter(|index| !self.wanted.get(*index))
+            .collect();
+        let mut cancels = Vec::new();
+        for index in &dropped {
+            if let Some(piece) = self.active.remove(index) {
+                for (slot, state) in piece.blocks.iter().enumerate() {
+                    if let BlockState::Requested { peer, .. } = state {
+                        cancels.push((*peer, *index, slot * BLOCK_SIZE));
+                    }
+                }
+            }
+            self.endgame_extras.retain(|key, _| key.0 != *index);
+        }
+        self.wanted_missing = (0..self.piece_count)
+            .filter(|&index| self.wanted.get(index) && !self.have.get(index))
+            .count();
+        (cancels, dropped)
+    }
+
+    /// Wanted pieces that are neither active nor verified.
+    fn inactive_unverified(&self) -> usize {
+        self.wanted_missing.saturating_sub(self.active.len())
     }
 
     pub fn is_endgame(&self) -> bool {
-        if self.inactive_unverified != 0 || self.active.is_empty() {
+        if self.inactive_unverified() != 0 || self.active.is_empty() {
             return false;
         }
         let mut remaining = 0usize;
@@ -199,9 +248,10 @@ impl PiecePicker {
     }
 
     pub fn mark_have(&mut self, index: usize) {
-        if self.active.remove(&index).is_none() {
-            self.inactive_unverified = self.inactive_unverified.saturating_sub(1);
+        if !self.have.get(index) && self.wanted.get(index) {
+            self.wanted_missing = self.wanted_missing.saturating_sub(1);
         }
+        self.active.remove(&index);
         self.endgame_extras.retain(|key, _| key.0 != index);
         let _ = self.have.set(index);
     }
@@ -226,7 +276,6 @@ impl PiecePicker {
                 blocks: vec![BlockState::Missing; blocks],
             },
         );
-        self.inactive_unverified = self.inactive_unverified.saturating_sub(1);
         self.mark_requested(index, 0, peer);
         Some((index, 0, self.block_length(index, 0)))
     }
@@ -373,7 +422,8 @@ impl PiecePicker {
         if self.have.count() < self.random_first {
             let candidates: Vec<usize> = (0..self.piece_count)
                 .filter(|&index| {
-                    bitfield.get(index)
+                    self.wanted.get(index)
+                        && bitfield.get(index)
                         && !self.have.get(index)
                         && !self.active.contains_key(&index)
                 })
@@ -384,17 +434,25 @@ impl PiecePicker {
             let pick = rand::rng().random_range(0..candidates.len());
             return Some(candidates[pick]);
         }
-        let mut best: Option<(u32, usize)> = None;
+        // High priority pieces first, rarest first inside each class.
+        let mut best: Option<(u8, u32, usize)> = None;
         for index in 0..self.piece_count {
-            if !bitfield.get(index) || self.have.get(index) || self.active.contains_key(&index) {
+            if !self.wanted.get(index)
+                || !bitfield.get(index)
+                || self.have.get(index)
+                || self.active.contains_key(&index)
+            {
                 continue;
             }
+            let class = if self.high.get(index) { 0 } else { 1 };
+            let rank = (class, self.availability[index]);
             match best {
-                Some((best_availability, _)) if self.availability[index] >= best_availability => {}
-                _ => best = Some((self.availability[index], index)),
+                Some((best_class, best_availability, _))
+                    if rank >= (best_class, best_availability) => {}
+                _ => best = Some((class, self.availability[index], index)),
             }
         }
-        best.map(|(_, index)| index)
+        best.map(|(_, _, index)| index)
     }
 
     fn piece_size(&self, index: usize) -> usize {
@@ -690,5 +748,138 @@ mod tests {
             picker.next_endgame_block(peer_c, &full),
             Some((0, 0, BLOCK_SIZE))
         );
+    }
+
+    fn set_wanted(picker: &mut PiecePicker, wanted: &[usize], high: &[usize]) {
+        let mut wanted_bits = Bitfield::new(4);
+        for &index in wanted {
+            wanted_bits.set(index).unwrap();
+        }
+        let mut high_bits = Bitfield::new(4);
+        for &index in high {
+            high_bits.set(index).unwrap();
+        }
+        picker.set_wanted(&wanted_bits, &high_bits);
+    }
+
+    #[test]
+    fn requests_only_wanted_pieces() {
+        let mut picker = picker(0, 8);
+        let full = bitfield_of(&[0, 1, 2, 3]);
+        picker.add_peer(&full);
+        set_wanted(&mut picker, &[1, 2], &[]);
+        let peer = addr("1.1.1.1");
+        let mut picked = Vec::new();
+        while let Some((index, _, _)) = picker.next_block(peer, &full) {
+            picked.push(index);
+        }
+        assert!(
+            picked.iter().all(|index| *index == 1 || *index == 2),
+            "skipped pieces are never requested: {picked:?}"
+        );
+        assert_eq!(
+            picked.len(),
+            4,
+            "both wanted pieces are fully requested: {picked:?}"
+        );
+        assert!(!picker.is_complete());
+        picker.mark_have(1);
+        picker.mark_have(2);
+        assert!(
+            picker.is_complete(),
+            "completion only requires the wanted pieces"
+        );
+    }
+
+    #[test]
+    fn high_pieces_are_requested_before_normal_and_rarest_first_inside_a_class() {
+        let mut picker = PiecePicker::new(4, PIECE_LENGTH, 4 * PIECE_LENGTH as u64, 0, 8);
+        // Piece 0: High with two peers. Piece 1: High with one peer (rarest).
+        // Piece 2: Normal with one peer. Piece 3: unwanted.
+        let a = bitfield_of(&[0, 1, 3]);
+        let b = bitfield_of(&[0, 2, 3]);
+        picker.add_peer(&a);
+        picker.add_peer(&b);
+        let mut wanted = Bitfield::new(4);
+        wanted.set(0).unwrap();
+        wanted.set(1).unwrap();
+        wanted.set(2).unwrap();
+        let mut high = Bitfield::new(4);
+        high.set(0).unwrap();
+        high.set(1).unwrap();
+        picker.set_wanted(&wanted, &high);
+        let peer = addr("1.1.1.1");
+        assert_eq!(
+            picker.next_block(peer, &a),
+            Some((1, 0, BLOCK_SIZE)),
+            "rarest High piece first"
+        );
+        picker.mark_have(1);
+        assert_eq!(
+            picker.next_block(peer, &a),
+            Some((0, 0, BLOCK_SIZE)),
+            "then the remaining High piece"
+        );
+        picker.mark_have(0);
+        assert_eq!(
+            picker.next_block(addr("2.2.2.2"), &b),
+            Some((2, 0, BLOCK_SIZE)),
+            "Normal pieces only after the High class is exhausted"
+        );
+    }
+
+    #[test]
+    fn set_wanted_cancels_in_flight_blocks_of_unwanted_pieces() {
+        let mut picker = picker(0, 8);
+        let full = bitfield_of(&[0, 1, 2, 3]);
+        picker.add_peer(&full);
+        let peer = addr("1.1.1.1");
+        assert_eq!(picker.next_block(peer, &full), Some((0, 0, BLOCK_SIZE)));
+        assert_eq!(
+            picker.next_block(peer, &full),
+            Some((0, BLOCK_SIZE, BLOCK_SIZE))
+        );
+        let mut keep = Bitfield::new(4);
+        for index in [1usize, 2, 3] {
+            keep.set(index).unwrap();
+        }
+        let (cancels, dropped) = picker.set_wanted(&keep, &Bitfield::new(4));
+        assert_eq!(dropped, vec![0]);
+        assert_eq!(
+            cancels,
+            vec![(peer, 0, 0), (peer, 0, BLOCK_SIZE)],
+            "every in-flight block of the dropped piece is cancelled"
+        );
+        assert!(picker.next_block(peer, &full).is_some());
+    }
+
+    #[test]
+    fn random_first_only_picks_wanted_pieces() {
+        let mut picker = picker(4, 8);
+        let full = bitfield_of(&[0, 1, 2, 3]);
+        picker.add_peer(&full);
+        set_wanted(&mut picker, &[1, 3], &[]);
+        let peer = addr("1.1.1.1");
+        let first = picker.next_block(peer, &full).unwrap();
+        assert!(first.0 == 1 || first.0 == 3);
+    }
+
+    #[test]
+    fn newly_wanted_pieces_start_without_touching_verified_state() {
+        let mut picker = picker(0, 8);
+        let full = bitfield_of(&[0, 1, 2, 3]);
+        picker.add_peer(&full);
+        set_wanted(&mut picker, &[0, 1], &[]);
+        picker.mark_have(0);
+        assert!(!picker.is_complete());
+        // The user re-enables pieces 2 and 3; verified piece 0 stays have.
+        set_wanted(&mut picker, &[0, 1, 2, 3], &[]);
+        assert!(picker.have().get(0));
+        assert!(!picker.is_complete());
+        picker.mark_have(1);
+        picker.mark_have(2);
+        picker.mark_have(3);
+        assert!(picker.is_complete());
+        assert_eq!(picker.have().count(), 4);
     }
 }

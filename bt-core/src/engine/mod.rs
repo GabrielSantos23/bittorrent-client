@@ -66,6 +66,20 @@ const TARGET_RTT: f64 = 1.5;
 const RATE_WINDOW: Duration = Duration::from_secs(6);
 const INITIAL_PIPELINE_DEPTH: usize = 8;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[ts(export)]
+pub enum FilePriority {
+    Skip,
+    Normal,
+    High,
+}
+
+impl FilePriority {
+    pub fn is_skip(self) -> bool {
+        matches!(self, FilePriority::Skip)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[ts(export)]
 pub enum State {
@@ -127,6 +141,10 @@ pub struct Stats {
     pub name: String,
     pub total_length: u64,
     pub verified_bytes: u64,
+    /// Sum of the lengths of files that are not skipped.
+    pub wanted_bytes: u64,
+    /// Bytes of verified pieces that fall inside non-skipped files.
+    pub verified_wanted_bytes: u64,
     pub session_downloaded: u64,
     pub session_uploaded: u64,
     pub upload_rate: f64,
@@ -139,6 +157,7 @@ pub struct Stats {
     pub outgoing_peers: usize,
     pub peers: Vec<PeerStats>,
     pub trackers: Vec<TrackerStatus>,
+    pub files: Vec<FileStats>,
     pub metadata_progress: Option<MetadataProgress>,
     pub diag: MetadataDiag,
     pub error: Option<String>,
@@ -146,6 +165,19 @@ pub struct Stats {
     pub resumed_from_saved_state: bool,
     pub startup_pieces_hashed: usize,
     pub resume_fallback: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct FileStats {
+    pub path: String,
+    #[ts(type = "number")]
+    pub length: u64,
+    pub priority: FilePriority,
+    /// Bytes of verified pieces that fall inside this file. Boundary pieces
+    /// count for every file they cover.
+    #[ts(type = "number")]
+    pub verified_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
@@ -168,12 +200,13 @@ pub struct MetadataDiag {
     pub peer_close_reasons: BTreeMap<String, u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum EngineCommand {
     Start,
     Pause,
     Resume,
     Stop,
+    SetFilePriorities(Vec<(usize, FilePriority)>),
 }
 
 #[derive(Clone)]
@@ -196,6 +229,11 @@ pub struct TorrentOptions {
     pub peer_id: [u8; 20],
     pub dht: Option<DhtIntegration>,
     pub resume_dir: Option<PathBuf>,
+    /// Sparse `(file index, priority)` pairs; unlisted files are Normal.
+    pub file_priorities: Vec<(usize, FilePriority)>,
+    /// Magnets only: pause as soon as the metadata arrives so the file list
+    /// can be shown and priorities chosen before any data is downloaded.
+    pub pause_after_metadata: bool,
 }
 
 impl Default for TorrentOptions {
@@ -212,6 +250,8 @@ impl Default for TorrentOptions {
             peer_id: *peer_id::session(),
             dht: None,
             resume_dir: None,
+            file_priorities: Vec::new(),
+            pause_after_metadata: false,
         }
     }
 }
@@ -230,6 +270,16 @@ enum StartupVerification {
 impl Torrent {
     pub fn subscribe_metadata(&self) -> watch::Receiver<Option<Arc<Vec<u8>>>> {
         self.metadata.clone()
+    }
+
+    pub async fn set_file_priorities(
+        &self,
+        priorities: Vec<(usize, FilePriority)>,
+    ) -> Result<(), EngineError> {
+        self.commands
+            .send(EngineCommand::SetFilePriorities(priorities))
+            .await
+            .map_err(|_| EngineError::Closed)
     }
 }
 
@@ -272,6 +322,8 @@ impl Torrent {
             name,
             total_length: 0,
             verified_bytes: 0,
+            wanted_bytes: 0,
+            verified_wanted_bytes: 0,
             session_downloaded: 0,
             session_uploaded: 0,
             upload_rate: 0.0,
@@ -284,6 +336,7 @@ impl Torrent {
             outgoing_peers: 0,
             peers: Vec::new(),
             trackers: Vec::new(),
+            files: Vec::new(),
             metadata_progress: Some(MetadataProgress {
                 received: 0,
                 total: None,
@@ -303,7 +356,7 @@ impl Torrent {
             resume_fallback: None,
         });
         options.registry.register(link.info_hash, incoming_tx);
-        let mut bootstrap_peers = Vec::new();
+        let mut bootstrap_peers = options.bootstrap_peers.clone();
         for peer in &link.peers {
             if let Ok(mut addrs) = tokio::net::lookup_host((peer.host.as_str(), peer.port)).await {
                 bootstrap_peers.extend(&mut addrs);
@@ -340,9 +393,11 @@ impl Torrent {
     ) -> Result<Torrent, EngineError> {
         let meta = Arc::new(meta);
         let output_dir_clone = output_dir.clone();
+        let priorities = padded_priorities(&options.file_priorities, file_count_of(&meta));
+        let priorities_for_storage = priorities.clone();
         let storage = spawn_blocking({
             let meta = meta.clone();
-            move || Storage::create(&meta, &output_dir_clone)
+            move || Storage::create(&meta, &output_dir_clone, &priorities_for_storage)
         })
         .await
         .map_err(|_| EngineError::Task)??;
@@ -408,6 +463,8 @@ impl Torrent {
             name,
             total_length,
             verified_bytes: initial_verified,
+            wanted_bytes: 0,
+            verified_wanted_bytes: 0,
             session_downloaded: 0,
             session_uploaded: 0,
             upload_rate: 0.0,
@@ -420,6 +477,7 @@ impl Torrent {
             outgoing_peers: 0,
             peers: Vec::new(),
             trackers: Vec::new(),
+            files: Vec::new(),
             metadata_progress: None,
             diag: MetadataDiag::default(),
             error: None,
@@ -517,6 +575,7 @@ struct PendingMetadata {
     round_robin: usize,
     contributors: HashSet<SocketAddr>,
     failed_assemblies: u32,
+    file_priorities: Vec<(usize, FilePriority)>,
 }
 
 impl PendingMetadata {
@@ -570,6 +629,9 @@ struct Engine {
     session_downloaded: u64,
     session_uploaded: u64,
     verified_bytes: u64,
+    file_priorities: Vec<FilePriority>,
+    file_verified: Vec<u64>,
+    pause_after_metadata: bool,
     error: Option<String>,
     last_rate: (TokioInstant, u64, u64),
     trackers: Vec<TrackerRuntime>,
@@ -740,6 +802,73 @@ fn metadata_info_and_size(raw: &[u8]) -> Result<(Vec<u8>, u64), crate::error::Me
     Ok((bytes, size))
 }
 
+pub fn file_count_of(meta: &MetaInfo) -> usize {
+    match &meta.info.content {
+        crate::metainfo::Content::Single { .. } => 1,
+        crate::metainfo::Content::Multi { files } => files.len(),
+    }
+}
+
+/// Expands sparse `(index, priority)` pairs into a per-file vector, ignoring
+/// out-of-range indices. Unlisted files are Normal.
+pub fn padded_priorities(pairs: &[(usize, FilePriority)], file_count: usize) -> Vec<FilePriority> {
+    let mut priorities = vec![FilePriority::Normal; file_count];
+    for (index, priority) in pairs {
+        if *index < file_count {
+            priorities[*index] = *priority;
+        }
+    }
+    priorities
+}
+
+/// A piece is wanted when it overlaps at least one non-skipped file; it is in
+/// the High class when it overlaps at least one High file.
+pub fn piece_wanted_map(
+    meta: &MetaInfo,
+    storage: &Storage,
+    priorities: &[FilePriority],
+) -> (Bitfield, Bitfield) {
+    let piece_count = meta.info.pieces.len();
+    let mut wanted = Bitfield::new(piece_count);
+    let mut high = Bitfield::new(piece_count);
+    for index in 0..piece_count {
+        for (file, _) in storage.piece_file_spans(index) {
+            match priorities
+                .get(file)
+                .copied()
+                .unwrap_or(FilePriority::Normal)
+            {
+                FilePriority::Skip => {}
+                FilePriority::Normal => {
+                    let _ = wanted.set(index);
+                }
+                FilePriority::High => {
+                    let _ = wanted.set(index);
+                    let _ = high.set(index);
+                }
+            }
+        }
+    }
+    (wanted, high)
+}
+
+/// Per-file verified bytes: every verified piece contributes the bytes it
+/// covers in each file, so boundary pieces count for all files they span.
+pub fn file_verified_of(storage: &Storage, have: &Bitfield) -> Vec<u64> {
+    let mut verified = vec![0u64; storage.file_lengths().len()];
+    for index in 0..have.piece_count() {
+        if !have.get(index) {
+            continue;
+        }
+        for (file, bytes) in storage.piece_file_spans(index) {
+            if let Some(slot) = verified.get_mut(file) {
+                *slot += bytes as u64;
+            }
+        }
+    }
+    verified
+}
+
 impl Engine {
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
@@ -781,6 +910,8 @@ impl Engine {
             peer_id: our_peer_id,
             dht,
             resume_dir,
+            file_priorities,
+            pause_after_metadata,
             ..
         } = options;
         let (dht_results_tx, dht_results) = mpsc::channel(16);
@@ -794,6 +925,7 @@ impl Engine {
             round_robin: 0,
             contributors: HashSet::new(),
             failed_assemblies: 0,
+            file_priorities,
         };
         Engine {
             picker: None,
@@ -836,6 +968,9 @@ impl Engine {
             session_downloaded: 0,
             session_uploaded: 0,
             verified_bytes: 0,
+            file_priorities: Vec::new(),
+            file_verified: Vec::new(),
+            pause_after_metadata,
             error: None,
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
@@ -875,6 +1010,16 @@ impl Engine {
     ) -> Engine {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
+        let file_priorities = padded_priorities(&options.file_priorities, file_count_of(&meta));
+        let (wanted, high) = piece_wanted_map(&meta, &storage, &file_priorities);
+        let mut picker = PiecePicker::new(
+            piece_count,
+            meta.info.piece_length,
+            total_length,
+            RANDOM_FIRST,
+            MAX_ACTIVE_PIECES,
+        );
+        picker.set_wanted(&wanted, &high);
         let mut backlog = PeerBacklog::default();
         for addr in options.bootstrap_peers {
             backlog.push(addr);
@@ -892,6 +1037,7 @@ impl Engine {
             peer_id: our_peer_id,
             dht,
             resume_dir,
+            pause_after_metadata,
             ..
         } = options;
         let (dht_results_tx, dht_results) = mpsc::channel(16);
@@ -901,13 +1047,7 @@ impl Engine {
         };
         Engine {
             spare_picker: PiecePicker::new(0, 16384, 0, 0, 1),
-            picker: Some(PiecePicker::new(
-                piece_count,
-                meta.info.piece_length,
-                total_length,
-                RANDOM_FIRST,
-                MAX_ACTIVE_PIECES,
-            )),
+            picker: Some(picker),
             assembler: Some(PieceAssembler::new(meta.info.piece_length, total_length)),
             meta: Some(meta),
             pending,
@@ -946,6 +1086,9 @@ impl Engine {
             session_downloaded: 0,
             session_uploaded: 0,
             verified_bytes: 0,
+            file_priorities,
+            file_verified: Vec::new(),
+            pause_after_metadata,
             error: None,
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
@@ -1083,6 +1226,7 @@ impl Engine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             *have = startup.trusted.clone();
         }
+        self.file_verified = file_verified_of(&storage, &startup.trusted);
         self.picker().set_have(&startup.trusted);
         self.error = None;
         if startup.overlaps.is_empty() {
@@ -1196,7 +1340,106 @@ impl Engine {
             EngineCommand::Pause => self.pause().await,
             EngineCommand::Resume => self.resume(),
             EngineCommand::Stop => self.stop().await,
+            EngineCommand::SetFilePriorities(priorities) => {
+                self.apply_file_priorities(priorities).await;
+            }
         }
+    }
+
+    /// Applies a priority change at runtime: pieces that are no longer wanted
+    /// have their in-flight blocks cancelled and assembler buffers dropped,
+    /// newly wanted pieces are requested immediately without a re-check, and
+    /// files leaving the skipped set are created so resume fingerprints exist.
+    async fn apply_file_priorities(&mut self, pairs: Vec<(usize, FilePriority)>) {
+        let Some(meta) = self.meta.clone() else {
+            // Metadata has not arrived yet; remember the request for the
+            // upgrade to the real torrent.
+            if let Some(pending) = self.pending.as_mut() {
+                for (index, priority) in pairs {
+                    pending
+                        .file_priorities
+                        .retain(|(existing, _)| *existing != index);
+                    pending.file_priorities.push((index, priority));
+                }
+            }
+            return;
+        };
+        let file_count = file_count_of(&meta);
+        let mut priorities = self.file_priorities.clone();
+        if priorities.len() != file_count {
+            priorities = padded_priorities(&pairs, file_count);
+        }
+        let mut changed_to_wanted = Vec::new();
+        for (index, priority) in &pairs {
+            if *index >= file_count {
+                continue;
+            }
+            if priorities[*index].is_skip() && !priority.is_skip() {
+                changed_to_wanted.push(*index);
+            }
+            priorities[*index] = *priority;
+        }
+        self.file_priorities = priorities;
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let skipped: Vec<bool> = self.file_priorities.iter().map(|p| p.is_skip()).collect();
+        storage.set_skipped(&skipped);
+        if !changed_to_wanted.is_empty() {
+            let _ = spawn_blocking({
+                let storage = storage.clone();
+                let indices = changed_to_wanted.clone();
+                move || storage.ensure_files_exist(&indices)
+            })
+            .await;
+        }
+        let (wanted, high) = piece_wanted_map(&meta, &storage, &self.file_priorities);
+        let (cancels, dropped) = self.picker().set_wanted(&wanted, &high);
+        if let Some(assembler) = self.assembler.as_mut() {
+            assembler.drop_pieces(&dropped);
+        }
+        for (peer, index, begin) in cancels {
+            let length = BLOCK_SIZE.min(self.piece_size(index).saturating_sub(begin)) as u32;
+            if let Some(handle) = self.peers.get_mut(&peer) {
+                let _ = handle.commands.try_send(PeerCommand::Cancel {
+                    index: index as u32,
+                    begin: begin as u32,
+                    length,
+                });
+                handle.in_flight = handle.in_flight.saturating_sub(1);
+            }
+        }
+        self.resume_dirty = true;
+        let was_running = matches!(
+            self.state,
+            State::Downloading | State::Completed | State::Seeding
+        );
+        if was_running {
+            if self.picker().is_complete() {
+                self.state = self.completed_state();
+                if self
+                    .have_map
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .count()
+                    == meta.info.pieces.len()
+                {
+                    self.queue_event(Event::Completed);
+                } else {
+                    self.queue_event(Event::Started);
+                }
+                self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
+                self.disconnect_all().await;
+                self.write_resume_snapshot().await;
+            } else if matches!(self.state, State::Completed | State::Seeding) {
+                // Newly wanted pieces exist; go back to downloading.
+                self.state = State::Downloading;
+                self.queue_event(Event::Started);
+                self.wake_trackers(TokioInstant::now());
+            }
+        }
+        self.refill_all().await;
+        self.publish();
     }
 
     async fn run_check(&mut self) {
@@ -1234,6 +1477,11 @@ impl Engine {
                     }
                 }
                 self.verified_bytes = verified;
+                self.file_verified = self
+                    .storage
+                    .as_ref()
+                    .map(|storage| file_verified_of(storage, &have))
+                    .unwrap_or_default();
                 self.error = None;
                 self.finish_initial_verification().await;
             }
@@ -1247,9 +1495,23 @@ impl Engine {
 
     async fn finish_initial_verification(&mut self) {
         let complete = self.picker().is_complete();
+        let fully_verified = self
+            .have_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .count()
+            == self
+                .meta
+                .as_ref()
+                .map(|meta| meta.info.pieces.len())
+                .unwrap_or(0);
         if complete {
             self.state = self.completed_state();
-            self.queue_event(Event::Completed);
+            if fully_verified {
+                self.queue_event(Event::Completed);
+            } else {
+                self.queue_event(Event::Started);
+            }
             self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
         } else {
             self.state = State::Downloading;
@@ -1289,11 +1551,10 @@ impl Engine {
         let path = self::resume::snapshot_path(&dir, &info_hash_hex);
         let outcome = spawn_blocking(move || {
             storage.sync_dirty()?;
-            let fingerprints = self::resume::current_fingerprints(&storage.file_paths());
-            let files: Option<Vec<_>> = fingerprints.into_iter().collect();
-            let Some(files) = files else {
-                return Ok(());
-            };
+            // Missing files are recorded as `None`: startup planning ignores
+            // them for skipped files and forces re-verification for files
+            // that should exist.
+            let files = self::resume::current_fingerprints(&storage.file_paths());
             let snapshot = self::resume::ResumeSnapshot {
                 version: self::resume::RESUME_FORMAT_VERSION,
                 info_hash: info_hash_hex,
@@ -1319,7 +1580,7 @@ impl Engine {
 
     async fn pause(&mut self) {
         match self.state {
-            State::Checking => self.pending_pause = true,
+            State::Checking | State::FetchingMetadata => self.pending_pause = true,
             State::Downloading | State::Completed | State::Seeding => {
                 self.disconnect_all().await;
                 self.backoff.clear();
@@ -1805,8 +2066,18 @@ impl Engine {
         let meta = Arc::new(meta);
         let output = output_dir.clone();
         let storage_meta = meta.clone();
+        let file_count = file_count_of(&meta);
+        let file_priorities = {
+            let pairs = self
+                .pending
+                .as_ref()
+                .map(|pending| pending.file_priorities.clone())
+                .unwrap_or_default();
+            padded_priorities(&pairs, file_count_of(&meta))
+        };
+        let priorities_for_storage = file_priorities.clone();
         let storage = match tokio::task::spawn_blocking(move || {
-            Storage::create(&storage_meta, &output)
+            Storage::create(&storage_meta, &output, &priorities_for_storage)
         })
         .await
         {
@@ -1821,20 +2092,32 @@ impl Engine {
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         self.total_length = total_length;
-        self.picker = Some(PiecePicker::new(
+        let (wanted, high) = piece_wanted_map(&meta, &storage, &file_priorities);
+        let mut picker = PiecePicker::new(
             piece_count,
             meta.info.piece_length,
             total_length,
             RANDOM_FIRST,
             MAX_ACTIVE_PIECES,
-        ));
+        );
+        picker.set_wanted(&wanted, &high);
+        self.picker = Some(picker);
         self.assembler = Some(PieceAssembler::new(meta.info.piece_length, total_length));
         self.meta = Some(meta);
         self.storage = Some(storage);
+        self.file_priorities = file_priorities;
+        self.file_verified = vec![0; file_count];
         self.raw_metainfo = Arc::new(std::sync::Mutex::new(raw.clone()));
         self.pending = None;
         let _ = self.metadata_tx.send(Some(Arc::new(raw)));
         self.initial_check().await;
+        if self.pause_after_metadata && !matches!(self.state, State::Paused) {
+            // Stop before any data is downloaded so the UI can show the file
+            // list and let the user choose priorities first.
+            self.state = State::Paused;
+            self.disconnect_all().await;
+            self.publish();
+        }
         self.refill_all().await;
         let targets: Vec<(u8, mpsc::Sender<PeerCommand>)> = self
             .peers
@@ -2366,6 +2649,7 @@ impl Engine {
         let Some(meta) = &self.meta else {
             return;
         };
+        let piece_count = meta.info.pieces.len();
         let Some(storage) = self.storage.clone() else {
             return;
         };
@@ -2390,10 +2674,31 @@ impl Engine {
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .set(index);
                 self.verified_bytes += self.piece_size(index) as u64;
+                for (file, bytes) in self
+                    .storage
+                    .as_ref()
+                    .map(|storage| storage.piece_file_spans(index))
+                    .unwrap_or_default()
+                {
+                    if let Some(slot) = self.file_verified.get_mut(file) {
+                        *slot += bytes as u64;
+                    }
+                }
                 self.resume_dirty = true;
                 if self.picker().is_complete() {
                     self.state = self.completed_state();
-                    self.queue_event(Event::Completed);
+                    // The completed event is only honest once the entire
+                    // torrent is verified: we cannot serve the skipped parts,
+                    // so announcing completion early would misrepresent us.
+                    if self
+                        .have_map
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .count()
+                        == piece_count
+                    {
+                        self.queue_event(Event::Completed);
+                    }
                     self.wake_trackers(TokioInstant::now() + Duration::from_secs(1));
                     self.disconnect_all().await;
                     self.write_resume_snapshot().await;
@@ -2603,6 +2908,39 @@ impl Engine {
         self.publish();
     }
 
+    fn file_reports(&self) -> Vec<FileStats> {
+        let Some(meta) = self.meta.as_ref() else {
+            return Vec::new();
+        };
+        let entries: Vec<(String, u64)> = match &meta.info.content {
+            crate::metainfo::Content::Single { length } => vec![(meta.info.name.clone(), *length)],
+            crate::metainfo::Content::Multi { files } => files
+                .iter()
+                .map(|file| {
+                    let mut path = PathBuf::new();
+                    for segment in &file.path {
+                        path.push(segment);
+                    }
+                    (path.to_string_lossy().into_owned(), file.length)
+                })
+                .collect(),
+        };
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, (path, length))| FileStats {
+                path,
+                length,
+                priority: self
+                    .file_priorities
+                    .get(index)
+                    .copied()
+                    .unwrap_or(FilePriority::Normal),
+                verified_bytes: self.file_verified.get(index).copied().unwrap_or(0),
+            })
+            .collect()
+    }
+
     fn current_stats(&self) -> Stats {
         let now = TokioInstant::now();
         let dt = (now - self.last_rate.0).as_secs_f64().max(0.001);
@@ -2623,6 +2961,17 @@ impl Engine {
             .iter()
             .filter(|peer| peer.direction == PeerDirection::Incoming)
             .count();
+        let files = self.file_reports();
+        let wanted_bytes: u64 = files
+            .iter()
+            .filter(|file| !file.priority.is_skip())
+            .map(|file| file.length)
+            .sum();
+        let verified_wanted_bytes: u64 = files
+            .iter()
+            .filter(|file| !file.priority.is_skip())
+            .map(|file| file.verified_bytes)
+            .sum();
         Stats {
             state: self.state,
             name: self.display_name(),
@@ -2632,6 +2981,8 @@ impl Engine {
                 .map(|storage| storage.total_length())
                 .unwrap_or(self.total_length),
             verified_bytes: self.verified_bytes,
+            wanted_bytes,
+            verified_wanted_bytes,
             session_downloaded: self.session_downloaded,
             session_uploaded: self.session_uploaded,
             upload_rate: (self.session_uploaded - self.last_rate.2) as f64 / dt,
@@ -2667,6 +3018,7 @@ impl Engine {
                     last_error: tracker.last_error.clone(),
                 })
                 .collect(),
+            files,
             metadata_progress: self
                 .pending
                 .as_ref()
@@ -2805,6 +3157,73 @@ mod tests {
 
     fn addr(host: &str) -> SocketAddr {
         format!("{host}:1").parse().unwrap()
+    }
+
+    fn boundary_torrent_bytes() -> Vec<u8> {
+        // dir/a.txt (5 B), dir/sub/b.bin (3 B), dir/c.txt (4 B); piece length 4.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"d4:infod5:filesl");
+        raw.extend_from_slice(b"d6:lengthi5e4:pathl5:a.txtee");
+        raw.extend_from_slice(b"d6:lengthi3e4:pathl3:sub5:b.binee");
+        raw.extend_from_slice(b"d6:lengthi4e4:pathl5:c.txtee");
+        raw.extend_from_slice(b"e4:name3:dir12:piece lengthi4e6:pieces");
+        let hashes: Vec<[u8; 20]> = vec![[1u8; 20], [2u8; 20], [3u8; 20]];
+        raw.extend_from_slice((hashes.len() * 20).to_string().as_bytes());
+        raw.push(b':');
+        for hash in &hashes {
+            raw.extend_from_slice(hash);
+        }
+        raw.extend_from_slice(b"ee");
+        raw
+    }
+
+    fn prios_temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bt-core-prios-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn per_file_verified_bytes_count_boundary_pieces_for_every_file() {
+        let raw = boundary_torrent_bytes();
+        let meta = MetaInfo::from_bytes(&raw).unwrap();
+        let dir = prios_temp_dir("verified");
+        let priorities = vec![FilePriority::Normal; 3];
+        let storage = Storage::create(&meta, &dir, &priorities).unwrap();
+        let mut have = Bitfield::new(3);
+        // Piece 1 (bytes 4..8) covers a.txt's last byte and all of b.bin.
+        have.set(1).unwrap();
+        assert_eq!(file_verified_of(&storage, &have), vec![1, 3, 0]);
+        let mut have = Bitfield::new(3);
+        have.set(0).unwrap();
+        have.set(2).unwrap();
+        // Piece 0 is a.txt only; piece 2 is c.txt only.
+        assert_eq!(file_verified_of(&storage, &have), vec![4, 0, 4]);
+        let mut have = Bitfield::new(3);
+        have.set(0).unwrap();
+        have.set(1).unwrap();
+        have.set(2).unwrap();
+        assert_eq!(file_verified_of(&storage, &have), vec![5, 3, 4]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wanted_map_marks_pieces_overlapping_non_skipped_files() {
+        let raw = boundary_torrent_bytes();
+        let meta = MetaInfo::from_bytes(&raw).unwrap();
+        let dir = prios_temp_dir("wanted");
+        let all_normal = vec![FilePriority::Normal; 3];
+        let storage = Storage::create(&meta, &dir, &all_normal).unwrap();
+        // a.txt skipped, b.bin High, c.txt Normal:
+        // piece 0 (a only) unwanted; piece 1 (a+b) wanted+high; piece 2 (c) wanted.
+        let priorities = vec![FilePriority::Skip, FilePriority::High, FilePriority::Normal];
+        let (wanted, high) = piece_wanted_map(&meta, &storage, &priorities);
+        assert!(!wanted.get(0));
+        assert!(wanted.get(1));
+        assert!(wanted.get(2));
+        assert!(high.get(1));
+        assert!(!high.get(2));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn candidate(host: &str, interested: bool, down: u64, up: u64) -> ChokeCandidate {

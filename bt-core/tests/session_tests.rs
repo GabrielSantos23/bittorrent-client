@@ -8,7 +8,7 @@ use bt_core::error::SessionError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use bt_core::peer::handshake::{self, Handshake};
-use bt_core::session::{Session, SessionOptions};
+use bt_core::session::{AddOptions, MagnetOptions, Session, SessionOptions};
 use common::{temp_dir, test_data, torrent_bytes, FakeDial, SeederKind};
 
 fn addr(port: u16) -> std::net::SocketAddr {
@@ -34,6 +34,17 @@ async fn wait_for(
     }
 }
 
+fn cleanup_dir(dir: &std::path::Path) {
+    // On Windows the engine's background tasks can hold file handles open for
+    // a short moment after shutdown.
+    for _ in 0..20 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn add_rejects_duplicates_and_removes_files() {
     let data = test_data();
@@ -56,10 +67,15 @@ async fn add_rejects_duplicates_and_removes_files() {
         .await
         .unwrap();
 
-    let id = session.add_torrent(&bytes, out.clone()).await.unwrap();
+    let id = session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     assert_eq!(id, meta_id);
     assert!(matches!(
-        session.add_torrent(&bytes, out.clone()).await,
+        session
+            .add_torrent(&bytes, out.clone(), AddOptions::default())
+            .await,
         Err(SessionError::Duplicate(_))
     ));
 
@@ -77,7 +93,10 @@ async fn add_rejects_duplicates_and_removes_files() {
     assert!(out.join("e2e.bin").exists());
     assert!(unrelated.exists());
 
-    let id = session.add_torrent(&bytes, out.clone()).await.unwrap();
+    let id = session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     session.remove(&id, true).await.unwrap();
     assert!(!out.join("e2e.bin").exists());
     assert!(unrelated.exists());
@@ -110,7 +129,10 @@ async fn pause_resume_completes() {
             .await
             .unwrap();
 
-    let id = session.add_torrent(&bytes, out.clone()).await.unwrap();
+    let id = session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     let summaries = session.subscribe();
     let added_id = id.clone();
     wait_for(
@@ -169,7 +191,10 @@ async fn persists_and_restores() {
     let session = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![])
         .await
         .unwrap();
-    let id = session.add_torrent(&bytes, out.clone()).await.unwrap();
+    let id = session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !data_dir.join("session.json").exists()
         || !data_dir.join(format!("{id}.torrent")).exists()
@@ -210,7 +235,10 @@ async fn session_restore_uses_the_resume_snapshot() {
     let first = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![])
         .await
         .unwrap();
-    first.add_torrent(&bytes, out.clone()).await.unwrap();
+    first
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     let first_id = id.clone();
     wait_for(
         &first.subscribe(),
@@ -254,8 +282,8 @@ async fn session_restore_uses_the_resume_snapshot() {
     )
     .await;
     second.shutdown().await.unwrap();
-    std::fs::remove_dir_all(data_dir).unwrap();
-    std::fs::remove_dir_all(out).unwrap();
+    cleanup_dir(&data_dir);
+    cleanup_dir(&out);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -278,7 +306,10 @@ async fn removing_a_torrent_deletes_its_resume_file() {
     let session = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![])
         .await
         .unwrap();
-    session.add_torrent(&bytes, out.clone()).await.unwrap();
+    session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     let resume_path = data_dir.join(format!("{id}.resume"));
     let expected = resume_path.clone();
     wait_for(&session.subscribe(), move |_| expected.exists(), 30).await;
@@ -288,8 +319,8 @@ async fn removing_a_torrent_deletes_its_resume_file() {
         "removing the torrent must delete the resume file"
     );
     session.shutdown().await.unwrap();
-    std::fs::remove_dir_all(data_dir).unwrap();
-    std::fs::remove_dir_all(out).unwrap();
+    cleanup_dir(&data_dir);
+    cleanup_dir(&out);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -376,7 +407,10 @@ async fn failed_rebind_keeps_original_listener_working() {
     let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
     let out = temp_dir("rebind-out");
     std::fs::create_dir_all(&out).unwrap();
-    session.add_torrent(&bytes, out.clone()).await.unwrap();
+    session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
 
     let blocker = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
     let taken_port = blocker.local_addr().unwrap().port();
@@ -440,7 +474,10 @@ async fn pending_magnet_persists_and_restores() {
         .await
         .unwrap();
     let uri = format!("magnet:?xt=urn:btih:{info_hash_hex}&dn=e2e.bin");
-    let id = session.add_magnet(&uri, out.clone()).await.unwrap();
+    let id = session
+        .add_magnet(&uri, out.clone(), MagnetOptions::default())
+        .await
+        .unwrap();
     assert_eq!(id, info_hash_hex);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -491,18 +528,28 @@ async fn duplicate_magnet_is_rejected() {
     ));
     let session = Session::spawn_with_dial(None, dial, vec![]).await.unwrap();
 
-    let id = session.add_magnet(&uri, out.clone()).await.unwrap();
+    let id = session
+        .add_magnet(&uri, out.clone(), MagnetOptions::default())
+        .await
+        .unwrap();
     assert_eq!(id, info_hash_hex);
     assert!(matches!(
-        session.add_magnet(&uri, out.clone()).await,
+        session
+            .add_magnet(&uri, out.clone(), MagnetOptions::default())
+            .await,
         Err(SessionError::Duplicate(_))
     ));
 
     session.remove(&id, false).await.unwrap();
-    session.add_torrent(&bytes, out.clone()).await.unwrap();
+    session
+        .add_torrent(&bytes, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
     assert!(
         matches!(
-            session.add_magnet(&uri, out.clone()).await,
+            session
+                .add_magnet(&uri, out.clone(), MagnetOptions::default())
+                .await,
             Err(SessionError::Duplicate(_))
         ),
         "a magnet must be rejected when a torrent with the same info hash exists"
@@ -640,7 +687,7 @@ async fn corrupt_dht_state_is_reported_and_the_session_starts_fresh() {
         session.restore_errors()
     );
     session.shutdown().await.unwrap();
-    std::fs::remove_dir_all(data_dir).unwrap();
+    cleanup_dir(&data_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -666,5 +713,5 @@ async fn valid_dht_state_restores_as_unverified_candidates_through_the_productio
     );
     assert!(session.restore_errors().is_empty());
     session.shutdown().await.unwrap();
-    std::fs::remove_dir_all(data_dir).unwrap();
+    cleanup_dir(&data_dir);
 }

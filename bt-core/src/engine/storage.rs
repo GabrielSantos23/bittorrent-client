@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use sha1::{Digest, Sha1};
 
+use crate::engine::FilePriority;
 use crate::error::StorageError;
 use crate::metainfo::{Content, MetaInfo};
 use crate::peer::Bitfield;
@@ -14,7 +15,8 @@ pub struct FileSlot {
     pub offset: u64,
     pub length: u64,
     path: PathBuf,
-    file: Mutex<File>,
+    file: Mutex<Option<File>>,
+    skip: AtomicBool,
     dirty: AtomicBool,
 }
 
@@ -22,10 +24,15 @@ pub struct Storage {
     slots: Vec<FileSlot>,
     piece_length: u32,
     total_length: u64,
+    priorities: Vec<FilePriority>,
 }
 
 impl Storage {
-    pub fn create(meta: &MetaInfo, output_dir: &Path) -> Result<Storage, StorageError> {
+    pub fn create(
+        meta: &MetaInfo,
+        output_dir: &Path,
+        priorities: &[FilePriority],
+    ) -> Result<Storage, StorageError> {
         std::fs::create_dir_all(output_dir)?;
         let entries: Vec<(Vec<String>, u64)> = match &meta.info.content {
             Content::Single { length } => vec![(vec![meta.info.name.clone()], *length)],
@@ -40,37 +47,58 @@ impl Storage {
         };
         let mut slots = Vec::new();
         let mut offset = 0u64;
-        for (segments, length) in entries {
+        for (index, (segments, length)) in entries.iter().enumerate() {
+            let skip = priorities
+                .get(index)
+                .copied()
+                .unwrap_or(FilePriority::Normal)
+                .is_skip();
             let mut full = output_dir.to_path_buf();
-            for segment in &segments {
+            for segment in segments {
                 full.push(segment);
             }
-            if let Some(parent) = full.parent() {
-                std::fs::create_dir_all(parent)?;
+            if skip {
+                // Skipped files that no boundary piece touches are never
+                // created or preallocated; the file appears on demand the
+                // first time a boundary piece is written.
+                slots.push(FileSlot {
+                    offset,
+                    length: *length,
+                    path: full,
+                    file: Mutex::new(None),
+                    skip: AtomicBool::new(true),
+                    dirty: AtomicBool::new(false),
+                });
+            } else {
+                if let Some(parent) = full.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let existed = full.exists();
+                let file = OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&full)?;
+                if !existed && *length > 0 {
+                    file.set_len(*length)?;
+                }
+                slots.push(FileSlot {
+                    offset,
+                    length: *length,
+                    path: full,
+                    file: Mutex::new(Some(file)),
+                    skip: AtomicBool::new(false),
+                    dirty: AtomicBool::new(false),
+                });
             }
-            let existed = full.exists();
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&full)?;
-            if !existed && length > 0 {
-                file.set_len(length)?;
-            }
-            slots.push(FileSlot {
-                offset,
-                length,
-                path: full,
-                file: Mutex::new(file),
-                dirty: AtomicBool::new(false),
-            });
-            offset += length;
+            offset += *length;
         }
         Ok(Storage {
             slots,
             piece_length: meta.info.piece_length,
             total_length: offset,
+            priorities: priorities.to_vec(),
         })
     }
 
@@ -80,6 +108,54 @@ impl Storage {
 
     pub fn file_lengths(&self) -> Vec<u64> {
         self.slots.iter().map(|slot| slot.length).collect()
+    }
+
+    /// Priorities as of creation time; startup resume planning reads these.
+    pub fn priorities(&self) -> &[FilePriority] {
+        &self.priorities
+    }
+
+    /// Updates which files are skipped at runtime, so that boundary writes
+    /// create the right files on demand. Only the skip flags change; the
+    /// creation-time priorities stay untouched.
+    pub fn set_skipped(&self, skipped: &[bool]) {
+        for (slot, skip) in self.slots.iter().zip(skipped.iter()) {
+            slot.skip.store(*skip, Ordering::SeqCst);
+        }
+    }
+
+    /// Eagerly creates and preallocates the given files if they do not exist
+    /// yet, so fingerprint-based resume can trust them.
+    pub fn ensure_files_exist(&self, indices: &[usize]) -> Result<(), StorageError> {
+        for index in indices {
+            if *index >= self.slots.len() {
+                continue;
+            }
+            let slot = &self.slots[*index];
+            let mut guard = lock_file(&slot.file);
+            if guard.is_some() {
+                continue;
+            }
+            *guard = Some(self.open_slot(*index)?);
+        }
+        Ok(())
+    }
+
+    fn open_slot(&self, slot_index: usize) -> Result<File, StorageError> {
+        let slot = &self.slots[slot_index];
+        if let Some(parent) = slot.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&slot.path)?;
+        if slot.length > 0 {
+            file.set_len(slot.length)?;
+        }
+        Ok(file)
     }
 
     pub fn pieces_overlapping_file(&self, file_index: usize) -> Vec<usize> {
@@ -94,12 +170,27 @@ impl Storage {
         (first..=last).collect()
     }
 
+    /// Files a piece covers and how many of its bytes fall into each of them.
+    pub fn piece_file_spans(&self, index: usize) -> Vec<(usize, usize)> {
+        self.spans(index)
+            .into_iter()
+            .map(|(slot_index, _, length)| (slot_index, length))
+            .collect()
+    }
+
     pub fn sync_dirty(&self) -> Result<(), StorageError> {
         for slot in &self.slots {
             if !slot.dirty.swap(false, Ordering::SeqCst) {
                 continue;
             }
-            if let Err(err) = lock_file(&slot.file).sync_data() {
+            let result = {
+                let mut guard = lock_file(&slot.file);
+                match guard.as_mut() {
+                    Some(file) => file.sync_data(),
+                    None => Ok(()),
+                }
+            };
+            if let Err(err) = result {
                 slot.dirty.store(true, Ordering::SeqCst);
                 return Err(err.into());
             }
@@ -165,10 +256,15 @@ impl Storage {
         {
             let slot = &self.slots[slot_index];
             let mut guard = lock_file(&slot.file);
-            guard.seek(SeekFrom::Start(file_offset))?;
+            let Some(file) = guard.as_mut() else {
+                // A skipped file that was never created reads as zeros.
+                cursor += span_length;
+                continue;
+            };
+            file.seek(SeekFrom::Start(file_offset))?;
             let mut filled = 0usize;
             while filled < span_length {
-                match guard.read(&mut buffer[cursor + filled..cursor + span_length])? {
+                match file.read(&mut buffer[cursor + filled..cursor + span_length])? {
                     0 => break,
                     read => filled += read,
                 }
@@ -186,10 +282,14 @@ impl Storage {
         for (slot_index, file_offset, length) in self.spans(index) {
             let slot = &self.slots[slot_index];
             let mut guard = lock_file(&slot.file);
-            guard.seek(SeekFrom::Start(file_offset))?;
+            let Some(file) = guard.as_mut() else {
+                cursor += length;
+                continue;
+            };
+            file.seek(SeekFrom::Start(file_offset))?;
             let mut filled = 0usize;
             while filled < length {
-                match guard.read(&mut buf[cursor + filled..cursor + length])? {
+                match file.read(&mut buf[cursor + filled..cursor + length])? {
                     0 => {
                         buf[cursor + filled..cursor + length].fill(0);
                         break;
@@ -210,8 +310,16 @@ impl Storage {
         for (slot_index, file_offset, length) in self.spans(index) {
             let slot = &self.slots[slot_index];
             let mut guard = lock_file(&slot.file);
-            guard.seek(SeekFrom::Start(file_offset))?;
-            guard.write_all(&data[cursor..cursor + length])?;
+            let file = match guard.as_mut() {
+                Some(file) => file,
+                None => {
+                    // A boundary piece brings a skipped file into existence
+                    // so the whole piece can be stored and served later.
+                    guard.insert(self.open_slot(slot_index)?)
+                }
+            };
+            file.seek(SeekFrom::Start(file_offset))?;
+            file.write_all(&data[cursor..cursor + length])?;
             slot.dirty.store(true, Ordering::SeqCst);
             cursor += length;
         }
@@ -265,7 +373,7 @@ pub fn delete_torrent_files(meta: &MetaInfo, output_dir: &Path) -> Result<(), St
     Ok(())
 }
 
-fn lock_file(file: &Mutex<File>) -> MutexGuard<'_, File> {
+fn lock_file(file: &Mutex<Option<File>>) -> MutexGuard<'_, Option<File>> {
     match file.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -299,6 +407,14 @@ mod tests {
     use std::path::PathBuf;
 
     const PIECE_LENGTH: u32 = 4;
+
+    fn priorities_of(priorities: &[FilePriority]) -> Vec<FilePriority> {
+        priorities.to_vec()
+    }
+
+    fn all_normal(count: usize) -> Vec<FilePriority> {
+        vec![FilePriority::Normal; count]
+    }
 
     fn multi_file_meta(hashes: &[[u8; 20]]) -> MetaInfo {
         let mut raw = Vec::new();
@@ -340,7 +456,7 @@ mod tests {
     fn maps_pieces_across_file_boundaries() {
         let meta = multi_file_meta(&hashes_of(&content()));
         let dir = temp_dir("mapping");
-        let storage = Storage::create(&meta, &dir).unwrap();
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
         assert_eq!(meta.info.pieces.len(), 3);
         storage.write_piece(0, &[1, 2, 3, 4]).unwrap();
         storage.write_piece(1, &[5, 6, 7, 8]).unwrap();
@@ -358,7 +474,7 @@ mod tests {
     fn reads_blocks_across_file_boundaries() {
         let meta = multi_file_meta(&hashes_of(&content()));
         let dir = temp_dir("readblock");
-        let storage = Storage::create(&meta, &dir).unwrap();
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
         storage.write_piece(0, &[1, 2, 3, 4]).unwrap();
         storage.write_piece(1, &[5, 6, 7, 8]).unwrap();
         storage.write_piece(2, &[9, 10, 11, 12]).unwrap();
@@ -380,7 +496,7 @@ mod tests {
         let data = content();
         let meta = multi_file_meta(&hashes_of(&data));
         let dir = temp_dir("recheck");
-        let storage = Storage::create(&meta, &dir).unwrap();
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
         fs::write(dir.join("dir/a.txt"), &data[0..5]).unwrap();
         fs::write(dir.join("dir/sub/b.bin"), &data[5..8]).unwrap();
         fs::write(dir.join("dir/c.txt"), &data[8..12]).unwrap();
@@ -400,12 +516,129 @@ mod tests {
     fn preallocates_missing_files() {
         let meta = multi_file_meta(&hashes_of(&content()));
         let dir = temp_dir("prealloc");
-        let storage = Storage::create(&meta, &dir).unwrap();
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
         let metadata = fs::metadata(dir.join("dir/sub/b.bin")).unwrap();
         assert_eq!(metadata.len(), 3);
         let mut buffer = [0u8; 4];
         storage.read_piece(2, &mut buffer).unwrap();
         assert_eq!(buffer, [0, 0, 0, 0]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn skipped_files_are_never_created_or_preallocated() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("skipped-none");
+        let storage = Storage::create(
+            &meta,
+            &dir,
+            &priorities_of(&[
+                FilePriority::Normal,
+                FilePriority::Skip,
+                FilePriority::Normal,
+            ]),
+        )
+        .unwrap();
+        assert!(dir.join("dir/a.txt").exists());
+        assert!(!dir.join("dir/sub/b.bin").exists());
+        assert!(dir.join("dir/c.txt").exists());
+        // A never-created skipped file reads as zeros, never as an error.
+        let mut buffer = [0u8; 4];
+        storage.read_piece(1, &mut buffer).unwrap();
+        assert_eq!(buffer, [0, 0, 0, 0]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn boundary_piece_writes_every_byte_and_creates_the_skipped_file() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("boundary-write");
+        let storage = Storage::create(
+            &meta,
+            &dir,
+            &priorities_of(&[
+                FilePriority::Normal,
+                FilePriority::Skip,
+                FilePriority::Normal,
+            ]),
+        )
+        .unwrap();
+        assert!(!dir.join("dir/sub/b.bin").exists());
+        // Piece 1 spans a.txt's tail and all of b.bin.
+        storage.write_piece(1, &[5, 6, 7, 8]).unwrap();
+        assert_eq!(fs::read(dir.join("dir/sub/b.bin")).unwrap(), [6, 7, 8]);
+        assert_eq!(
+            fs::read(dir.join("dir/a.txt")).unwrap(),
+            [0, 0, 0, 0, 5],
+            "the whole piece is written, including the wanted file's bytes"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn on_demand_skipped_file_gets_the_full_declared_length() {
+        // Two files: "head" (2 bytes) and "tail" (6 bytes), piece length 4.
+        // Piece 0 covers head + tail[0..2]; piece 1 covers tail[2..6] only.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"d4:infod5:filesl");
+        raw.extend_from_slice(b"d6:lengthi2e4:pathl4:headee");
+        raw.extend_from_slice(b"d6:lengthi6e4:pathl4:tailee");
+        raw.extend_from_slice(b"e4:name1:t12:piece lengthi4e6:pieces");
+        let data: Vec<u8> = (1..=8).collect();
+        let hashes = hashes_of(&data);
+        raw.extend_from_slice((hashes.len() * 20).to_string().as_bytes());
+        raw.push(b':');
+        for hash in &hashes {
+            raw.extend_from_slice(hash);
+        }
+        raw.extend_from_slice(b"ee");
+        let meta = MetaInfo::from_bytes(&raw).unwrap();
+        let dir = temp_dir("sparse-length");
+        let storage = Storage::create(
+            &meta,
+            &dir,
+            &priorities_of(&[FilePriority::Normal, FilePriority::Skip]),
+        )
+        .unwrap();
+        assert!(!dir.join("t/tail").exists());
+        storage.write_piece(0, &data[0..4]).unwrap();
+        let written = fs::read(dir.join("t/tail")).unwrap();
+        assert_eq!(written.len(), 6, "created with the full declared length");
+        assert_eq!(&written[0..2], &data[2..4]);
+        assert_eq!(&written[2..6], &[0, 0, 0, 0], "untouched tail stays sparse");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn set_skip_flags_and_ensure_files_exist() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("ensure");
+        let storage = Storage::create(
+            &meta,
+            &dir,
+            &priorities_of(&[
+                FilePriority::Normal,
+                FilePriority::Skip,
+                FilePriority::Normal,
+            ]),
+        )
+        .unwrap();
+        assert!(!dir.join("dir/sub/b.bin").exists());
+        storage.set_skipped(&[false, false, false]);
+        storage.ensure_files_exist(&[1]).unwrap();
+        assert_eq!(fs::metadata(dir.join("dir/sub/b.bin")).unwrap().len(), 3);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn piece_file_spans_report_byte_shares() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("spans");
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
+        // Piece 1 (bytes 4..8) covers a.txt's last byte and all of b.bin.
+        assert_eq!(storage.piece_file_spans(1), vec![(0, 1), (1, 3)]);
+        assert_eq!(storage.piece_file_spans(0), vec![(0, 4)]);
+        assert_eq!(storage.piece_file_spans(2), vec![(2, 4)]);
         fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -6,6 +6,17 @@ use bt_core::metainfo::MetaInfo;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 
+fn cleanup_dir(dir: &std::path::Path) {
+    // On Windows the engine's background tasks can hold file handles open for
+    // a short moment after shutdown.
+    for _ in 0..20 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return,
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+}
+
 const PIECE_LENGTH: usize = 4;
 
 fn single_file_meta(data: &[u8]) -> MetaInfo {
@@ -161,8 +172,8 @@ async fn completion_persists_a_complete_snapshot_without_temp_files() {
         "no temp file may survive"
     );
     torrent.stop().await.unwrap();
-    std::fs::remove_dir_all(&out).unwrap();
-    std::fs::remove_dir_all(&resume_dir).unwrap();
+    cleanup_dir(&out);
+    cleanup_dir(&resume_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -205,8 +216,8 @@ async fn a_valid_resume_hashes_only_the_sample() {
     assert_eq!(finished.verified_bytes as usize, data.len());
     assert!(finished.resume_fallback.is_none());
     second.stop().await.unwrap();
-    std::fs::remove_dir_all(&out).unwrap();
-    std::fs::remove_dir_all(&resume_dir).unwrap();
+    cleanup_dir(&out);
+    cleanup_dir(&resume_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -261,8 +272,8 @@ async fn a_tampered_piece_caught_by_the_sample_falls_back_to_a_full_recheck() {
         "the full recheck verifies the pieces the tamper did not touch"
     );
     torrent.stop().await.unwrap();
-    std::fs::remove_dir_all(&out).unwrap();
-    std::fs::remove_dir_all(&resume_dir).unwrap();
+    cleanup_dir(&out);
+    cleanup_dir(&resume_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -309,8 +320,8 @@ async fn a_changed_file_mtime_reverifies_only_overlapping_pieces() {
     );
     assert_eq!(finished.verified_bytes as usize, data.len());
     second.stop().await.unwrap();
-    std::fs::remove_dir_all(&out).unwrap();
-    std::fs::remove_dir_all(&resume_dir).unwrap();
+    cleanup_dir(&out);
+    cleanup_dir(&resume_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -359,8 +370,8 @@ async fn wrong_piece_count_snapshot_falls_back_to_a_full_recheck() {
     assert_eq!(settled.startup_pieces_hashed, 6);
     assert_eq!(settled.verified_bytes as usize, data.len());
     torrent.stop().await.unwrap();
-    std::fs::remove_dir_all(&out).unwrap();
-    std::fs::remove_dir_all(&resume_dir).unwrap();
+    cleanup_dir(&out);
+    cleanup_dir(&resume_dir);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -401,6 +412,6 @@ async fn wrong_info_hash_snapshot_falls_back_to_a_full_recheck() {
     assert!(settled.resume_fallback.is_some());
     assert_eq!(settled.verified_bytes as usize, data.len());
     torrent.stop().await.unwrap();
-    std::fs::remove_dir_all(&out).unwrap();
-    std::fs::remove_dir_all(&resume_dir).unwrap();
+    cleanup_dir(&out);
+    cleanup_dir(&resume_dir);
 }

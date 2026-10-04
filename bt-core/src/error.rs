@@ -166,6 +166,8 @@ pub enum SessionError {
     Dht(String),
     #[error("{0}")]
     Magnet(#[from] crate::magnet::MagnetError),
+    #[error("invalid file priorities: {0}")]
+    InvalidPriority(String),
 }
 
 #[derive(Debug, Error)]

@@ -32,7 +32,10 @@ pub struct ResumeSnapshot {
     pub info_hash: String,
     pub piece_count: usize,
     pub bitfield: Vec<u8>,
-    pub files: Vec<FileFingerprint>,
+    /// One entry per torrent file. `None` marks a skipped file that did not
+    /// exist when the snapshot was written; fingerprint checks do not apply
+    /// to it.
+    pub files: Vec<Option<FileFingerprint>>,
 }
 
 #[derive(Debug, Clone)]
@@ -127,21 +130,33 @@ pub fn startup_plan(
     }
     let lengths = storage.file_lengths();
     for (index, fingerprint) in snapshot.files.iter().enumerate() {
-        if fingerprint.length != lengths[index] {
-            return Err(ResumeError::FileLengthMismatch {
-                index,
-                expected: lengths[index],
-                actual: fingerprint.length,
-            });
+        if let Some(fingerprint) = fingerprint {
+            if fingerprint.length != lengths[index] {
+                return Err(ResumeError::FileLengthMismatch {
+                    index,
+                    expected: lengths[index],
+                    actual: fingerprint.length,
+                });
+            }
         }
     }
     let mut trusted = Bitfield::from_bytes(&snapshot.bitfield, piece_count)?;
     let current = current_fingerprints(&paths);
     let mut overlaps: Vec<usize> = Vec::new();
     for (index, fingerprint) in current.iter().enumerate() {
-        let changed = match fingerprint {
-            Some(current) => *current != snapshot.files[index],
-            None => true,
+        let should_exist = !storage
+            .priorities()
+            .get(index)
+            .copied()
+            .unwrap_or(crate::engine::FilePriority::Normal)
+            .is_skip();
+        // Fingerprint checks only apply to files that are supposed to exist:
+        // non-skipped files, and skipped files that were created for boundary
+        // pieces (those existed when the snapshot was written).
+        let changed = match (&snapshot.files[index], fingerprint) {
+            (Some(saved), Some(current)) => current != saved,
+            (Some(_), None) | (None, Some(_)) => true,
+            (None, None) => should_exist,
         };
         if changed {
             overlaps.extend(storage.pieces_overlapping_file(index));
@@ -256,7 +271,8 @@ mod tests {
     }
 
     fn storage_with_content(meta: &MetaInfo, dir: &Path, data: &[u8]) -> Storage {
-        let storage = Storage::create(meta, dir).unwrap();
+        let priorities = vec![crate::engine::FilePriority::Normal; storage_file_count(meta)];
+        let storage = Storage::create(meta, dir, &priorities).unwrap();
         let mut offset = 0usize;
         for index in 0..meta.info.pieces.len() {
             let size = storage.piece_size(index);
@@ -266,6 +282,13 @@ mod tests {
             offset += size;
         }
         storage
+    }
+
+    fn storage_file_count(meta: &MetaInfo) -> usize {
+        match &meta.info.content {
+            crate::metainfo::Content::Single { .. } => 1,
+            crate::metainfo::Content::Multi { files } => files.len(),
+        }
     }
 
     fn wait_for_mtime_change(dir: &Path, relative: &[&str]) {
@@ -292,11 +315,11 @@ mod tests {
             info_hash: "abc".to_string(),
             piece_count: 3,
             bitfield: vec![0xE0],
-            files: vec![FileFingerprint {
+            files: vec![Some(FileFingerprint {
                 length: 5,
                 modified_secs: 100,
                 modified_nanos: 5,
-            }],
+            })],
         };
         write_snapshot(&path, &snapshot).unwrap();
         assert_eq!(load_snapshot(&path).unwrap(), snapshot);
@@ -434,10 +457,7 @@ mod tests {
             info_hash: info_hash_hex.clone(),
             piece_count: 3,
             bitfield: vec![0xE0],
-            files: current_fingerprints(&storage.file_paths())
-                .into_iter()
-                .map(|fingerprint| fingerprint.unwrap())
-                .collect(),
+            files: current_fingerprints(&storage.file_paths()),
         };
         write_snapshot(&snapshot_path(&dir, &info_hash_hex), &snapshot).unwrap();
 
@@ -449,7 +469,7 @@ mod tests {
         assert!(!plan.trusted.get(2));
         assert_eq!(plan.sample, vec![0, 1]);
 
-        snapshot.files[2].length = 99;
+        snapshot.files[2].as_mut().unwrap().length = 99;
         write_snapshot(&snapshot_path(&dir, &info_hash_hex), &snapshot).unwrap();
         assert!(matches!(
             startup_plan(&dir, &meta, &storage),
@@ -470,10 +490,7 @@ mod tests {
             info_hash: info_hash_hex.clone(),
             piece_count: 3,
             bitfield: vec![0xE0],
-            files: current_fingerprints(&storage.file_paths())
-                .into_iter()
-                .map(|fingerprint| fingerprint.unwrap())
-                .collect(),
+            files: current_fingerprints(&storage.file_paths()),
         };
         write_snapshot(&snapshot_path(&dir, &info_hash_hex), &snapshot).unwrap();
 
@@ -499,10 +516,7 @@ mod tests {
             info_hash: info_hash_hex.clone(),
             piece_count: 3,
             bitfield: vec![0xE0],
-            files: current_fingerprints(&storage.file_paths())
-                .into_iter()
-                .map(|fingerprint| fingerprint.unwrap())
-                .collect(),
+            files: current_fingerprints(&storage.file_paths()),
         };
         write_snapshot(&snapshot_path(&dir, &info_hash_hex), &snapshot).unwrap();
         std::fs::remove_file(dir.join("dir/sub/b.bin")).unwrap();
@@ -555,7 +569,7 @@ mod tests {
         let dir = temp_dir("verifiedlength");
         let data = content();
         let meta = multi_file_meta(&hashes_of(&data));
-        let storage = Storage::create(&meta, &dir).unwrap();
+        let storage = storage_with_content(&meta, &dir, &data);
         let mut have = Bitfield::new(3);
         have.set(0).unwrap();
         have.set(2).unwrap();
@@ -564,6 +578,141 @@ mod tests {
             4 + 4,
             "piece sizes, not file lengths"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn skip_first_file_storage(meta: &MetaInfo, dir: &std::path::Path) -> Storage {
+        Storage::create(
+            meta,
+            dir,
+            &[
+                crate::engine::FilePriority::Skip,
+                crate::engine::FilePriority::Normal,
+                crate::engine::FilePriority::Normal,
+            ],
+        )
+        .unwrap()
+    }
+
+    fn write_snapshot_for(
+        dir: &std::path::Path,
+        meta: &MetaInfo,
+        storage: &Storage,
+        have: &[usize],
+    ) {
+        let info_hash_hex = crate::hex::encode(&meta.info_hash);
+        let mut bitfield = Bitfield::new(meta.info.pieces.len());
+        for &index in have {
+            bitfield.set(index).unwrap();
+        }
+        let snapshot = ResumeSnapshot {
+            version: RESUME_FORMAT_VERSION,
+            info_hash: info_hash_hex.clone(),
+            piece_count: meta.info.pieces.len(),
+            bitfield: bitfield.as_raw().to_vec(),
+            files: current_fingerprints(&storage.file_paths()),
+        };
+        write_snapshot(&snapshot_path(dir, &info_hash_hex), &snapshot).unwrap();
+    }
+
+    #[test]
+    fn skipped_file_that_was_never_created_still_resumes() {
+        let dir = temp_dir("skipped-resume");
+        let data = content();
+        let meta = multi_file_meta(&hashes_of(&data));
+        let storage = skip_first_file_storage(&meta, &dir);
+        assert!(
+            !dir.join("dir/a.txt").exists(),
+            "the skipped file was never created"
+        );
+        // Pieces 1 and 2 are verified; the skipped file's piece 0 is not.
+        storage.write_piece(1, &data[4..8]).unwrap();
+        storage.write_piece(2, &data[8..12]).unwrap();
+        write_snapshot_for(&dir, &meta, &storage, &[1, 2]);
+
+        let plan = startup_plan(&dir, &meta, &storage).unwrap();
+        assert!(
+            plan.overlaps.is_empty(),
+            "a missing skipped file must not invalidate the resume state"
+        );
+        assert!(plan.trusted.get(1));
+        assert!(plan.trusted.get(2));
+        assert!(!plan.trusted.get(0));
+        assert_eq!(plan.sample, vec![1, 2]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn skipped_file_created_for_boundary_pieces_is_fingerprint_checked() {
+        let dir = temp_dir("boundary-fingerprint");
+        let data = content();
+        let meta = multi_file_meta(&hashes_of(&data));
+        let storage = skip_first_file_storage(&meta, &dir);
+        // Piece 1 brings the skipped file into existence (boundary piece).
+        storage.write_piece(1, &data[4..8]).unwrap();
+        assert!(dir.join("dir/a.txt").exists());
+        storage.write_piece(2, &data[8..12]).unwrap();
+        write_snapshot_for(&dir, &meta, &storage, &[1, 2]);
+
+        let plan = startup_plan(&dir, &meta, &storage).unwrap();
+        assert!(plan.overlaps.is_empty());
+
+        // If that created file is later removed, its pieces are re-verified.
+        std::fs::remove_file(dir.join("dir/a.txt")).unwrap();
+        let plan = startup_plan(&dir, &meta, &storage).unwrap();
+        assert_eq!(plan.overlaps, vec![0, 1], "a.txt overlaps pieces 0 and 1");
+        assert!(!plan.trusted.get(0));
+        assert!(!plan.trusted.get(1));
+        assert!(plan.trusted.get(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn missing_file_that_should_exist_forces_reverification() {
+        let dir = temp_dir("should-exist");
+        let data = content();
+        let meta = multi_file_meta(&hashes_of(&data));
+        // The snapshot was written while a.txt was skipped (files[0] is None),
+        // but the current priorities say a.txt should exist.
+        let storage = skip_first_file_storage(&meta, &dir);
+        storage.write_piece(1, &data[4..8]).unwrap();
+        storage.write_piece(2, &data[8..12]).unwrap();
+        write_snapshot_for(&dir, &meta, &storage, &[1, 2]);
+        let normal_storage = Storage::create(
+            &meta,
+            &dir,
+            &[
+                crate::engine::FilePriority::Normal,
+                crate::engine::FilePriority::Normal,
+                crate::engine::FilePriority::Normal,
+            ],
+        )
+        .unwrap();
+        std::fs::remove_file(dir.join("dir/a.txt")).unwrap();
+        let plan = startup_plan(&dir, &meta, &normal_storage).unwrap();
+        assert_eq!(
+            plan.overlaps,
+            vec![0, 1],
+            "a file that should exist but is missing still forces re-verification"
+        );
+        assert!(!plan.trusted.get(0));
+        assert!(!plan.trusted.get(1));
+        assert!(plan.trusted.get(2));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn skipped_file_that_appeared_since_the_snapshot_is_reverified() {
+        let dir = temp_dir("appeared");
+        let data = content();
+        let meta = multi_file_meta(&hashes_of(&data));
+        let storage = skip_first_file_storage(&meta, &dir);
+        storage.write_piece(1, &data[4..8]).unwrap();
+        storage.write_piece(2, &data[8..12]).unwrap();
+        write_snapshot_for(&dir, &meta, &storage, &[1, 2]);
+        std::fs::write(dir.join("dir/a.txt"), b"xyzzy").unwrap();
+        let plan = startup_plan(&dir, &meta, &storage).unwrap();
+        assert_eq!(plan.overlaps, vec![0, 1]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

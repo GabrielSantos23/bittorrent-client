@@ -12,7 +12,7 @@ use tokio::task::spawn_blocking;
 
 use crate::dht::{DhtHandle, DhtOptions, DhtStatus};
 use crate::dht::{NodeId, SystemRandom};
-use crate::engine::{PeerStats, State, Torrent, TrackerStatus};
+use crate::engine::{FilePriority, PeerStats, State, Torrent, TrackerStatus};
 use crate::listener::{self, Listener, ListenerOptions, ListenerStatus, Registry};
 use crate::ratelimit::UploadBucket;
 
@@ -23,6 +23,31 @@ use crate::metainfo::MetaInfo;
 use crate::peer_id;
 
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Options for adding a .torrent: start paused, and optionally select file
+/// priorities up front (sparse `(file index, priority)` pairs, default Normal).
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct AddOptions {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub file_priorities: Vec<(usize, FilePriority)>,
+}
+
+/// Options for adding a magnet. `pause_after_metadata` pauses the torrent as
+/// soon as the metadata arrives, so the UI can show the file list and let the
+/// user choose priorities before any data is downloaded.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct MagnetOptions {
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub pause_after_metadata: bool,
+    #[serde(default)]
+    pub file_priorities: Vec<(usize, FilePriority)>,
+}
 
 #[derive(Clone)]
 pub struct SessionOptions {
@@ -69,6 +94,10 @@ pub struct TorrentSummary {
     pub total_length: u64,
     #[ts(type = "number")]
     pub verified_bytes: u64,
+    /// Sum of the lengths of files that are not skipped.
+    #[ts(type = "number")]
+    pub wanted_bytes: u64,
+    /// Progress relative to the wanted bytes.
     pub progress: f64,
     pub download_rate: f64,
     #[ts(type = "number")]
@@ -89,6 +118,11 @@ pub struct FileSummary {
     pub path: String,
     #[ts(type = "number")]
     pub length: u64,
+    pub priority: FilePriority,
+    /// Bytes of verified pieces that fall inside this file; boundary pieces
+    /// count for every file they cover.
+    #[ts(type = "number")]
+    pub verified_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
@@ -112,14 +146,19 @@ enum SessionCommand {
     Add {
         bytes: Vec<u8>,
         output_dir: PathBuf,
-        paused: bool,
+        options: AddOptions,
         reply: oneshot::Sender<Result<String, SessionError>>,
     },
     AddMagnet {
         uri: String,
         output_dir: PathBuf,
-        paused: bool,
+        options: MagnetOptions,
         reply: oneshot::Sender<Result<String, SessionError>>,
+    },
+    SetFilePriorities {
+        id: String,
+        priorities: Vec<(usize, FilePriority)>,
+        reply: oneshot::Sender<Result<(), SessionError>>,
     },
     Pause {
         id: String,
@@ -343,7 +382,7 @@ impl Session {
         };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
-        let mut pending_magnets: Vec<(String, PathBuf, bool)> = Vec::new();
+        let mut pending_magnets: Vec<(String, PathBuf, MagnetOptions)> = Vec::new();
         let persisted_file;
         if let Some(data_dir) = &persistence {
             std::fs::create_dir_all(data_dir)?;
@@ -352,7 +391,15 @@ impl Session {
             restore_errors.extend(errors);
             for entry in &persisted_file.torrents {
                 if let Some(uri) = &entry.magnet {
-                    pending_magnets.push((uri.clone(), entry.output_dir.clone(), entry.paused));
+                    pending_magnets.push((
+                        uri.clone(),
+                        entry.output_dir.clone(),
+                        MagnetOptions {
+                            paused: entry.paused,
+                            pause_after_metadata: entry.pause_after_metadata,
+                            file_priorities: entry.file_priorities.clone(),
+                        },
+                    ));
                 }
             }
             for entry in persisted_file.torrents {
@@ -365,7 +412,14 @@ impl Session {
                         Ok(meta) => {
                             let id = hex::encode(&meta.info_hash);
                             if id == entry.id {
-                                Some((meta, entry.output_dir.clone(), entry.paused))
+                                Some((
+                                    meta,
+                                    entry.output_dir.clone(),
+                                    AddOptions {
+                                        paused: entry.paused,
+                                        file_priorities: entry.file_priorities.clone(),
+                                    },
+                                ))
                             } else {
                                 restore_errors.push(format!(
                                     "entry {} has a mismatching info hash",
@@ -387,8 +441,8 @@ impl Session {
                         None
                     }
                 };
-                if let Some((meta, output_dir, paused)) = restored_entry {
-                    restored.push((Arc::new(meta), output_dir, paused));
+                if let Some((meta, output_dir, options)) = restored_entry {
+                    restored.push((Arc::new(meta), output_dir, options));
                 }
             }
         }
@@ -396,18 +450,18 @@ impl Session {
         let mut torrents = HashMap::new();
         let mut order = Vec::new();
         let mut initial = Vec::new();
-        for (meta, output_dir, paused) in restored {
+        for (meta, output_dir, options) in restored {
             let id = hex::encode(&meta.info_hash);
             if torrents.contains_key(&id) {
                 restore_errors.push(format!("duplicate restored torrent {id}"));
                 continue;
             }
-            let entry = spawn_entry(meta, output_dir, paused, &wiring).await?;
+            let entry = spawn_entry(meta, output_dir, options, &wiring).await?;
             initial.push(make_summary(&id, &entry));
             order.push(id.clone());
             torrents.insert(id, entry);
         }
-        for (uri, output_dir, paused) in pending_magnets {
+        for (uri, output_dir, options) in pending_magnets {
             let Ok(link) = crate::magnet::parse(&uri) else {
                 restore_errors.push(format!("bad magnet: {uri}"));
                 continue;
@@ -417,7 +471,7 @@ impl Session {
                 restore_errors.push(format!("duplicate restored magnet {id}"));
                 continue;
             }
-            let entry = spawn_magnet_entry(link, uri.clone(), output_dir, paused, &wiring).await?;
+            let entry = spawn_magnet_entry(link, uri.clone(), output_dir, options, &wiring).await?;
             initial.push(make_summary(&id, &entry));
             order.push(id.clone());
             torrents.insert(id, entry);
@@ -512,13 +566,14 @@ impl Session {
         &self,
         bytes: &[u8],
         output_dir: PathBuf,
+        options: AddOptions,
     ) -> Result<String, SessionError> {
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(SessionCommand::Add {
                 bytes: bytes.to_vec(),
                 output_dir,
-                paused: false,
+                options,
                 reply,
             })
             .await
@@ -526,13 +581,35 @@ impl Session {
         rx.await.map_err(|_| SessionError::Closed)?
     }
 
-    pub async fn add_magnet(&self, uri: &str, output_dir: PathBuf) -> Result<String, SessionError> {
+    pub async fn add_magnet(
+        &self,
+        uri: &str,
+        output_dir: PathBuf,
+        options: MagnetOptions,
+    ) -> Result<String, SessionError> {
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(SessionCommand::AddMagnet {
                 uri: uri.to_string(),
                 output_dir,
-                paused: false,
+                options,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
+    pub async fn set_file_priorities(
+        &self,
+        id: &str,
+        priorities: Vec<(usize, FilePriority)>,
+    ) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::SetFilePriorities {
+                id: id.to_string(),
+                priorities,
                 reply,
             })
             .await
@@ -605,6 +682,8 @@ struct SessionTorrent {
     output_dir: PathBuf,
     paused: bool,
     magnet: Option<String>,
+    file_priorities: Vec<(usize, FilePriority)>,
+    pause_after_metadata: bool,
     stats: watch::Receiver<crate::engine::Stats>,
 }
 
@@ -748,19 +827,27 @@ impl SessionActor {
             SessionCommand::Add {
                 bytes,
                 output_dir,
-                paused,
+                options,
                 reply,
             } => {
-                let result = self.add(bytes, output_dir, paused).await;
+                let result = self.add(bytes, output_dir, options).await;
                 let _ = reply.send(result);
             }
             SessionCommand::AddMagnet {
                 uri,
                 output_dir,
-                paused,
+                options,
                 reply,
             } => {
-                let result = self.add_magnet(&uri, output_dir, paused).await;
+                let result = self.add_magnet(&uri, output_dir, options).await;
+                let _ = reply.send(result);
+            }
+            SessionCommand::SetFilePriorities {
+                id,
+                priorities,
+                reply,
+            } => {
+                let result = self.set_file_priorities(&id, priorities).await;
                 let _ = reply.send(result);
             }
             SessionCommand::Pause { id, reply } => {
@@ -814,14 +901,14 @@ impl SessionActor {
         &mut self,
         bytes: Vec<u8>,
         output_dir: PathBuf,
-        paused: bool,
+        options: AddOptions,
     ) -> Result<String, SessionError> {
         let meta = Arc::new(MetaInfo::from_bytes(&bytes)?);
         let id = hex::encode(&meta.info_hash);
         if self.torrents.contains_key(&id) {
             return Err(SessionError::Duplicate(id));
         }
-        let entry = spawn_entry(meta, output_dir, paused, &self.wiring).await?;
+        let entry = spawn_entry(meta, output_dir, options, &self.wiring).await?;
         if let Some(data_dir) = &self.persistence {
             persist::write_metainfo(data_dir, &id, &bytes)?;
         }
@@ -836,7 +923,7 @@ impl SessionActor {
         &mut self,
         uri: &str,
         output_dir: PathBuf,
-        paused: bool,
+        options: MagnetOptions,
     ) -> Result<String, SessionError> {
         let link = crate::magnet::parse(uri)?;
         let id = hex::encode(&link.info_hash);
@@ -847,7 +934,7 @@ impl SessionActor {
             link,
             uri.to_string(),
             output_dir.clone(),
-            paused,
+            options,
             &self.wiring,
         )
         .await?;
@@ -856,6 +943,40 @@ impl SessionActor {
         self.persist();
         self.publish();
         Ok(id)
+    }
+
+    async fn set_file_priorities(
+        &mut self,
+        id: &str,
+        priorities: Vec<(usize, FilePriority)>,
+    ) -> Result<(), SessionError> {
+        let entry = self
+            .torrents
+            .get_mut(id)
+            .ok_or_else(|| SessionError::Unknown(id.to_string()))?;
+        let file_count = entry.stats.borrow().files.len();
+        if file_count == 0 {
+            return Err(SessionError::InvalidPriority(
+                "the file list is not available yet".to_string(),
+            ));
+        }
+        for (index, _) in &priorities {
+            if *index >= file_count {
+                return Err(SessionError::InvalidPriority(format!(
+                    "file index {index} is out of range ({file_count} files)"
+                )));
+            }
+        }
+        entry.handle.set_file_priorities(priorities.clone()).await?;
+        for (index, priority) in priorities {
+            entry
+                .file_priorities
+                .retain(|(existing, _)| *existing != index);
+            entry.file_priorities.push((index, priority));
+        }
+        self.persist();
+        self.publish();
+        Ok(())
     }
 
     async fn set_paused(&mut self, id: &str, paused: bool) -> Result<(), SessionError> {
@@ -901,27 +1022,18 @@ impl SessionActor {
     fn detail(&self, id: &str) -> Option<TorrentDetail> {
         let entry = self.torrents.get(id)?;
         let stats = entry.stats.borrow().clone();
-        let mut files = Vec::new();
-        match &entry.meta.info.content {
-            crate::metainfo::Content::Single { length } => {
-                files.push(FileSummary {
-                    path: entry.meta.info.name.clone(),
-                    length: *length,
-                });
-            }
-            crate::metainfo::Content::Multi { files: entries } => {
-                for file in entries {
-                    let mut path = PathBuf::new();
-                    for segment in &file.path {
-                        path.push(segment);
-                    }
-                    files.push(FileSummary {
-                        path: path.to_string_lossy().into_owned(),
-                        length: file.length,
-                    });
-                }
-            }
-        }
+        // The engine derives the file list from the real metadata, so the
+        // detail of a magnet is correct as soon as the metadata has arrived.
+        let files = stats
+            .files
+            .iter()
+            .map(|file| FileSummary {
+                path: file.path.clone(),
+                length: file.length,
+                priority: file.priority,
+                verified_bytes: file.verified_bytes,
+            })
+            .collect();
         Some(TorrentDetail {
             id: id.to_string(),
             info_hash: id.to_string(),
@@ -964,6 +1076,8 @@ impl SessionActor {
                             output_dir: entry.output_dir.clone(),
                             paused: entry.paused,
                             magnet: entry.magnet.clone(),
+                            file_priorities: entry.file_priorities.clone(),
+                            pause_after_metadata: entry.pause_after_metadata,
                         })
                     })
                     .collect(),
@@ -989,10 +1103,10 @@ async fn spawn_magnet_entry(
     link: crate::magnet::MagnetLink,
     uri: String,
     output_dir: PathBuf,
-    paused: bool,
+    options: MagnetOptions,
     wiring: &EngineWiring,
 ) -> Result<SessionTorrent, SessionError> {
-    let options = crate::engine::TorrentOptions {
+    let engine_options = crate::engine::TorrentOptions {
         bootstrap_peers: wiring.bootstrap_peers.clone(),
         dial: wiring.dial.clone(),
         listen_active: wiring.listen_active.clone(),
@@ -1004,12 +1118,13 @@ async fn spawn_magnet_entry(
         peer_id: wiring.peer_id,
         dht: wiring.dht.clone(),
         resume_dir: wiring.resume_dir.clone(),
+        file_priorities: options.file_priorities.clone(),
+        // A paused magnet pauses when the metadata arrives; without this the
+        // engine would leave FetchingMetadata straight into Downloading.
+        pause_after_metadata: options.paused || options.pause_after_metadata,
     };
-    let handle = Torrent::spawn_from_magnet(link, output_dir.clone(), options).await?;
+    let handle = Torrent::spawn_from_magnet(link, output_dir.clone(), engine_options).await?;
     let stats = handle.subscribe();
-    if paused {
-        handle.pause().await?;
-    }
     let mut info = std::collections::BTreeMap::new();
     info.insert(b"length".to_vec(), crate::bencode::Value::Int(1));
     info.insert(
@@ -1031,8 +1146,10 @@ async fn spawn_magnet_entry(
         handle,
         meta: Arc::new(placeholder_meta),
         output_dir,
-        paused,
+        paused: options.paused,
         magnet: Some(uri),
+        file_priorities: options.file_priorities,
+        pause_after_metadata: options.pause_after_metadata,
         stats,
     })
 }
@@ -1040,10 +1157,10 @@ async fn spawn_magnet_entry(
 async fn spawn_entry(
     meta: Arc<MetaInfo>,
     output_dir: PathBuf,
-    paused: bool,
+    options: AddOptions,
     wiring: &EngineWiring,
 ) -> Result<SessionTorrent, SessionError> {
-    let options = crate::engine::TorrentOptions {
+    let engine_options = crate::engine::TorrentOptions {
         bootstrap_peers: wiring.bootstrap_peers.clone(),
         dial: wiring.dial.clone(),
         listen_active: wiring.listen_active.clone(),
@@ -1055,30 +1172,39 @@ async fn spawn_entry(
         peer_id: wiring.peer_id,
         dht: wiring.dht.clone(),
         resume_dir: wiring.resume_dir.clone(),
+        file_priorities: options.file_priorities.clone(),
+        pause_after_metadata: false,
     };
-    let handle = Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), options).await?;
+    let handle =
+        Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), engine_options).await?;
     let stats = handle.subscribe();
-    if paused {
+    if options.paused {
         handle.pause().await?;
     }
     Ok(SessionTorrent {
         handle,
         meta,
         output_dir,
-        paused,
+        paused: options.paused,
         magnet: None,
+        file_priorities: options.file_priorities,
+        pause_after_metadata: false,
         stats,
     })
 }
 
 fn make_summary(id: &str, entry: &SessionTorrent) -> TorrentSummary {
     let stats = entry.stats.borrow().clone();
-    let progress = if stats.total_length > 0 {
-        stats.verified_bytes as f64 / stats.total_length as f64
+    let progress = if stats.wanted_bytes > 0 {
+        stats.verified_wanted_bytes as f64 / stats.wanted_bytes as f64
+    } else if stats.total_length > 0 && stats.verified_bytes >= stats.total_length {
+        1.0
     } else {
         0.0
     };
-    let remaining = stats.total_length.saturating_sub(stats.verified_bytes);
+    let remaining = stats
+        .wanted_bytes
+        .saturating_sub(stats.verified_wanted_bytes);
     let eta_seconds = if stats.download_rate > 1.0 && remaining > 0 {
         Some((remaining as f64 / stats.download_rate) as u64)
     } else {
@@ -1090,6 +1216,7 @@ fn make_summary(id: &str, entry: &SessionTorrent) -> TorrentSummary {
         state: stats.state,
         total_length: stats.total_length,
         verified_bytes: stats.verified_bytes,
+        wanted_bytes: stats.wanted_bytes,
         progress,
         download_rate: stats.download_rate,
         session_uploaded: stats.session_uploaded,

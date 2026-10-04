@@ -7,9 +7,11 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use bt_core::dht::DhtStatus;
-use bt_core::engine::State;
+use bt_core::engine::{FilePriority, State};
 use bt_core::listener::ListenerStatus;
-use bt_core::session::{Session, SessionOptions, TorrentDetail, TorrentSummary};
+use bt_core::session::{
+    AddOptions, MagnetOptions, Session, SessionOptions, TorrentDetail, TorrentSummary,
+};
 use settings::{default_settings, load_settings, save_settings, Settings};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
@@ -32,7 +34,12 @@ fn lock_settings(state: &AppState) -> std::sync::MutexGuard<'_, Settings> {
 }
 
 #[tauri::command]
-async fn add_torrent(state: tauri::State<'_, AppState>, path: String) -> Result<String, String> {
+async fn add_torrent(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    paused: Option<bool>,
+    file_priorities: Option<Vec<(u32, FilePriority)>>,
+) -> Result<String, String> {
     let path = PathBuf::from(path);
     let metadata =
         std::fs::metadata(&path).map_err(|err| format!("cannot access torrent file: {err}"))?;
@@ -46,19 +53,54 @@ async fn add_torrent(state: tauri::State<'_, AppState>, path: String) -> Result<
     bt_core::metainfo::MetaInfo::from_bytes(&bytes)
         .map_err(|err| format!("invalid torrent file: {err}"))?;
     let download_dir = lock_settings(&state).download_dir.clone();
+    let options = AddOptions {
+        paused: paused.unwrap_or(false),
+        file_priorities: file_priorities
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(index, priority)| (index as usize, priority))
+            .collect(),
+    };
     state
         .session
-        .add_torrent(&bytes, download_dir)
+        .add_torrent(&bytes, download_dir, options)
         .await
         .map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-async fn add_magnet(state: tauri::State<'_, AppState>, uri: String) -> Result<String, String> {
+async fn add_magnet(
+    state: tauri::State<'_, AppState>,
+    uri: String,
+    paused: Option<bool>,
+    pause_after_metadata: Option<bool>,
+) -> Result<String, String> {
     let download_dir = lock_settings(&state).download_dir.clone();
+    let options = MagnetOptions {
+        paused: paused.unwrap_or(false),
+        pause_after_metadata: pause_after_metadata.unwrap_or(false),
+        file_priorities: Vec::new(),
+    };
     state
         .session
-        .add_magnet(&uri, download_dir)
+        .add_magnet(&uri, download_dir, options)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn set_file_priorities(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    priorities: Vec<(u32, FilePriority)>,
+) -> Result<(), String> {
+    let priorities = priorities
+        .into_iter()
+        .map(|(index, priority)| (index as usize, priority))
+        .collect();
+    state
+        .session
+        .set_file_priorities(&id, priorities)
         .await
         .map_err(|err| err.to_string())
 }
@@ -333,6 +375,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             add_torrent,
             add_magnet,
+            set_file_priorities,
             list_torrents,
             get_listener_status,
             get_dht_status,

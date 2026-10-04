@@ -81,6 +81,13 @@ impl PieceAssembler {
             .unwrap_or(false)
     }
 
+    /// Discards partial buffers, e.g. for pieces that are no longer wanted.
+    pub fn drop_pieces(&mut self, indices: &[usize]) {
+        for index in indices {
+            self.pieces.remove(index);
+        }
+    }
+
     pub fn take(&mut self, index: usize) -> Option<Vec<u8>> {
         let buffer = self.pieces.get(&index)?;
         if buffer.remaining > 0 {
@@ -190,5 +197,21 @@ mod tests {
             asm.write_block(0, 0, &vec![9u8; BLOCK_SIZE]),
             BlockOutcome::Accepted
         );
+    }
+
+    #[test]
+    fn drop_pieces_discards_partial_buffers() {
+        let mut asm = assembler(40000);
+        asm.open(0);
+        asm.write_block(0, 0, &vec![1u8; BLOCK_SIZE]);
+        asm.drop_pieces(&[0]);
+        assert!(!asm.is_open(0));
+        assert_eq!(
+            asm.write_block(0, BLOCK_SIZE, &vec![1u8; BLOCK_SIZE]),
+            BlockOutcome::Unexpected,
+            "blocks for dropped pieces are rejected until the piece is opened again"
+        );
+        asm.open(0);
+        assert!(asm.is_open(0));
     }
 }

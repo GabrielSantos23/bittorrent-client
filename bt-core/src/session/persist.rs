@@ -1,3 +1,4 @@
+use crate::engine::FilePriority;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,11 @@ pub(crate) struct PersistedTorrent {
     pub paused: bool,
     #[serde(default)]
     pub magnet: Option<String>,
+    /// Sparse `(file index, priority)` pairs chosen for this torrent.
+    #[serde(default)]
+    pub file_priorities: Vec<(usize, FilePriority)>,
+    #[serde(default)]
+    pub pause_after_metadata: bool,
 }
 
 pub(crate) fn load(data_dir: &Path) -> (SessionFile, Vec<String>) {
