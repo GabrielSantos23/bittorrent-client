@@ -1527,7 +1527,7 @@ impl Engine {
 
     fn left_for_announce(&self) -> u64 {
         match &self.pending {
-            Some(pending) => pending.size.unwrap_or(0),
+            Some(pending) => pending.size.unwrap_or(1),
             None => self.total_length - self.verified_bytes,
         }
     }
