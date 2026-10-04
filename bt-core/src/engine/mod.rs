@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -136,6 +136,7 @@ pub struct Stats {
     pub peers: Vec<PeerStats>,
     pub trackers: Vec<TrackerStatus>,
     pub metadata_progress: Option<MetadataProgress>,
+    pub diag: MetadataDiag,
     pub error: Option<String>,
 }
 
@@ -144,6 +145,19 @@ pub struct Stats {
 pub struct MetadataProgress {
     pub received: u32,
     pub total: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MetadataDiag {
+    pub peers_connected: u32,
+    pub extension_handshakes: u32,
+    pub extension_handshake_decode_errors: u32,
+    pub ut_metadata_advertisers: u32,
+    pub metadata_sizes: BTreeMap<u64, u32>,
+    pub metadata_requests_sent: u32,
+    pub metadata_data_received: u32,
+    pub metadata_rejects_received: u32,
+    pub peer_close_reasons: BTreeMap<String, u32>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -250,6 +264,7 @@ impl Torrent {
                 received: 0,
                 total: None,
             }),
+            diag: MetadataDiag::default(),
             error: if no_source {
                 Some(
                     "no peer source available: the magnet has no trackers and no x.pe peers"
@@ -332,6 +347,7 @@ impl Torrent {
             peers: Vec::new(),
             trackers: Vec::new(),
             metadata_progress: None,
+            diag: MetadataDiag::default(),
             error: None,
         });
         options.registry.register(meta.info_hash, incoming_tx);
@@ -478,6 +494,7 @@ struct Engine {
     announce_results_tx: mpsc::Sender<TrackerOutcome>,
     primary_tier: Option<usize>,
     pending_pause: bool,
+    diag: MetadataDiag,
 }
 
 #[derive(Clone)]
@@ -749,6 +766,7 @@ impl Engine {
             error: None,
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
+            diag: MetadataDiag::default(),
         }
     }
 
@@ -838,6 +856,7 @@ impl Engine {
             error: None,
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
+            diag: MetadataDiag::default(),
         }
     }
 
@@ -1249,12 +1268,18 @@ impl Engine {
                 &crate::extensions::UtMetadata::Request { piece },
             );
             if let Some(handle) = self.peers.get(&addr) {
-                let _ = handle.commands.try_send(PeerCommand::Extended {
-                    extension_id,
-                    payload,
-                });
-                pending.in_flight.insert(piece, now);
-                in_flight += 1;
+                if handle
+                    .commands
+                    .try_send(PeerCommand::Extended {
+                        extension_id,
+                        payload,
+                    })
+                    .is_ok()
+                {
+                    self.diag.metadata_requests_sent += 1;
+                    pending.in_flight.insert(piece, now);
+                    in_flight += 1;
+                }
             }
         }
         pending.round_robin = round_robin;
@@ -1264,8 +1289,18 @@ impl Engine {
         if extension_id == crate::extensions::EXTENSION_HANDSHAKE_ID {
             let handshake = match crate::extensions::decode_extension_handshake(payload) {
                 Ok(handshake) => handshake,
-                Err(_) => return,
+                Err(_) => {
+                    self.diag.extension_handshake_decode_errors += 1;
+                    return;
+                }
             };
+            self.diag.extension_handshakes += 1;
+            if handshake.ut_metadata.is_some() {
+                self.diag.ut_metadata_advertisers += 1;
+            }
+            if let Some(size) = handshake.metadata_size {
+                *self.diag.metadata_sizes.entry(size).or_default() += 1;
+            }
             if let Some(handle) = self.peers.get_mut(&addr) {
                 handle.extensions = Some(handshake.clone());
             }
@@ -1300,6 +1335,7 @@ impl Engine {
                 self.serve_metadata_piece(addr, piece).await;
             }
             crate::extensions::UtMetadata::Reject { piece } => {
+                self.diag.metadata_rejects_received += 1;
                 if let Some(pending) = &mut self.pending {
                     pending.in_flight.remove(&piece);
                 }
@@ -1309,6 +1345,7 @@ impl Engine {
                 total_size,
                 data,
             } => {
+                self.diag.metadata_data_received += 1;
                 self.accept_metadata_piece(addr, piece, total_size, data)
                     .await;
             }
@@ -1785,6 +1822,7 @@ impl Engine {
     async fn handle_event(&mut self, event: PeerEvent) {
         match event {
             PeerEvent::Handshaken { addr, peer_id } => {
+                self.diag.peers_connected += 1;
                 let duplicate = self
                     .peers
                     .iter()
@@ -1876,7 +1914,9 @@ impl Engine {
                 self.handle_extended_event(addr, extension_id, &payload)
                     .await;
             }
-            PeerEvent::Disconnected { addr } => {
+            PeerEvent::Disconnected { addr, reason } => {
+                let label = reason.unwrap_or_else(|| "unknown".to_string());
+                *self.diag.peer_close_reasons.entry(label).or_default() += 1;
                 let mut direction = None;
                 if let Some(handle) = self.peers.remove(&addr) {
                     direction = Some(handle.direction);
@@ -2265,6 +2305,7 @@ impl Engine {
                 .pending
                 .as_ref()
                 .map(|pending| pending.received_of_total()),
+            diag: self.diag.clone(),
             error: self.error.clone(),
         }
     }

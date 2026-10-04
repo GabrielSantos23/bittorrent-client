@@ -121,6 +121,7 @@ async fn magnet_metadata_and_download_from_live_swarm() {
             );
             break;
         }
+        println!("metadata diag: {:?}", snapshot.diag);
         assert!(
             Instant::now() < metadata_deadline,
             "metadata never arrived: {snapshot:?}"

@@ -122,6 +122,7 @@ pub enum PeerEvent {
     },
     Disconnected {
         addr: SocketAddr,
+        reason: Option<String>,
     },
 }
 
@@ -155,30 +156,36 @@ pub(crate) async fn run_peer_task(
     mut commands: mpsc::Receiver<PeerCommand>,
     events: mpsc::Sender<PeerEvent>,
 ) {
-    let outcome = connect_outgoing(&task).await;
-    if let Ok((connection, remote)) = outcome {
-        let _ = events
-            .send(PeerEvent::Handshaken {
-                addr: task.addr,
-                peer_id: remote.peer_id,
-            })
+    let reason = match connect_outgoing(&task).await {
+        Ok((connection, remote)) => {
+            let _ = events
+                .send(PeerEvent::Handshaken {
+                    addr: task.addr,
+                    peer_id: remote.peer_id,
+                })
+                .await;
+            let served = serve_established(
+                task.addr,
+                connection,
+                task.piece_count,
+                task.extension_handshake,
+                task.have,
+                task.storage,
+                task.uploads,
+                &mut commands,
+                &events,
+                task.config.keep_alive_interval,
+            )
             .await;
-        let _ = serve_established(
-            task.addr,
-            connection,
-            task.piece_count,
-            task.extension_handshake,
-            task.have,
-            task.storage,
-            task.uploads,
-            &mut commands,
-            &events,
-            task.config.keep_alive_interval,
-        )
-        .await;
-    }
+            close_label(served.as_ref().err())
+        }
+        Err(err) => close_label(Some(&err)),
+    };
     let _ = events
-        .send(PeerEvent::Disconnected { addr: task.addr })
+        .send(PeerEvent::Disconnected {
+            addr: task.addr,
+            reason: Some(reason),
+        })
         .await;
 }
 
@@ -194,7 +201,7 @@ pub(crate) async fn run_incoming_peer_task(
             peer_id: task.remote.peer_id,
         })
         .await;
-    let _ = serve_established(
+    let served = serve_established(
         task.addr,
         connection,
         task.piece_count,
@@ -208,8 +215,23 @@ pub(crate) async fn run_incoming_peer_task(
     )
     .await;
     let _ = events
-        .send(PeerEvent::Disconnected { addr: task.addr })
+        .send(PeerEvent::Disconnected {
+            addr: task.addr,
+            reason: Some(close_label(served.as_ref().err())),
+        })
         .await;
+}
+
+fn close_label(err: Option<&PeerError>) -> String {
+    match err {
+        None => "clean".to_string(),
+        Some(PeerError::Io(err)) => format!("io-{:?}", err.kind()),
+        Some(PeerError::Timeout) => "timeout".to_string(),
+        Some(PeerError::ConnectionClosed) => "connection-closed".to_string(),
+        Some(PeerError::OversizedMessage(_)) => "oversized-message".to_string(),
+        Some(PeerError::Handshake(_)) => "handshake".to_string(),
+        Some(PeerError::Message(_)) => "message".to_string(),
+    }
 }
 
 async fn connect_outgoing(
