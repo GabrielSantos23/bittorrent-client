@@ -66,6 +66,8 @@ export default function App() {
 
   useEffect(() => {
     api.list().then(setSummaries).catch(setNotice);
+    api.getListenerStatus().then(setListener).catch((err) => setNotice(String(err)));
+    api.getDhtStatus().then(setDht).catch((err) => setNotice(String(err)));
     const unSummaries = api.onSummaries((next) => {
       setSummaries(next);
       const total = next.reduce((acc, torrent) => acc + torrent.download_rate, 0);

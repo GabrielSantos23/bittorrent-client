@@ -10,6 +10,8 @@ import type { DhtStatus } from "../../../bt-core/bindings/DhtStatus";
 
 export const api = {
   list: () => invoke<TorrentSummary[]>("list_torrents"),
+  getListenerStatus: () => invoke<ListenerStatus>("get_listener_status"),
+  getDhtStatus: () => invoke<DhtStatus>("get_dht_status"),
   add: (path: string) => invoke<string>("add_torrent", { path }),
   addMagnet: (uri: string) => invoke<string>("add_magnet", { uri }),
   pause: (id: string) => invoke<void>("pause_torrent", { id }),

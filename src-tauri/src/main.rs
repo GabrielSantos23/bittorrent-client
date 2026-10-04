@@ -68,6 +68,24 @@ async fn list_torrents(state: tauri::State<'_, AppState>) -> Result<Vec<TorrentS
     Ok(state.session.list().await)
 }
 
+fn listener_snapshot(session: &Session) -> ListenerStatus {
+    session.listener_status().borrow().clone()
+}
+
+fn dht_snapshot(session: &Session) -> DhtStatus {
+    session.dht_status().borrow().clone()
+}
+
+#[tauri::command]
+async fn get_listener_status(state: tauri::State<'_, AppState>) -> Result<ListenerStatus, String> {
+    Ok(listener_snapshot(&state.session))
+}
+
+#[tauri::command]
+async fn get_dht_status(state: tauri::State<'_, AppState>) -> Result<DhtStatus, String> {
+    Ok(dht_snapshot(&state.session))
+}
+
 #[tauri::command]
 async fn pause_torrent(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
     state
@@ -316,6 +334,8 @@ fn main() {
             add_torrent,
             add_magnet,
             list_torrents,
+            get_listener_status,
+            get_dht_status,
             pause_torrent,
             resume_torrent,
             remove_torrent,
@@ -326,4 +346,76 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn wait_for(mut read: impl FnMut() -> Option<ListenerStatus>) -> ListenerStatus {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = read() {
+                return status;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "listener status never settled"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_snapshot_reports_the_bound_port() {
+        let session = Session::spawn_with_options(
+            None,
+            SessionOptions::new(0, 0).with_dht_bootstrap(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let status = wait_for(|| {
+            let snapshot = listener_snapshot(&session);
+            snapshot.active.then_some(snapshot)
+        })
+        .await;
+        assert!(status.port > 0);
+        assert!(status.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn dht_snapshot_reports_the_running_service() {
+        let session = Session::spawn_with_options(
+            None,
+            SessionOptions::new(0, 0).with_dht_bootstrap(Vec::new()),
+        )
+        .await
+        .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = dht_snapshot(&session);
+            if snapshot.active {
+                assert!(snapshot.port > 0);
+                assert!(snapshot.error.is_none());
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "dht status never became active"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dht_snapshot_reports_inactive_when_disabled() {
+        let options = SessionOptions {
+            dht_enabled: false,
+            ..SessionOptions::new(0, 0)
+        };
+        let session = Session::spawn_with_options(None, options).await.unwrap();
+        let snapshot = dht_snapshot(&session);
+        assert!(!snapshot.active);
+        assert_eq!(snapshot.node_count, 0);
+    }
 }
