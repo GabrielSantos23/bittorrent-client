@@ -18,13 +18,15 @@ use crate::dht::node_id::{cmp_distance_to, NodeId, SystemRandom};
 use crate::dht::schedule;
 use crate::dht::state as dht_state;
 use crate::dht::store::PeerStore;
-use crate::dht::table::{OfferOutcome, RoutingTable};
+use crate::dht::table::{OfferOutcome, RoutingTable, K};
 use crate::dht::tokens::TokenVault;
 
 pub const DEFAULT_BOOTSTRAP_ROUTERS: &[&str] = &[
     "router.bittorrent.com:6881",
     "router.utorrent.com:6881",
     "dht.transmissionbt.com:6881",
+    "212.129.33.59:6881",
+    "87.98.162.88:6881",
 ];
 pub const TRANSACTION_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_PENDING_QUERIES: usize = 128;
@@ -883,14 +885,14 @@ impl NodeState {
         }
         if self.fill.active {
             self.maybe_dispatch_fill().await;
-        } else if self.table.is_empty() {
-            if now.saturating_sub(self.last_bootstrap_ms.unwrap_or(0)) >= REBOOTSTRAP_IDLE_MS
+        } else {
+            self.refresh_stale_buckets(now).await;
+            if self.table.len() < K
+                && now.saturating_sub(self.last_bootstrap_ms.unwrap_or(0)) >= REBOOTSTRAP_IDLE_MS
                 && !self.bootstrap.is_empty()
             {
                 self.bootstrap().await;
             }
-        } else {
-            self.refresh_stale_buckets(now).await;
         }
         let mut to_finish: Vec<u32> = Vec::new();
         for id in self.lookups.keys().copied().collect::<Vec<_>>() {
@@ -939,7 +941,7 @@ impl NodeState {
         let targets = resolve_bootstrap(&self.bootstrap).await;
         self.fill.active = true;
         for addr in targets.into_iter().take(MAX_BOOTSTRAP_TARGETS) {
-            if !self.filter.allows(addr) || self.queried.contains(&addr) {
+            if !self.filter.allows(addr) {
                 continue;
             }
             self.queried.insert(addr);
