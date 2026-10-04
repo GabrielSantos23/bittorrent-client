@@ -31,6 +31,8 @@ interface SettingsForm {
   downloadDir: string;
   listenPort: number;
   uploadLimitBps: number;
+  dhtEnabled: boolean;
+  dhtPort: number;
 }
 
 function toForm(settings: Settings): SettingsForm {
@@ -38,6 +40,8 @@ function toForm(settings: Settings): SettingsForm {
     downloadDir: settings.download_dir,
     listenPort: settings.listen_port,
     uploadLimitBps: settings.upload_limit_bps,
+    dhtEnabled: settings.dht_enabled,
+    dhtPort: settings.dht_port,
   };
 }
 
@@ -168,6 +172,8 @@ export default function App() {
         downloadDir: settingsForm.downloadDir,
         listenPort: settingsForm.listenPort,
         uploadLimitBps: settingsForm.uploadLimitBps,
+        dhtEnabled: settingsForm.dhtEnabled,
+        dhtPort: settingsForm.dhtPort,
       })
       .then(() => setSettingsOpen(false))
       .catch((err) => setSettingsError(String(err)));
@@ -359,6 +365,22 @@ export default function App() {
                 />
               </div>
               <div className="grid gap-2">
+                <Label htmlFor="dht-port">DHT port</Label>
+                <Input
+                  id="dht-port"
+                  type="number"
+                  min={1024}
+                  max={65535}
+                  value={settingsForm.dhtPort}
+                  onChange={(event) =>
+                    setSettingsForm({
+                      ...settingsForm,
+                      dhtPort: Number(event.target.value),
+                    })
+                  }
+                />
+              </div>
+              <div className="grid gap-2">
                 <Label htmlFor="upload-limit">Upload limit (B/s, 0 = unlimited)</Label>
                 <Input
                   id="upload-limit"
@@ -373,6 +395,18 @@ export default function App() {
                   }
                 />
               </div>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Checkbox
+                  checked={settingsForm.dhtEnabled}
+                  onCheckedChange={(checked) =>
+                    setSettingsForm({
+                      ...settingsForm,
+                      dhtEnabled: checked === true,
+                    })
+                  }
+                />
+                Enable DHT peer discovery (BEP 5)
+              </label>
               {settingsError !== null && (
                 <p role="alert" className="text-sm text-destructive">
                   {settingsError}

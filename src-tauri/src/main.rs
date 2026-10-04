@@ -117,11 +117,15 @@ async fn set_settings(
     download_dir: String,
     listen_port: u16,
     upload_limit_bps: u64,
+    dht_enabled: bool,
+    dht_port: u16,
 ) -> Result<(), String> {
     let settings = Settings {
         download_dir: PathBuf::from(download_dir),
         listen_port,
         upload_limit_bps,
+        dht_enabled,
+        dht_port,
     };
     let path = state.data_dir.join("settings.json");
     state
@@ -132,6 +136,11 @@ async fn set_settings(
     state
         .session
         .set_listen_port(listen_port)
+        .await
+        .map_err(|err| err.to_string())?;
+    state
+        .session
+        .set_dht(dht_enabled, dht_port)
         .await
         .map_err(|err| err.to_string())?;
     save_settings(&path, &settings).map_err(|err| err.to_string())?;
@@ -242,7 +251,13 @@ fn main() {
             std::fs::create_dir_all(&settings.download_dir)?;
             let session = tauri::async_runtime::block_on(Session::spawn_with_options(
                 Some(data_dir.join("session")),
-                SessionOptions::new(settings.listen_port, settings.upload_limit_bps),
+                SessionOptions::new(settings.listen_port, settings.upload_limit_bps)
+                    .with_dht_bootstrap(
+                        bt_core::dht::DEFAULT_BOOTSTRAP_ROUTERS
+                            .iter()
+                            .map(|host| host.to_string())
+                            .collect(),
+                    ),
             ))?;
             let summaries = session.subscribe();
             let (selected_tx, selected_rx) = watch::channel(None);

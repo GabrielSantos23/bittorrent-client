@@ -21,6 +21,8 @@ export const api = {
     downloadDir: string;
     listenPort: number;
     uploadLimitBps: number;
+    dhtEnabled: boolean;
+    dhtPort: number;
   }) => invoke<void>("set_settings", settings),
   openOutputDir: (id: string) => invoke<void>("open_output_dir", { id }),
   onSummaries: (handler: (summaries: TorrentSummary[]) => void) =>

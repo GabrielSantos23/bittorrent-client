@@ -14,10 +14,18 @@ pub struct Settings {
     #[serde(default)]
     #[ts(type = "number")]
     pub upload_limit_bps: u64,
+    #[serde(default = "default_dht_enabled")]
+    pub dht_enabled: bool,
+    #[serde(default = "default_listen_port")]
+    pub dht_port: u16,
 }
 
 fn default_listen_port() -> u16 {
     DEFAULT_LISTEN_PORT
+}
+
+fn default_dht_enabled() -> bool {
+    true
 }
 
 pub fn default_settings(data_dir: &Path) -> Settings {
@@ -25,6 +33,8 @@ pub fn default_settings(data_dir: &Path) -> Settings {
         download_dir: data_dir.join("downloads"),
         listen_port: DEFAULT_LISTEN_PORT,
         upload_limit_bps: 0,
+        dht_enabled: true,
+        dht_port: DEFAULT_LISTEN_PORT,
     }
 }
 
@@ -69,6 +79,8 @@ mod tests {
             download_dir: PathBuf::from("D:\\downloads"),
             listen_port: 6889,
             upload_limit_bps: 1024,
+            dht_enabled: false,
+            dht_port: 6890,
         }
     }
 
@@ -91,6 +103,8 @@ mod tests {
         let settings = load_settings(&path).unwrap();
         assert_eq!(settings.listen_port, DEFAULT_LISTEN_PORT);
         assert_eq!(settings.upload_limit_bps, 0);
+        assert!(settings.dht_enabled);
+        assert_eq!(settings.dht_port, DEFAULT_LISTEN_PORT);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

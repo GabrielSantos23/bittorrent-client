@@ -10,6 +10,8 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::spawn_blocking;
 
+use crate::dht::{DhtHandle, DhtOptions, DhtStatus};
+use crate::dht::{NodeId, SystemRandom};
 use crate::engine::{PeerStats, State, Torrent, TrackerStatus};
 use crate::listener::{self, Listener, ListenerOptions, ListenerStatus, Registry};
 use crate::ratelimit::UploadBucket;
@@ -30,6 +32,9 @@ pub struct SessionOptions {
     pub optimistic_interval: Duration,
     pub dial: Arc<dyn crate::engine::Dial>,
     pub bootstrap_peers: Vec<std::net::SocketAddr>,
+    pub dht_enabled: bool,
+    pub dht_port: u16,
+    pub dht_bootstrap: Vec<String>,
 }
 
 impl SessionOptions {
@@ -42,7 +47,15 @@ impl SessionOptions {
             optimistic_interval: Duration::from_secs(30),
             dial: Arc::new(crate::engine::TcpDial::new(connect_timeout)),
             bootstrap_peers: Vec::new(),
+            dht_enabled: true,
+            dht_port: listen_port,
+            dht_bootstrap: Vec::new(),
         }
+    }
+
+    pub fn with_dht_bootstrap(mut self, bootstrap: Vec<String>) -> SessionOptions {
+        self.dht_bootstrap = bootstrap;
+        self
     }
 }
 
@@ -132,6 +145,11 @@ enum SessionCommand {
         port: u16,
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
+    SetDht {
+        enabled: bool,
+        port: u16,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -142,7 +160,28 @@ pub struct Session {
     commands: mpsc::Sender<SessionCommand>,
     summaries: watch::Receiver<Vec<TorrentSummary>>,
     listener_status: watch::Receiver<ListenerStatus>,
+    dht_status: watch::Receiver<DhtStatus>,
     restore_errors: Arc<Vec<String>>,
+}
+
+fn spawn_dht_status_forwarder(
+    status: Option<watch::Receiver<DhtStatus>>,
+    status_tx: watch::Sender<DhtStatus>,
+    configured_port: u16,
+) -> tokio::task::AbortHandle {
+    let task = tokio::spawn(async move {
+        let Some(mut status) = status else {
+            let _ = status_tx.send(DhtStatus::inactive(configured_port, None));
+            return;
+        };
+        loop {
+            let _ = status_tx.send(status.borrow().clone());
+            if status.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+    task.abort_handle()
 }
 
 fn initial_listener_status(port: u16) -> ListenerStatus {
@@ -205,6 +244,26 @@ impl Session {
         persistence: Option<PathBuf>,
         options: SessionOptions,
     ) -> Result<Session, SessionError> {
+        let (dht_status_tx, dht_status) =
+            watch::channel(DhtStatus::inactive(options.dht_port, None));
+        let dht_node_id = NodeId::random(&SystemRandom);
+        let (dht, dht_forwarder) = if options.dht_enabled {
+            let handle = crate::dht::spawn(
+                DhtOptions::new(options.dht_port, dht_node_id)
+                    .with_bootstrap(options.dht_bootstrap.clone()),
+            );
+            let forwarder = spawn_dht_status_forwarder(
+                Some(handle.status()),
+                dht_status_tx.clone(),
+                options.dht_port,
+            );
+            (Some(handle), forwarder)
+        } else {
+            (
+                None,
+                spawn_dht_status_forwarder(None, dht_status_tx.clone(), options.dht_port),
+            )
+        };
         let registry = Arc::new(Registry::default());
         let (status_tx, listener_status) =
             watch::channel(initial_listener_status(options.listen_port));
@@ -330,18 +389,41 @@ impl Session {
             listener,
             status_tx,
             listener_forwarder,
+            dht,
+            dht_forwarder,
+            dht_status_tx,
+            dht_bootstrap: options.dht_bootstrap,
+            dht_node_id,
         };
         tokio::spawn(actor.run());
         Ok(Session {
             commands,
             summaries: summaries_rx,
             listener_status,
+            dht_status,
             restore_errors,
         })
     }
 
     pub fn listener_status(&self) -> watch::Receiver<ListenerStatus> {
         self.listener_status.clone()
+    }
+
+    pub fn dht_status(&self) -> watch::Receiver<DhtStatus> {
+        self.dht_status.clone()
+    }
+
+    pub async fn set_dht(&self, enabled: bool, port: u16) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::SetDht {
+                enabled,
+                port,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
     }
 
     pub async fn set_upload_limit(&self, bps: u64) -> Result<(), SessionError> {
@@ -498,6 +580,11 @@ struct SessionActor {
     listener: Listener,
     status_tx: watch::Sender<ListenerStatus>,
     listener_forwarder: tokio::task::AbortHandle,
+    dht: Option<DhtHandle>,
+    dht_forwarder: tokio::task::AbortHandle,
+    dht_status_tx: watch::Sender<DhtStatus>,
+    dht_bootstrap: Vec<String>,
+    dht_node_id: NodeId,
 }
 
 impl SessionActor {
@@ -521,6 +608,30 @@ impl SessionActor {
             self.wiring.announce_port.clone(),
         );
         self.listener = listener;
+        Ok(())
+    }
+
+    async fn rebind_dht(&mut self, enabled: bool, port: u16) -> Result<(), SessionError> {
+        if !enabled {
+            if let Some(dht) = self.dht.take() {
+                dht.shutdown();
+            }
+            self.dht_forwarder.abort();
+            self.dht_forwarder = spawn_dht_status_forwarder(None, self.dht_status_tx.clone(), port);
+            return Ok(());
+        }
+        let options =
+            DhtOptions::new(port, self.dht_node_id).with_bootstrap(self.dht_bootstrap.clone());
+        let handle = crate::dht::bind(options)
+            .await
+            .map_err(|err| SessionError::Dht(format!("cannot bind DHT port {port}: {err}")))?;
+        self.dht_forwarder.abort();
+        if let Some(old) = self.dht.take() {
+            old.shutdown();
+        }
+        self.dht_forwarder =
+            spawn_dht_status_forwarder(Some(handle.status()), self.dht_status_tx.clone(), port);
+        self.dht = Some(handle);
         Ok(())
     }
 }
@@ -593,6 +704,14 @@ impl SessionActor {
                     .rebind_listener(port)
                     .await
                     .map_err(SessionError::Listen);
+                let _ = reply.send(result);
+            }
+            SessionCommand::SetDht {
+                enabled,
+                port,
+                reply,
+            } => {
+                let result = self.rebind_dht(enabled, port).await;
                 let _ = reply.send(result);
             }
             SessionCommand::Shutdown { reply } => {
@@ -738,6 +857,9 @@ impl SessionActor {
         }
         self.persist();
         self.listener.shutdown();
+        if let Some(dht) = self.dht.take() {
+            dht.shutdown();
+        }
         let _ = self.summaries_tx.send(Vec::new());
     }
 

@@ -407,3 +407,116 @@ async fn duplicate_magnet_is_rejected() {
     );
     session.shutdown().await.unwrap();
 }
+
+async fn wait_for_dht_status(
+    mut rx: tokio::sync::watch::Receiver<bt_core::dht::DhtStatus>,
+    condition: impl Fn(&bt_core::dht::DhtStatus) -> bool,
+    seconds: u64,
+) -> bt_core::dht::DhtStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let snapshot = rx.borrow().clone();
+        if condition(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dht status condition not met within {seconds}s: {snapshot:?}"
+        );
+        if rx.changed().await.is_err() {
+            panic!("dht status channel closed");
+        }
+    }
+}
+
+fn blocked_udp_port() -> u16 {
+    let blocker = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0)).unwrap();
+    let port = blocker.local_addr().unwrap().port();
+    std::mem::forget(blocker);
+    port
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_spawns_active_and_follows_the_settings() {
+    let session = Session::spawn_with_options(None, SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    let active = wait_for_dht_status(session.dht_status(), |s| s.active, 10).await;
+    assert_ne!(active.port, 0, "port 0 must bind an ephemeral port");
+    assert_eq!(active.node_count, 0, "no bootstrap hosts means no nodes");
+
+    session.set_dht(true, 0).await.unwrap();
+    let first = active.port;
+    let rebound =
+        wait_for_dht_status(session.dht_status(), |s| s.active && s.port != first, 10).await;
+    assert_ne!(rebound.port, first);
+
+    session.set_dht(false, rebound.port).await.unwrap();
+    let disabled = wait_for_dht_status(session.dht_status(), |s| !s.active, 10).await;
+    assert!(disabled.error.is_none(), "disabling is not an error");
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_bind_failure_degrades_gracefully_and_recovers() {
+    let blocked = blocked_udp_port();
+    let mut options = SessionOptions::new(0, 0);
+    options.dht_port = blocked;
+    let session = Session::spawn_with_options(None, options).await.unwrap();
+    let failed =
+        wait_for_dht_status(session.dht_status(), |s| !s.active && s.error.is_some(), 10).await;
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains(&blocked.to_string()),
+        "the status must name the port that could not be bound: {failed:?}"
+    );
+
+    session.set_dht(true, 0).await.unwrap();
+    let recovered = wait_for_dht_status(session.dht_status(), |s| s.active, 10).await;
+    assert_ne!(recovered.port, blocked);
+    assert!(recovered.error.is_none());
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_dht_port_binds_the_new_socket_before_swapping() {
+    let session = Session::spawn_with_options(None, SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    let active = wait_for_dht_status(session.dht_status(), |s| s.active, 10).await;
+    let current = active.port;
+
+    let blocked = blocked_udp_port();
+    let outcome = session.set_dht(true, blocked).await;
+    assert!(outcome.is_err(), "binding a taken port must fail");
+    let still = session.dht_status().borrow().clone();
+    assert!(still.active, "the old socket must keep running");
+    assert_eq!(still.port, current);
+
+    let changed = session.set_dht(true, 0).await;
+    assert!(changed.is_ok());
+    wait_for_dht_status(
+        session.dht_status(),
+        move |s| s.active && s.port != current,
+        10,
+    )
+    .await;
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_disabled_at_spawn_reports_inactive_without_error() {
+    let mut options = SessionOptions::new(0, 0);
+    options.dht_enabled = false;
+    let session = Session::spawn_with_options(None, options).await.unwrap();
+    let snapshot = session.dht_status().borrow().clone();
+    assert!(!snapshot.active);
+    assert!(snapshot.error.is_none());
+    assert_eq!(snapshot.node_count, 0);
+    session.set_dht(true, 0).await.unwrap();
+    wait_for_dht_status(session.dht_status(), |s| s.active, 10).await;
+    session.shutdown().await.unwrap();
+}
