@@ -319,3 +319,91 @@ async fn failed_rebind_keeps_original_listener_working() {
     }
     session.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pending_magnet_persists_and_restores() {
+    let data = test_data();
+    let bytes = torrent_bytes(&data);
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
+    let info_hash_hex = bt_core::hex::encode(&meta.info_hash);
+    let data_dir = temp_dir("magnet-persist-data");
+    let out = temp_dir("magnet-persist-out");
+    let dial = Arc::new(FakeDial::new(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![],
+    ));
+    let session = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![])
+        .await
+        .unwrap();
+    let uri = format!("magnet:?xt=urn:btih:{info_hash_hex}&dn=e2e.bin");
+    let id = session.add_magnet(&uri, out.clone()).await.unwrap();
+    assert_eq!(id, info_hash_hex);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let persisted = data_dir.join("session.json");
+        if persisted.exists() {
+            let text = std::fs::read_to_string(&persisted).unwrap();
+            if text.contains("magnet") && text.contains(&uri) {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pending magnet was never persisted"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    session.shutdown().await.unwrap();
+
+    let restored = Session::spawn(Some(data_dir.clone())).await.unwrap();
+    assert!(
+        restored.restore_errors().is_empty(),
+        "unexpected restore errors: {:?}",
+        restored.restore_errors()
+    );
+    let summaries = wait_for(&restored.subscribe(), |s| !s.is_empty(), 10).await;
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].id, info_hash_hex);
+    assert_eq!(summaries[0].output_dir, out);
+    assert_eq!(summaries[0].state, State::FetchingMetadata);
+    assert_eq!(summaries[0].name, "e2e.bin");
+    restored.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_magnet_is_rejected() {
+    let data = test_data();
+    let bytes = torrent_bytes(&data);
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
+    let info_hash_hex = bt_core::hex::encode(&meta.info_hash);
+    let uri = format!("magnet:?xt=urn:btih:{info_hash_hex}&dn=e2e.bin");
+    let out = temp_dir("magnet-dup-out");
+
+    let dial = Arc::new(FakeDial::new(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![],
+    ));
+    let session = Session::spawn_with_dial(None, dial, vec![]).await.unwrap();
+
+    let id = session.add_magnet(&uri, out.clone()).await.unwrap();
+    assert_eq!(id, info_hash_hex);
+    assert!(matches!(
+        session.add_magnet(&uri, out.clone()).await,
+        Err(SessionError::Duplicate(_))
+    ));
+
+    session.remove(&id, false).await.unwrap();
+    session.add_torrent(&bytes, out.clone()).await.unwrap();
+    assert!(
+        matches!(
+            session.add_magnet(&uri, out.clone()).await,
+            Err(SessionError::Duplicate(_))
+        ),
+        "a magnet must be rejected when a torrent with the same info hash exists"
+    );
+    session.shutdown().await.unwrap();
+}

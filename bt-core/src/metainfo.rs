@@ -14,6 +14,7 @@ pub struct MetaInfo {
     pub comment: Option<String>,
     pub created_by: Option<String>,
     pub creation_date: Option<i64>,
+    pub raw: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +82,7 @@ impl MetaInfo {
             comment,
             created_by,
             creation_date,
+            raw: raw.to_vec(),
         })
     }
 }

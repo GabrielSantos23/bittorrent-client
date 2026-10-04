@@ -609,6 +609,7 @@ mod tests {
             comment: None,
             created_by: None,
             creation_date: None,
+            raw: Vec::new(),
         };
         assert_eq!(
             candidate_urls(&meta),

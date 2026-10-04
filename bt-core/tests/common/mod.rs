@@ -23,14 +23,19 @@ pub const LEECHER_PEER_ID: [u8; 20] = *b"-LC0000-leecher00001";
 pub const STRICT_UT_METADATA_ID: u8 = 7;
 
 fn strict_handshake_payload(metadata_size: u64) -> Vec<u8> {
-    let mut m: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
-    m.insert(
-        b"ut_metadata".to_vec(),
-        Value::Int(STRICT_UT_METADATA_ID as i64),
-    );
+    strict_handshake_payload_for(Some(metadata_size), Some(STRICT_UT_METADATA_ID))
+}
+
+fn strict_handshake_payload_for(metadata_size: Option<u64>, ut_metadata: Option<u8>) -> Vec<u8> {
     let mut root: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
-    root.insert(b"m".to_vec(), Value::Dict(m));
-    root.insert(b"metadata_size".to_vec(), Value::Int(metadata_size as i64));
+    if let Some(id) = ut_metadata {
+        let mut m: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+        m.insert(b"ut_metadata".to_vec(), Value::Int(id as i64));
+        root.insert(b"m".to_vec(), Value::Dict(m));
+    }
+    if let Some(size) = metadata_size {
+        root.insert(b"metadata_size".to_vec(), Value::Int(size as i64));
+    }
     root.insert(b"v".to_vec(), Value::Bytes(b"strict-fake".to_vec()));
     bencode::encode(&Value::Dict(root))
 }
@@ -61,6 +66,15 @@ fn strict_request_piece(payload: &[u8]) -> Option<u32> {
 }
 
 fn strict_data_payload(piece: u32, info_dict: &[u8]) -> Option<Vec<u8>> {
+    strict_data_payload_with(piece, info_dict, info_dict.len() as u64, false)
+}
+
+fn strict_data_payload_with(
+    piece: u32,
+    info_dict: &[u8],
+    total_size: u64,
+    corrupt: bool,
+) -> Option<Vec<u8>> {
     let start = (piece as usize).saturating_mul(PIECE_LENGTH);
     if start >= info_dict.len() {
         return None;
@@ -69,9 +83,13 @@ fn strict_data_payload(piece: u32, info_dict: &[u8]) -> Option<Vec<u8>> {
     let mut dict: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
     dict.insert(b"msg_type".to_vec(), Value::Int(1));
     dict.insert(b"piece".to_vec(), Value::Int(piece as i64));
-    dict.insert(b"total_size".to_vec(), Value::Int(info_dict.len() as i64));
+    dict.insert(b"total_size".to_vec(), Value::Int(total_size as i64));
+    let mut block = info_dict[start..end].to_vec();
+    if corrupt {
+        block[0] ^= 0xFF;
+    }
     let mut payload = bencode::encode(&Value::Dict(dict));
-    payload.extend_from_slice(&info_dict[start..end]);
+    payload.extend_from_slice(&block);
     Some(payload)
 }
 
@@ -100,6 +118,25 @@ pub struct SeederReport {
     pub blocks_served: usize,
     pub cancels_received: usize,
     pub last_piece_requests: usize,
+    pub metadata_requests_received: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum MetadataMode {
+    #[default]
+    Good,
+    Corrupt(u32),
+    Reject(u32),
+    RejectAll,
+    NoUtMetadata,
+    ConflictingDataSize(u32),
+    OversizedHandshake,
+    ZeroHandshake,
+    LateHandshake {
+        delay: Duration,
+        size_delta: i64,
+    },
+    UnsolicitedExtras,
 }
 
 #[derive(Debug, Clone)]
@@ -361,10 +398,12 @@ pub struct FakeDial {
     info_hash: [u8; 20],
     data: Arc<Vec<u8>>,
     piece_count: usize,
+    file_piece_length: usize,
     peers: Mutex<HashMap<SocketAddr, SeederKind>>,
     reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
     dial_counts: Arc<Mutex<HashMap<SocketAddr, usize>>>,
     metadata: Option<Arc<Vec<u8>>>,
+    metadata_modes: HashMap<SocketAddr, MetadataMode>,
 }
 
 impl FakeDial {
@@ -378,10 +417,12 @@ impl FakeDial {
             info_hash,
             data,
             piece_count,
+            file_piece_length: PIECE_LENGTH,
             peers: Mutex::new(peers.into_iter().collect()),
             reports: None,
             dial_counts: Arc::new(Mutex::new(HashMap::new())),
             metadata: None,
+            metadata_modes: HashMap::new(),
         }
     }
 
@@ -396,11 +437,37 @@ impl FakeDial {
             info_hash,
             data,
             piece_count,
+            file_piece_length: PIECE_LENGTH,
             peers: Mutex::new(peers.into_iter().collect()),
             reports: None,
             dial_counts: Arc::new(Mutex::new(HashMap::new())),
             metadata: Some(metadata),
+            metadata_modes: HashMap::new(),
         }
+    }
+
+    pub fn with_metadata_modes(
+        info_hash: [u8; 20],
+        data: Arc<Vec<u8>>,
+        piece_count: usize,
+        file_piece_length: usize,
+        peers: Vec<(SocketAddr, SeederKind)>,
+        metadata: Arc<Vec<u8>>,
+        modes: Vec<(SocketAddr, MetadataMode)>,
+    ) -> (FakeDial, tokio::sync::mpsc::Receiver<SeederReport>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let dial = FakeDial {
+            info_hash,
+            data,
+            piece_count,
+            file_piece_length,
+            peers: Mutex::new(peers.into_iter().collect()),
+            reports: Some(tx),
+            dial_counts: Arc::new(Mutex::new(HashMap::new())),
+            metadata: Some(metadata),
+            metadata_modes: modes.into_iter().collect(),
+        };
+        (dial, rx)
     }
 
     pub fn dial_count(&self, addr: &SocketAddr) -> usize {
@@ -425,10 +492,12 @@ impl FakeDial {
             info_hash,
             data,
             piece_count,
+            file_piece_length: PIECE_LENGTH,
             peers: Mutex::new(peers.into_iter().collect()),
             reports: Some(tx),
             dial_counts: Arc::new(Mutex::new(HashMap::new())),
             metadata: None,
+            metadata_modes: HashMap::new(),
         };
         (dial, rx)
     }
@@ -440,9 +509,11 @@ impl Dial for FakeDial {
         addr: SocketAddr,
     ) -> Pin<Box<dyn Future<Output = std::io::Result<BoxedStream>> + Send>> {
         let kind = self.peers.lock().unwrap().get(&addr).copied();
+        let mode = self.metadata_modes.get(&addr).cloned().unwrap_or_default();
         let info_hash = self.info_hash;
         let data = self.data.clone();
         let piece_count = self.piece_count;
+        let file_piece_length = self.file_piece_length;
         let reports = self.reports.clone();
         let dial_counts = self.dial_counts.clone();
         let metadata = self.metadata.clone();
@@ -461,8 +532,10 @@ impl Dial for FakeDial {
                 info_hash,
                 data,
                 piece_count,
+                file_piece_length,
                 kind,
                 metadata,
+                mode,
                 reports,
             ));
             Ok(Box::new(client_side) as BoxedStream)
@@ -470,16 +543,221 @@ impl Dial for FakeDial {
     }
 }
 
+pub struct MetadataLeecherReport {
+    pub saw_client_handshake: bool,
+    pub data: Vec<(u32, u64, Vec<u8>)>,
+    pub rejects: Vec<u32>,
+}
+
+const METADATA_LEECHER_UT_METADATA_ID: u8 = 9;
+
+fn strict_request_payload(piece: u32) -> Vec<u8> {
+    let mut dict: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+    dict.insert(b"msg_type".to_vec(), Value::Int(0));
+    dict.insert(b"piece".to_vec(), Value::Int(piece as i64));
+    bencode::encode(&Value::Dict(dict))
+}
+
+pub struct FakeMetadataLeecherDial {
+    info_hash: [u8; 20],
+    piece_count: usize,
+    requests: Vec<u32>,
+    reports: tokio::sync::mpsc::Sender<MetadataLeecherReport>,
+}
+
+impl FakeMetadataLeecherDial {
+    pub fn new(
+        info_hash: [u8; 20],
+        piece_count: usize,
+        requests: Vec<u32>,
+    ) -> (
+        FakeMetadataLeecherDial,
+        tokio::sync::mpsc::Receiver<MetadataLeecherReport>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        (
+            FakeMetadataLeecherDial {
+                info_hash,
+                piece_count,
+                requests,
+                reports: tx,
+            },
+            rx,
+        )
+    }
+}
+
+impl Dial for FakeMetadataLeecherDial {
+    fn dial(
+        &self,
+        _addr: SocketAddr,
+    ) -> Pin<Box<dyn Future<Output = std::io::Result<BoxedStream>> + Send>> {
+        let info_hash = self.info_hash;
+        let piece_count = self.piece_count;
+        let requests = self.requests.clone();
+        let reports = self.reports.clone();
+        Box::pin(async move {
+            let (client_side, server_side) = duplex(256 * 1024);
+            tokio::spawn(async move {
+                let report =
+                    run_metadata_leecher(Box::new(server_side), info_hash, piece_count, requests)
+                        .await;
+                let _ = reports.send(report).await;
+            });
+            Ok(Box::new(client_side) as BoxedStream)
+        })
+    }
+}
+
+async fn run_metadata_leecher(
+    stream: BoxedStream,
+    info_hash: [u8; 20],
+    piece_count: usize,
+    requests: Vec<u32>,
+) -> MetadataLeecherReport {
+    let mut report = MetadataLeecherReport {
+        saw_client_handshake: false,
+        data: Vec::new(),
+        rejects: Vec::new(),
+    };
+    let mut raw: BoxedStream = stream;
+    let mut buffer = [0u8; 68];
+    if raw.read_exact(&mut buffer).await.is_err() {
+        return report;
+    }
+    let remote = match handshake::decode(&buffer) {
+        Ok(remote) => remote,
+        Err(_) => return report,
+    };
+    if remote.info_hash != info_hash {
+        return report;
+    }
+    let mut reserved = [0u8; 8];
+    reserved[5] |= 0x10;
+    let reply = handshake::encode(&Handshake {
+        info_hash,
+        reserved,
+        peer_id: LEECHER_PEER_ID,
+    });
+    if raw.write_all(&reply).await.is_err() {
+        return report;
+    }
+    let conn_config = PeerConfig {
+        read_timeout: Duration::from_secs(20),
+        ..PeerConfig::default()
+    };
+    let mut conn = PeerConnection::new(raw, remote, Some(piece_count), conn_config);
+    if conn
+        .write_message(&Message::Extended {
+            extension_id: bt_core::extensions::EXTENSION_HANDSHAKE_ID,
+            payload: strict_handshake_payload_for(None, Some(METADATA_LEECHER_UT_METADATA_ID)),
+        })
+        .await
+        .is_err()
+    {
+        return report;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut client_id: Option<u8> = None;
+    while client_id.is_none() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return report;
+        }
+        let message = match tokio::time::timeout(remaining, conn.read_message()).await {
+            Ok(Ok(message)) => message,
+            _ => return report,
+        };
+        if let Message::Extended {
+            extension_id: bt_core::extensions::EXTENSION_HANDSHAKE_ID,
+            payload,
+        } = message
+        {
+            report.saw_client_handshake = true;
+            client_id = strict_advertised_ut_metadata(&payload);
+        }
+    }
+    let client_id = client_id.unwrap_or(0);
+    for piece in requests {
+        if conn
+            .write_message(&Message::Extended {
+                extension_id: client_id,
+                payload: strict_request_payload(piece),
+            })
+            .await
+            .is_err()
+        {
+            return report;
+        }
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return report;
+            }
+            let message = match tokio::time::timeout(remaining, conn.read_message()).await {
+                Ok(Ok(message)) => message,
+                _ => return report,
+            };
+            let Message::Extended {
+                extension_id,
+                payload,
+            } = message
+            else {
+                continue;
+            };
+            if extension_id != METADATA_LEECHER_UT_METADATA_ID {
+                continue;
+            }
+            if payload.first() != Some(&b'd') {
+                return report;
+            }
+            let Ok((value, dict_end)) = bencode::decode_prefix(&payload) else {
+                return report;
+            };
+            let Some(dict) = value.as_dict() else {
+                return report;
+            };
+            let msg_type = dict
+                .get(b"msg_type".as_slice())
+                .and_then(Value::as_int)
+                .unwrap_or(-1);
+            let response_piece = dict
+                .get(b"piece".as_slice())
+                .and_then(Value::as_int)
+                .unwrap_or(-1) as u32;
+            if msg_type == 1 {
+                let total_size = dict
+                    .get(b"total_size".as_slice())
+                    .and_then(Value::as_int)
+                    .unwrap_or(0);
+                report.data.push((
+                    response_piece,
+                    total_size as u64,
+                    payload[dict_end..].to_vec(),
+                ));
+            } else if msg_type == 2 {
+                report.rejects.push(response_piece);
+            }
+            break;
+        }
+    }
+    report
+}
+
 pub fn torrent_bytes(data: &[u8]) -> Vec<u8> {
+    torrent_bytes_with_piece_length(data, PIECE_LENGTH)
+}
+
+pub fn torrent_bytes_with_piece_length(data: &[u8], piece_length: usize) -> Vec<u8> {
     let mut pieces = Vec::new();
-    for chunk in data.chunks(PIECE_LENGTH) {
+    for chunk in data.chunks(piece_length) {
         let digest: [u8; 20] = Sha1::digest(chunk).into();
         pieces.extend_from_slice(&digest);
     }
     let mut info = std::collections::BTreeMap::new();
     info.insert(b"length".to_vec(), Value::Int(data.len() as i64));
     info.insert(b"name".to_vec(), Value::Bytes(b"e2e.bin".to_vec()));
-    info.insert(b"piece length".to_vec(), Value::Int(PIECE_LENGTH as i64));
+    info.insert(b"piece length".to_vec(), Value::Int(piece_length as i64));
     info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
     let mut root = std::collections::BTreeMap::new();
     root.insert(b"info".to_vec(), Value::Dict(info));
@@ -487,20 +765,18 @@ pub fn torrent_bytes(data: &[u8]) -> Vec<u8> {
 }
 
 pub fn torrent_meta(data: &[u8]) -> MetaInfo {
-    let mut pieces = Vec::new();
-    for chunk in data.chunks(PIECE_LENGTH) {
-        let digest: [u8; 20] = Sha1::digest(chunk).into();
-        pieces.extend_from_slice(&digest);
-    }
-    let mut info = std::collections::BTreeMap::new();
-    info.insert(b"length".to_vec(), Value::Int(data.len() as i64));
-    info.insert(b"name".to_vec(), Value::Bytes(b"e2e.bin".to_vec()));
-    info.insert(b"piece length".to_vec(), Value::Int(PIECE_LENGTH as i64));
-    info.insert(b"pieces".to_vec(), Value::Bytes(pieces));
-    let mut root = std::collections::BTreeMap::new();
-    root.insert(b"info".to_vec(), Value::Dict(info));
-    let raw = bencode::encode(&Value::Dict(root));
+    torrent_meta_with_piece_length(data, PIECE_LENGTH)
+}
+
+pub fn torrent_meta_with_piece_length(data: &[u8], piece_length: usize) -> MetaInfo {
+    let raw = torrent_bytes_with_piece_length(data, piece_length);
     MetaInfo::from_bytes(&raw).unwrap()
+}
+
+pub fn metadata_multi_piece_data() -> Arc<Vec<u8>> {
+    let file_pieces = 2456usize;
+    let length = file_pieces * 1024;
+    Arc::new((0..length).map(|i| (i % 251) as u8).collect())
 }
 
 pub fn test_data() -> Arc<Vec<u8>> {
@@ -520,8 +796,10 @@ async fn run_seeder(
     info_hash: [u8; 20],
     data: Arc<Vec<u8>>,
     piece_count: usize,
+    file_piece_length: usize,
     kind: SeederKind,
     metadata: Option<Arc<Vec<u8>>>,
+    mode: MetadataMode,
     reports: Option<tokio::sync::mpsc::Sender<SeederReport>>,
 ) {
     let mut report = SeederReport {
@@ -529,14 +807,17 @@ async fn run_seeder(
         blocks_served: 0,
         cancels_received: 0,
         last_piece_requests: 0,
+        metadata_requests_received: 0,
     };
     serve_seeder(
         stream,
         info_hash,
         data,
         piece_count,
+        file_piece_length,
         kind,
         metadata,
+        mode,
         &mut report,
     )
     .await;
@@ -545,13 +826,16 @@ async fn run_seeder(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_seeder(
     stream: BoxedStream,
     info_hash: [u8; 20],
     data: Arc<Vec<u8>>,
     piece_count: usize,
+    file_piece_length: usize,
     kind: SeederKind,
     metadata: Option<Arc<Vec<u8>>>,
+    mode: MetadataMode,
     report: &mut SeederReport,
 ) {
     let mut conn = PeerConnection::connect_stream(
@@ -575,9 +859,25 @@ async fn serve_seeder(
         if conn.reserved()[5] & 0x10 == 0 {
             return;
         }
+        let (size, ut) = match &mode {
+            MetadataMode::NoUtMetadata => (Some(info_dict.len() as u64), None),
+            MetadataMode::OversizedHandshake => (
+                Some(bt_core::extensions::MAX_METADATA_SIZE + 1),
+                Some(STRICT_UT_METADATA_ID),
+            ),
+            MetadataMode::ZeroHandshake => (Some(0), Some(STRICT_UT_METADATA_ID)),
+            MetadataMode::LateHandshake { size_delta, .. } => (
+                Some((info_dict.len() as i64 + size_delta).max(0) as u64),
+                Some(STRICT_UT_METADATA_ID),
+            ),
+            _ => (Some(info_dict.len() as u64), Some(STRICT_UT_METADATA_ID)),
+        };
+        if let MetadataMode::LateHandshake { delay, .. } = &mode {
+            tokio::time::sleep(*delay).await;
+        }
         conn.write_message(&Message::Extended {
             extension_id: bt_core::extensions::EXTENSION_HANDSHAKE_ID,
-            payload: strict_handshake_payload(info_dict.len() as u64),
+            payload: strict_handshake_payload_for(size, ut),
         })
         .await
         .unwrap();
@@ -587,6 +887,7 @@ async fn serve_seeder(
     }
     let mut corrupted = false;
     let mut our_ut_metadata: Option<u8> = None;
+    let mut extras_sent = false;
     let mut served = 0usize;
     struct PendingSend {
         deadline: tokio::time::Instant,
@@ -633,7 +934,7 @@ async fn serve_seeder(
                 begin,
                 length,
             } => {
-                let start = index as usize * PIECE_LENGTH + begin as usize;
+                let start = index as usize * file_piece_length + begin as usize;
                 let mut block = data[start..start + length as usize].to_vec();
                 if index as usize == piece_count - 1 {
                     report.last_piece_requests += 1;
@@ -715,9 +1016,23 @@ async fn serve_seeder(
                 let Some(piece) = strict_request_piece(&payload) else {
                     return;
                 };
-                let reply = match strict_data_payload(piece, info_dict) {
-                    Some(payload) => payload,
-                    None => strict_reject_payload(piece),
+                report.metadata_requests_received += 1;
+                let reply = if matches!(&mode, MetadataMode::Reject(p) if *p == piece)
+                    || matches!(&mode, MetadataMode::RejectAll)
+                {
+                    strict_reject_payload(piece)
+                } else {
+                    let corrupt = matches!(&mode, MetadataMode::Corrupt(p) if *p == piece);
+                    let total_size = match &mode {
+                        MetadataMode::ConflictingDataSize(p) if *p == piece => {
+                            info_dict.len() as u64 + 1
+                        }
+                        _ => info_dict.len() as u64,
+                    };
+                    match strict_data_payload_with(piece, info_dict, total_size, corrupt) {
+                        Some(payload) => payload,
+                        None => strict_reject_payload(piece),
+                    }
                 };
                 if conn
                     .write_message(&Message::Extended {
@@ -728,6 +1043,31 @@ async fn serve_seeder(
                     .is_err()
                 {
                     return;
+                }
+                if matches!(&mode, MetadataMode::UnsolicitedExtras) && piece == 0 && !extras_sent {
+                    extras_sent = true;
+                    if let Some(corrupt_copy) =
+                        strict_data_payload_with(0, info_dict, info_dict.len() as u64, true)
+                    {
+                        let _ = conn
+                            .write_message(&Message::Extended {
+                                extension_id: reply_id,
+                                payload: corrupt_copy,
+                            })
+                            .await;
+                    }
+                    let mut dict: BTreeMap<Vec<u8>, Value> = BTreeMap::new();
+                    dict.insert(b"msg_type".to_vec(), Value::Int(1));
+                    dict.insert(b"piece".to_vec(), Value::Int(99));
+                    dict.insert(b"total_size".to_vec(), Value::Int(info_dict.len() as i64));
+                    let mut out_of_range = bencode::encode(&Value::Dict(dict));
+                    out_of_range.extend_from_slice(b"0123456789");
+                    let _ = conn
+                        .write_message(&Message::Extended {
+                            extension_id: reply_id,
+                            payload: out_of_range,
+                        })
+                        .await;
                 }
             }
             Message::Cancel {

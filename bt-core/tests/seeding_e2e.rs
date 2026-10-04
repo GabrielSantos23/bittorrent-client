@@ -11,8 +11,9 @@ use bt_core::listener::{ListenerOptions, Registry};
 use bt_core::peer_id;
 use bt_core::ratelimit::UploadBucket;
 use common::{
-    temp_dir, test_data, torrent_meta, FakeDial, FakeLeecherDial, LeecherConfig, LeecherReport,
-    SeederKind, DATA_LENGTH, PIECE_LENGTH,
+    temp_dir, test_data, torrent_meta, torrent_meta_with_piece_length, FakeDial, FakeLeecherDial,
+    FakeMetadataLeecherDial, LeecherConfig, LeecherReport, MetadataMode, SeederKind, DATA_LENGTH,
+    PIECE_LENGTH,
 };
 
 fn addr(port: u16) -> SocketAddr {
@@ -684,6 +685,348 @@ async fn magnet_metadata_fetch_and_download_from_one_peer() {
         );
         assert!(stats.changed().await.is_ok());
     }
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+fn info_dict_of_with(data: &[u8], piece_length: usize) -> Arc<Vec<u8>> {
+    let root_value =
+        bt_core::bencode::decode(&common::torrent_bytes_with_piece_length(data, piece_length))
+            .unwrap();
+    match &root_value {
+        bt_core::bencode::Value::Dict(entries) => Arc::new(bt_core::bencode::encode(
+            &entries.get(&b"info".to_vec()).unwrap().clone(),
+        )),
+        _ => unreachable!(),
+    }
+}
+
+fn magnet_for(info_hash: [u8; 20], peers: &[u16]) -> bt_core::magnet::MagnetLink {
+    bt_core::magnet::MagnetLink {
+        info_hash,
+        display_name: Some("e2e.bin".to_string()),
+        trackers: Vec::new(),
+        peers: peers
+            .iter()
+            .map(|port| bt_core::magnet::MagnetPeer {
+                host: "127.0.0.1".to_string(),
+                port: *port,
+            })
+            .collect(),
+    }
+}
+
+async fn wait_for_metadata(torrent: &Torrent, seconds: u64) -> bt_core::engine::Stats {
+    let mut stats = torrent.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    loop {
+        let snapshot = stats.borrow().clone();
+        if snapshot.piece_count > 0 {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "metadata never arrived: {:?}",
+            snapshot.diag
+        );
+        assert!(stats.changed().await.is_ok());
+    }
+}
+
+async fn spawn_magnet_torrent(
+    data: &Arc<Vec<u8>>,
+    peers: &[u16],
+    modes: Vec<(SocketAddr, MetadataMode)>,
+    dir: &std::path::Path,
+) -> (
+    Torrent,
+    Option<tokio::sync::mpsc::Receiver<common::SeederReport>>,
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    let meta = torrent_meta_with_piece_length(data, 1024);
+    let info_dict = info_dict_of_with(data, 1024);
+    let (dial, reports) = FakeDial::with_metadata_modes(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        1024,
+        peers.iter().map(|p| (addr(*p), SeederKind::Good)).collect(),
+        info_dict,
+        modes,
+    );
+    let torrent = Torrent::spawn_from_magnet(
+        magnet_for(meta.info_hash, peers),
+        dir.to_path_buf(),
+        TorrentOptions {
+            dial: Arc::new(dial),
+            registry: Arc::new(Registry::default()),
+            ..TorrentOptions::default()
+        },
+    )
+    .await
+    .unwrap();
+    (torrent, Some(reports))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn corrupted_metadata_is_refetched_from_a_good_peer() {
+    let data = common::metadata_multi_piece_data();
+    let meta = torrent_meta_with_piece_length(&data, 1024);
+    let piece_count = meta.info.pieces.len();
+    let dir = temp_dir("magnet-corrupt");
+    let (torrent, _reports) = spawn_magnet_torrent(
+        &data,
+        &[7301, 7302],
+        vec![
+            (addr(7301), MetadataMode::Corrupt(0)),
+            (addr(7302), MetadataMode::Good),
+        ],
+        &dir,
+    )
+    .await;
+    let snapshot = wait_for_metadata(&torrent, 30).await;
+    assert_eq!(snapshot.name, "e2e.bin");
+    assert_eq!(snapshot.piece_count, piece_count);
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_size_zero_is_never_requested() {
+    let data = common::metadata_multi_piece_data();
+    let dir = temp_dir("magnet-zero-size");
+    let (torrent, _reports) = spawn_magnet_torrent(
+        &data,
+        &[7311],
+        vec![(addr(7311), MetadataMode::ZeroHandshake)],
+        &dir,
+    )
+    .await;
+    let mut stats = torrent.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let snapshot = stats.borrow().clone();
+        if snapshot.diag.extension_handshakes >= 1 {
+            assert_eq!(
+                snapshot.diag.metadata_requests_sent, 0,
+                "a zero metadata_size must never be requested"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "extension handshake never arrived: {:?}",
+            snapshot.diag
+        );
+        assert!(stats.changed().await.is_ok());
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let snapshot = stats.borrow().clone();
+    assert_eq!(snapshot.diag.metadata_requests_sent, 0);
+    assert_eq!(snapshot.piece_count, 0);
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_size_above_limit_is_never_requested() {
+    let data = common::metadata_multi_piece_data();
+    let dir = temp_dir("magnet-oversize");
+    let (torrent, _reports) = spawn_magnet_torrent(
+        &data,
+        &[7312],
+        vec![(addr(7312), MetadataMode::OversizedHandshake)],
+        &dir,
+    )
+    .await;
+    let mut stats = torrent.subscribe();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let snapshot = stats.borrow().clone();
+        if snapshot.diag.extension_handshakes >= 1 {
+            assert_eq!(
+                snapshot.diag.metadata_requests_sent, 0,
+                "an over-limit metadata_size must never be requested"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "extension handshake never arrived: {:?}",
+            snapshot.diag
+        );
+        assert!(stats.changed().await.is_ok());
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let snapshot = stats.borrow().clone();
+    assert_eq!(snapshot.diag.metadata_requests_sent, 0);
+    assert_eq!(snapshot.piece_count, 0);
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflicting_metadata_size_stops_requests() {
+    let data = common::metadata_multi_piece_data();
+    let dir = temp_dir("magnet-conflict-size");
+    let (torrent, _reports) = spawn_magnet_torrent(
+        &data,
+        &[7321],
+        vec![(addr(7321), MetadataMode::ConflictingDataSize(1))],
+        &dir,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let snapshot = torrent.subscribe().borrow().clone();
+    assert_eq!(
+        snapshot.diag.metadata_requests_sent, 4,
+        "the conflicting peer must not be re-requested"
+    );
+    assert_eq!(snapshot.diag.metadata_data_received, 4);
+    assert_eq!(
+        snapshot.piece_count, 0,
+        "the conflicting piece must be dropped"
+    );
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn metadata_reject_is_retried_on_another_peer() {
+    let data = common::metadata_multi_piece_data();
+    let meta = torrent_meta_with_piece_length(&data, 1024);
+    let piece_count = meta.info.pieces.len();
+    let dir = temp_dir("magnet-reject");
+    let (torrent, reports) = spawn_magnet_torrent(
+        &data,
+        &[7331, 7332],
+        vec![(addr(7331), MetadataMode::RejectAll)],
+        &dir,
+    )
+    .await;
+    let snapshot = wait_for_metadata(&torrent, 30).await;
+    assert_eq!(snapshot.piece_count, piece_count);
+    torrent.stop().await.unwrap();
+    let mut reports = reports.unwrap();
+    let mut asked_rejecter = false;
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(10), reports.recv()).await {
+            Ok(Some(report)) => {
+                eprintln!("DEBUG reject report: {report:?}");
+                if report.addr == addr(7331) && report.metadata_requests_received >= 1 {
+                    asked_rejecter = true;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        asked_rejecter,
+        "the rejecting peer must have been asked and the work retried elsewhere"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn peer_without_ut_metadata_is_skipped() {
+    let data = common::metadata_multi_piece_data();
+    let meta = torrent_meta_with_piece_length(&data, 1024);
+    let piece_count = meta.info.pieces.len();
+    let dir = temp_dir("magnet-no-ut");
+    let (torrent, reports) = spawn_magnet_torrent(
+        &data,
+        &[7341, 7342],
+        vec![(addr(7341), MetadataMode::NoUtMetadata)],
+        &dir,
+    )
+    .await;
+    let snapshot = wait_for_metadata(&torrent, 30).await;
+    assert_eq!(snapshot.piece_count, piece_count);
+    torrent.stop().await.unwrap();
+    let mut reports = reports.unwrap();
+    let mut skipped = false;
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(10), reports.recv()).await {
+            Ok(Some(report)) => {
+                if report.addr == addr(7341) {
+                    skipped = true;
+                    assert_eq!(
+                        report.metadata_requests_received, 0,
+                        "a peer without ut_metadata must never be asked"
+                    );
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(skipped, "the ut_metadata-less peer report is missing");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_and_out_of_range_metadata_pieces_are_ignored() {
+    let data = common::metadata_multi_piece_data();
+    let meta = torrent_meta_with_piece_length(&data, 1024);
+    let piece_count = meta.info.pieces.len();
+    let dir = temp_dir("magnet-extras");
+    let (torrent, _reports) = spawn_magnet_torrent(
+        &data,
+        &[7351],
+        vec![(addr(7351), MetadataMode::UnsolicitedExtras)],
+        &dir,
+    )
+    .await;
+    let snapshot = wait_for_metadata(&torrent, 30).await;
+    assert_eq!(snapshot.piece_count, piece_count);
+    assert_eq!(
+        snapshot.diag.metadata_requests_sent, 4,
+        "garbage pieces must not trigger a refetch"
+    );
+    assert_eq!(
+        snapshot.diag.metadata_data_received, 6,
+        "four valid pieces plus a duplicate and an out-of-range piece"
+    );
+    torrent.stop().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_metadata_pieces_and_rejects_out_of_range_requests() {
+    let data = test_data();
+    let meta = torrent_meta(&data);
+    let info_dict = info_dict_of_with(&data, PIECE_LENGTH);
+    let (dial, mut reports) =
+        FakeMetadataLeecherDial::new(meta.info_hash, meta.info.pieces.len(), vec![0, 1]);
+    let dir = temp_dir("magnet-serve");
+    let torrent = Torrent::spawn_with_dial(meta, dir.clone(), vec![addr(7361)], Arc::new(dial))
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let report = loop {
+        match tokio::time::timeout(Duration::from_millis(200), reports.recv()).await {
+            Ok(Some(report)) => break report,
+            Ok(None) => panic!("metadata leecher task ended without a report"),
+            Err(_) => {
+                assert!(Instant::now() < deadline, "metadata leecher never finished");
+            }
+        }
+    };
+    assert!(
+        report.saw_client_handshake,
+        "our extension handshake must arrive before any request"
+    );
+    assert_eq!(
+        report.rejects,
+        vec![1],
+        "an out-of-range piece must be rejected"
+    );
+    assert_eq!(report.data.len(), 1);
+    assert_eq!(report.data[0].0, 0);
+    assert_eq!(report.data[0].1, info_dict.len() as u64);
+    assert_eq!(
+        report.data[0].2, *info_dict,
+        "the served bytes must be the exact info dict"
+    );
     torrent.stop().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

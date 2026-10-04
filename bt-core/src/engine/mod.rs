@@ -58,6 +58,7 @@ const STOP_ANNOUNCE_WAIT: Duration = Duration::from_secs(3);
 const METADATA_TICK: Duration = Duration::from_millis(500);
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_IN_FLIGHT_METADATA: usize = 8;
+const MAX_METADATA_ASSEMBLY_FAILURES: u32 = 8;
 const TARGET_RTT: f64 = 1.5;
 const RATE_WINDOW: Duration = Duration::from_secs(6);
 const INITIAL_PIPELINE_DEPTH: usize = 8;
@@ -325,7 +326,7 @@ impl Torrent {
         let (incoming_tx, incoming_rx) = mpsc::channel(8);
         let (announce_results_tx, announce_results) = mpsc::channel(64);
         let (metadata_tx, metadata_rx) = watch::channel(None);
-        let raw_metainfo = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let raw_metainfo = Arc::new(std::sync::Mutex::new(meta.raw.clone()));
         let piece_count = meta.info.pieces.len();
         let total_length = storage.total_length();
         let name = meta.info.name.clone();
@@ -434,6 +435,7 @@ struct PendingMetadata {
     in_flight: HashMap<u32, TokioInstant>,
     round_robin: usize,
     contributors: HashSet<SocketAddr>,
+    failed_assemblies: u32,
 }
 
 impl PendingMetadata {
@@ -641,34 +643,8 @@ fn metadata_info_and_size(raw: &[u8]) -> Result<(Vec<u8>, u64), crate::error::Me
         .ok_or(crate::error::MetaInfoError::MissingInfo)?;
     let mut bytes = Vec::new();
     crate::bencode::encode_into(info, &mut bytes);
-    let total_size = match info {
-        crate::bencode::Value::Dict(entries) => entries
-            .get(&b"length".to_vec())
-            .and_then(crate::bencode::Value::as_int)
-            .map(|value| value as u64),
-        _ => None,
-    };
-    let total_size = match total_size {
-        Some(size) => size,
-        None => {
-            let files = info
-                .as_dict()
-                .and_then(|dict| dict.get(&b"files".to_vec()))
-                .and_then(crate::bencode::Value::as_list)
-                .ok_or(crate::error::MetaInfoError::MissingKey("length"))?;
-            let mut total = 0u64;
-            for file in files {
-                let length = file
-                    .as_dict()
-                    .and_then(|dict| dict.get(&b"length".to_vec()))
-                    .and_then(crate::bencode::Value::as_int)
-                    .ok_or(crate::error::MetaInfoError::MissingKey("length"))?;
-                total += length as u64;
-            }
-            total
-        }
-    };
-    Ok((bytes, total_size))
+    let size = bytes.len() as u64;
+    Ok((bytes, size))
 }
 
 impl Engine {
@@ -721,6 +697,7 @@ impl Engine {
             in_flight: HashMap::new(),
             round_robin: 0,
             contributors: HashSet::new(),
+            failed_assemblies: 0,
         };
         Engine {
             picker: None,
@@ -1189,11 +1166,19 @@ impl Engine {
 
     fn extension_handshake_payload(&self) -> Option<Vec<u8>> {
         match (&self.meta, &self.pending) {
-            (Some(meta), _) => Some(crate::extensions::encode_extension_handshake(
-                &crate::extensions::ExtensionHandshake::with_metadata_size(
-                    meta.info.total_length().ok()?,
-                ),
-            )),
+            (Some(_), _) => {
+                let raw = self
+                    .raw_metainfo
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                let Ok((_, size)) = metadata_info_and_size(&raw) else {
+                    return None;
+                };
+                Some(crate::extensions::encode_extension_handshake(
+                    &crate::extensions::ExtensionHandshake::with_metadata_size(size),
+                ))
+            }
             (None, Some(pending)) => Some(crate::extensions::encode_extension_handshake(
                 &crate::extensions::ExtensionHandshake {
                     ut_metadata: Some(1),
@@ -1451,16 +1436,26 @@ impl Engine {
         }
         let contributors: HashSet<SocketAddr> = pending.contributors.iter().copied().collect();
         if crate::extensions::sha1(&assembled) != info_hash {
-            for contributor in contributors {
-                self.strike(contributor).await;
+            let mut ban_contributors = false;
+            {
+                let Some(pending) = self.pending.as_mut() else {
+                    return;
+                };
+                pending.failed_assemblies = pending.failed_assemblies.saturating_add(1);
+                if pending.failed_assemblies >= MAX_METADATA_ASSEMBLY_FAILURES {
+                    ban_contributors = true;
+                }
+                pending.size = None;
+                pending.pieces.clear();
+                pending.in_flight.clear();
+                pending.contributors.clear();
+                pending.round_robin = pending.round_robin.wrapping_add(1);
             }
-            let Some(pending) = self.pending.as_mut() else {
-                return;
-            };
-            pending.size = None;
-            pending.pieces.clear();
-            pending.in_flight.clear();
-            pending.contributors.clear();
+            if ban_contributors {
+                for contributor in contributors {
+                    self.strike(contributor).await;
+                }
+            }
             return;
         }
         self.upgrade_with_metadata(assembled, output_dir).await;

@@ -312,7 +312,7 @@ impl Session {
                 restore_errors.push(format!("duplicate restored magnet {id}"));
                 continue;
             }
-            let entry = spawn_magnet_entry(link, output_dir, paused, &wiring).await?;
+            let entry = spawn_magnet_entry(link, uri.clone(), output_dir, paused, &wiring).await?;
             initial.push(make_summary(&id, &entry));
             order.push(id.clone());
             torrents.insert(id, entry);
@@ -470,6 +470,7 @@ struct SessionTorrent {
     meta: Arc<MetaInfo>,
     output_dir: PathBuf,
     paused: bool,
+    magnet: Option<String>,
     stats: watch::Receiver<crate::engine::Stats>,
 }
 
@@ -636,31 +637,17 @@ impl SessionActor {
         if self.torrents.contains_key(&id) {
             return Err(SessionError::Duplicate(id));
         }
-        let entry = spawn_magnet_entry(link, output_dir.clone(), paused, &self.wiring).await?;
+        let entry = spawn_magnet_entry(
+            link,
+            uri.to_string(),
+            output_dir.clone(),
+            paused,
+            &self.wiring,
+        )
+        .await?;
         self.order.push(id.clone());
         self.torrents.insert(id.clone(), entry);
-        if let Some(data_dir) = &self.persistence {
-            let file = SessionFile {
-                torrents: self
-                    .order
-                    .iter()
-                    .filter_map(|existing| {
-                        self.torrents.get(existing).map(|entry| PersistedTorrent {
-                            id: existing.clone(),
-                            file: format!("{existing}.torrent"),
-                            output_dir: entry.output_dir.clone(),
-                            paused: entry.paused,
-                            magnet: if existing == &id {
-                                Some(uri.to_string())
-                            } else {
-                                None
-                            },
-                        })
-                    })
-                    .collect(),
-            };
-            let _ = persist::save(data_dir, &file);
-        }
+        self.persist();
         self.publish();
         Ok(id)
     }
@@ -766,7 +753,7 @@ impl SessionActor {
                             file: format!("{id}.torrent"),
                             output_dir: entry.output_dir.clone(),
                             paused: entry.paused,
-                            magnet: None,
+                            magnet: entry.magnet.clone(),
                         })
                     })
                     .collect(),
@@ -790,6 +777,7 @@ impl SessionActor {
 
 async fn spawn_magnet_entry(
     link: crate::magnet::MagnetLink,
+    uri: String,
     output_dir: PathBuf,
     paused: bool,
     wiring: &EngineWiring,
@@ -810,14 +798,29 @@ async fn spawn_magnet_entry(
     if paused {
         handle.pause().await?;
     }
+    let mut info = std::collections::BTreeMap::new();
+    info.insert(b"length".to_vec(), crate::bencode::Value::Int(1));
+    info.insert(
+        b"name".to_vec(),
+        crate::bencode::Value::Bytes(b"a".to_vec()),
+    );
+    info.insert(b"piece length".to_vec(), crate::bencode::Value::Int(16384));
+    info.insert(
+        b"pieces".to_vec(),
+        crate::bencode::Value::Bytes(vec![0u8; 20]),
+    );
+    let mut root = std::collections::BTreeMap::new();
+    root.insert(b"info".to_vec(), crate::bencode::Value::Dict(info));
+    let placeholder_bytes = crate::bencode::encode(&crate::bencode::Value::Dict(root));
     #[allow(clippy::expect_used)]
     let placeholder_meta =
-        MetaInfo::from_bytes(b"d4:infoi0ee").expect("statically valid placeholder");
+        MetaInfo::from_bytes(&placeholder_bytes).expect("statically valid placeholder");
     Ok(SessionTorrent {
         handle,
         meta: Arc::new(placeholder_meta),
         output_dir,
         paused,
+        magnet: Some(uri),
         stats,
     })
 }
@@ -849,6 +852,7 @@ async fn spawn_entry(
         meta,
         output_dir,
         paused,
+        magnet: None,
         stats,
     })
 }
