@@ -80,6 +80,7 @@ pub struct TorrentSummary {
     pub peer_count: usize,
     pub output_dir: PathBuf,
     pub error: Option<String>,
+    pub dht_waiting: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
@@ -259,13 +260,32 @@ impl Session {
         let announce_port = Arc::new(AtomicU16::new(options.listen_port));
         let (dht_status_tx, dht_status) =
             watch::channel(DhtStatus::inactive(options.dht_port, None));
-        let dht_node_id = NodeId::random(&SystemRandom);
+        let dht_persist_path = persistence.as_ref().map(|dir| dir.join("dht.json"));
+        let (dht_node_id, dht_restore_nodes, dht_report) = match &dht_persist_path {
+            Some(path) => match crate::dht::load_state(path) {
+                Ok(loaded) => {
+                    let report = (loaded.dropped > 0)
+                        .then(|| format!("DHT state: {} invalid entries dropped", loaded.dropped));
+                    (loaded.node_id, loaded.nodes, report)
+                }
+                Err(crate::dht::LoadError::Missing) => {
+                    (NodeId::random(&SystemRandom), Vec::new(), None)
+                }
+                Err(crate::dht::LoadError::Corrupt(err)) => (
+                    NodeId::random(&SystemRandom),
+                    Vec::new(),
+                    Some(format!("corrupt DHT state, starting fresh: {err}")),
+                ),
+            },
+            None => (NodeId::random(&SystemRandom), Vec::new(), None),
+        };
         let dht_active = Arc::new(AtomicBool::new(false));
         let dht_port = Arc::new(AtomicU16::new(options.dht_port));
         let (dht, dht_forwarder) = if options.dht_enabled {
             let handle = crate::dht::spawn(
                 DhtOptions::new(options.dht_port, dht_node_id)
                     .with_bootstrap(options.dht_bootstrap.clone())
+                    .with_persist(dht_persist_path.clone(), dht_restore_nodes)
                     .with_listener_state(listen_active.clone(), announce_port.clone()),
             );
             let forwarder = spawn_dht_status_forwarder(
@@ -401,6 +421,9 @@ impl Session {
             order.push(id.clone());
             torrents.insert(id, entry);
         }
+        if let Some(report) = dht_report {
+            restore_errors.push(report);
+        }
         let restore_errors = Arc::new(restore_errors);
         let (summaries_tx, summaries_rx) = watch::channel(initial.clone());
         let actor = SessionActor {
@@ -421,6 +444,7 @@ impl Session {
             dht_node_id,
             dht_active,
             dht_port,
+            dht_persist_path,
         };
         tokio::spawn(actor.run());
         Ok(Session {
@@ -615,6 +639,7 @@ struct SessionActor {
     dht_node_id: NodeId,
     dht_active: Arc<AtomicBool>,
     dht_port: Arc<AtomicU16>,
+    dht_persist_path: Option<PathBuf>,
 }
 
 impl SessionActor {
@@ -658,8 +683,20 @@ impl SessionActor {
             self.wiring.dht = None;
             return Ok(());
         }
-        let options = DhtOptions::new(port, self.dht_node_id)
+        self.dht_forwarder.abort();
+        if let Some(old) = self.dht.take() {
+            old.persist_and_shutdown().await;
+        }
+        let (node_id, restore_nodes) = match &self.dht_persist_path {
+            Some(path) => match crate::dht::load_state(path) {
+                Ok(loaded) => (loaded.node_id, loaded.nodes),
+                Err(_) => (self.dht_node_id, Vec::new()),
+            },
+            None => (self.dht_node_id, Vec::new()),
+        };
+        let options = DhtOptions::new(port, node_id)
             .with_bootstrap(self.dht_bootstrap.clone())
+            .with_persist(self.dht_persist_path.clone(), restore_nodes)
             .with_listener_state(
                 self.wiring.listen_active.clone(),
                 self.wiring.announce_port.clone(),
@@ -667,10 +704,6 @@ impl SessionActor {
         let handle = crate::dht::bind(options)
             .await
             .map_err(|err| SessionError::Dht(format!("cannot bind DHT port {port}: {err}")))?;
-        self.dht_forwarder.abort();
-        if let Some(old) = self.dht.take() {
-            old.shutdown();
-        }
         self.dht_forwarder = spawn_dht_status_forwarder(
             Some(handle.status()),
             self.dht_status_tx.clone(),
@@ -910,7 +943,7 @@ impl SessionActor {
         self.persist();
         self.listener.shutdown();
         if let Some(dht) = self.dht.take() {
-            dht.shutdown();
+            dht.persist_and_shutdown().await;
         }
         let _ = self.summaries_tx.send(Vec::new());
     }
@@ -1061,5 +1094,6 @@ fn make_summary(id: &str, entry: &SessionTorrent) -> TorrentSummary {
         peer_count: stats.peer_count,
         output_dir: entry.output_dir.clone(),
         error: stats.error,
+        dht_waiting: stats.dht_waiting,
     }
 }

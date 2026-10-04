@@ -520,3 +520,44 @@ async fn dht_disabled_at_spawn_reports_inactive_without_error() {
     wait_for_dht_status(session.dht_status(), |s| s.active, 10).await;
     session.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_dht_state_is_reported_and_the_session_starts_fresh() {
+    let data_dir = temp_dir("dht-corrupt");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::write(data_dir.join("dht.json"), b"{not valid dht state").unwrap();
+    let session = Session::spawn_with_options(Some(data_dir.clone()), SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    assert!(
+        session
+            .restore_errors()
+            .iter()
+            .any(|error| error.contains("corrupt DHT state")),
+        "the corrupt dht state must be reported once: {:?}",
+        session.restore_errors()
+    );
+    session.shutdown().await.unwrap();
+    std::fs::remove_dir_all(data_dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn valid_dht_state_restores_the_table_through_the_production_path() {
+    let data_dir = temp_dir("dht-valid");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let node_id = bt_core::dht::NodeId::from_bytes([0x2A; 20]);
+    let nodes = vec![bt_core::dht::NodeInfo::new(
+        bt_core::dht::NodeId::from_bytes([0x2B; 20]),
+        std::net::SocketAddrV4::new(std::net::Ipv4Addr::new(93, 184, 216, 34), 6881),
+    )];
+    bt_core::dht::save_state(&data_dir.join("dht.json"), &node_id, &nodes).unwrap();
+    let session = Session::spawn_with_options(Some(data_dir.clone()), SessionOptions::new(0, 0))
+        .await
+        .unwrap();
+    let restored =
+        wait_for_dht_status(session.dht_status(), |s| s.active && s.node_count == 1, 10).await;
+    assert_eq!(restored.node_count, 1);
+    assert!(session.restore_errors().is_empty());
+    session.shutdown().await.unwrap();
+    std::fs::remove_dir_all(data_dir).unwrap();
+}

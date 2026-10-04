@@ -9,16 +9,19 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import type { TorrentDetail } from "../../../bt-core/bindings/TorrentDetail";
+import type { DhtStatus } from "../../../bt-core/bindings/DhtStatus";
 
 interface DetailPanelProps {
   detail: TorrentDetail | null;
+  dht: DhtStatus | null;
+  dhtWaiting: boolean;
 }
 
 function directionLabel(direction: "Incoming" | "Outgoing"): string {
   return direction === "Incoming" ? "in" : "out";
 }
 
-export default function DetailPanel({ detail }: DetailPanelProps) {
+export default function DetailPanel({ detail, dht, dhtWaiting }: DetailPanelProps) {
   if (detail === null) {
     return (
       <div className="flex items-center justify-center border-t border-border px-4 py-6 text-muted-foreground">
@@ -96,6 +99,22 @@ export default function DetailPanel({ detail }: DetailPanelProps) {
         <dl className="grid grid-cols-[160px_1fr] gap-y-1 text-sm">
           <dt className="text-muted-foreground">Info hash</dt>
           <dd className="break-all">{detail.info_hash}</dd>
+          <dt className="text-muted-foreground">DHT</dt>
+          <dd>
+            {dht === null
+              ? "—"
+              : dht.active
+                ? `active · ${dht.node_count} nodes`
+                : "inactive"}
+            {dht !== null && !dht.active && dht.error !== null && (
+              <span className="block text-xs text-destructive">{dht.error}</span>
+            )}
+            {dhtWaiting && (
+              <span className="block text-xs text-muted-foreground">
+                waiting for peers from DHT
+              </span>
+            )}
+          </dd>
           <dt className="text-muted-foreground">Output dir</dt>
           <dd className="break-all">{detail.output_dir}</dd>
           <dt className="text-muted-foreground">Comment</dt>

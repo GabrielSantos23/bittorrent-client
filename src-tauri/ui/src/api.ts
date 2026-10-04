@@ -6,6 +6,7 @@ import type { Settings } from "../../bindings/Settings";
 import type { TorrentDetail } from "../../../bt-core/bindings/TorrentDetail";
 import type { TorrentSummary } from "../../../bt-core/bindings/TorrentSummary";
 import type { ListenerStatus } from "../../../bt-core/bindings/ListenerStatus";
+import type { DhtStatus } from "../../../bt-core/bindings/DhtStatus";
 
 export const api = {
   list: () => invoke<TorrentSummary[]>("list_torrents"),
@@ -37,6 +38,8 @@ export const api = {
     listen<ListenerStatus>("session://listener", (event) =>
       handler(event.payload),
     ),
+  onDht: (handler: (status: DhtStatus) => void) =>
+    listen<DhtStatus>("session://dht", (event) => handler(event.payload)),
   pickTorrent: () =>
     open({
       multiple: false,

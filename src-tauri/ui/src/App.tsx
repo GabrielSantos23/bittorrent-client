@@ -19,6 +19,7 @@ import DetailPanel from "./DetailPanel";
 import type { TorrentSummary } from "../../../bt-core/bindings/TorrentSummary";
 import type { TorrentDetail } from "../../../bt-core/bindings/TorrentDetail";
 import type { ListenerStatus } from "../../../bt-core/bindings/ListenerStatus";
+import type { DhtStatus } from "../../../bt-core/bindings/DhtStatus";
 import type { Settings } from "../../bindings/Settings";
 
 const HISTORY_LIMIT = 240;
@@ -55,6 +56,7 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [listener, setListener] = useState<ListenerStatus | null>(null);
+  const [dht, setDht] = useState<DhtStatus | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsForm, setSettingsForm] = useState<SettingsForm | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
@@ -71,6 +73,7 @@ export default function App() {
     });
     const unDetail = api.onDetail(setDetail);
     const unListener = api.onListener(setListener);
+    const unDht = api.onDht(setDht);
     const unDragEnter = api.onDragEnter((paths) => {
       setDragActive(paths.some(isTorrentPath));
     });
@@ -85,6 +88,7 @@ export default function App() {
       unSummaries.then((stop) => stop());
       unDetail.then((stop) => stop());
       unListener.then((stop) => stop());
+      unDht.then((stop) => stop());
       unDragEnter.then((stop) => stop());
       unDragLeave.then((stop) => stop());
       unDrop.then((stop) => stop());
@@ -202,6 +206,15 @@ export default function App() {
           ↑ {formatRate(totalUpload)}
         </span>
         <div className="flex-1" />
+        {dht !== null && (
+          <span
+            className={dht.active ? "text-sm text-primary" : "text-sm text-destructive"}
+            title={dht.active ? undefined : (dht.error ?? undefined)}
+            role="status"
+          >
+            {dht.active ? `DHT: ${dht.node_count} nodes` : "DHT inactive"}
+          </span>
+        )}
         {listener !== null && (
           <span
             className={
@@ -243,7 +256,15 @@ export default function App() {
             onRemove={setPendingRemove}
           />
         </div>
-        <DetailPanel detail={selectedId === null ? null : detail} />
+        <DetailPanel
+          detail={selectedId === null ? null : detail}
+          dht={dht}
+          dhtWaiting={
+            selectedId !== null &&
+            (summaries.find((torrent) => torrent.id === selectedId)?.dht_waiting ??
+              false)
+          }
+        />
       </main>
 
       {dragActive && (

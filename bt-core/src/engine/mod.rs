@@ -139,6 +139,7 @@ pub struct Stats {
     pub metadata_progress: Option<MetadataProgress>,
     pub diag: MetadataDiag,
     pub error: Option<String>,
+    pub dht_waiting: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
@@ -283,6 +284,7 @@ impl Torrent {
             } else {
                 None
             },
+            dht_waiting: false,
         });
         options.registry.register(link.info_hash, incoming_tx);
         let mut bootstrap_peers = Vec::new();
@@ -359,6 +361,7 @@ impl Torrent {
             metadata_progress: None,
             diag: MetadataDiag::default(),
             error: None,
+            dht_waiting: false,
         });
         options.registry.register(meta.info_hash, incoming_tx);
         let engine = Engine::new(
@@ -2402,7 +2405,21 @@ impl Engine {
                 .map(|pending| pending.received_of_total()),
             diag: self.diag.clone(),
             error: self.error.clone(),
+            dht_waiting: self.dht_waiting(),
         }
+    }
+
+    fn dht_waiting(&self) -> bool {
+        let Some(dht) = &self.dht else {
+            return false;
+        };
+        if !dht.active.load(Ordering::Relaxed) || !self.peers.is_empty() {
+            return false;
+        }
+        matches!(
+            self.state,
+            State::FetchingMetadata | State::Downloading | State::Checking
+        ) && self.last_dht_lookup_ms.is_some()
     }
 
     fn publish(&self) {

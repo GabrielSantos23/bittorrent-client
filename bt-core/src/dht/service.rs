@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior};
 
@@ -15,6 +16,7 @@ use crate::dht::krpc::{self, KrpcMessage, NodeInfo, Query, Response, Transaction
 use crate::dht::limiter::ResponseGate;
 use crate::dht::node_id::{cmp_distance_to, NodeId, SystemRandom};
 use crate::dht::schedule;
+use crate::dht::state as dht_state;
 use crate::dht::store::PeerStore;
 use crate::dht::table::{OfferOutcome, RoutingTable};
 use crate::dht::tokens::TokenVault;
@@ -42,6 +44,7 @@ const LOOKUP_MAX_CANDIDATES: usize = 256;
 const LOOKUP_MAINTENANCE_RESERVE: usize = 32;
 const REFRESH_QUERIES_PER_SWEEP: usize = 2;
 const REBOOTSTRAP_IDLE_MS: u64 = 30_000;
+const PERSIST_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const MAX_BOOTSTRAP_TARGETS: usize = 8;
 const COMMAND_CHANNEL_CAPACITY: usize = 64;
 const LOOKUP_QUEUE_CAPACITY: usize = 32;
@@ -88,6 +91,8 @@ pub struct DhtOptions {
     pub bootstrap: Vec<String>,
     listener_active: Arc<AtomicBool>,
     announce_port: Arc<AtomicU16>,
+    persist_path: Option<PathBuf>,
+    restore_nodes: Vec<NodeInfo>,
     filter: AddressFilter,
 }
 
@@ -99,12 +104,24 @@ impl DhtOptions {
             bootstrap: Vec::new(),
             listener_active: Arc::new(AtomicBool::new(false)),
             announce_port: Arc::new(AtomicU16::new(0)),
+            persist_path: None,
+            restore_nodes: Vec::new(),
             filter: AddressFilter::strict(),
         }
     }
 
     pub fn with_bootstrap(mut self, bootstrap: Vec<String>) -> DhtOptions {
         self.bootstrap = bootstrap;
+        self
+    }
+
+    pub fn with_persist(
+        mut self,
+        persist_path: Option<PathBuf>,
+        restore_nodes: Vec<NodeInfo>,
+    ) -> DhtOptions {
+        self.persist_path = persist_path;
+        self.restore_nodes = restore_nodes;
         self
     }
 
@@ -140,6 +157,9 @@ pub enum DhtCommand {
     VerifyCandidate {
         addr: SocketAddrV4,
     },
+    PersistAndShutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 #[derive(Clone)]
@@ -168,6 +188,18 @@ impl DhtHandle {
         self.commands
             .try_send(DhtCommand::VerifyCandidate { addr })
             .is_ok()
+    }
+
+    pub async fn persist_and_shutdown(&self) {
+        let (reply, rx) = oneshot::channel();
+        if self
+            .commands
+            .try_send(DhtCommand::PersistAndShutdown { reply })
+            .is_ok()
+        {
+            let _ = tokio::time::timeout(Duration::from_secs(2), rx).await;
+        }
+        self.abort.abort();
     }
 }
 
@@ -323,6 +355,9 @@ struct NodeState {
     commands_open: bool,
     counters: Counters,
     last_bootstrap_ms: Option<u64>,
+    last_persist_ms: Option<u64>,
+    persist_path: Option<PathBuf>,
+    deferred_lookups: Vec<Lookup>,
     start: TokioInstant,
     random: SystemRandom,
 }
@@ -690,12 +725,7 @@ impl NodeState {
             let Some(lookup) = self.lookup_queue.pop_front() else {
                 return;
             };
-            let id = self.next_lookup_id;
-            self.next_lookup_id = self.next_lookup_id.wrapping_add(1);
-            let mut lookup = lookup;
-            lookup.started_ms = self.now_ms();
-            self.lookups.insert(id, lookup);
-            self.dispatch_lookup(id).await;
+            self.start_lookup(lookup).await;
         }
     }
 
@@ -713,10 +743,25 @@ impl NodeState {
             queries_sent: 0,
             started_ms: self.now_ms(),
         };
+        if self.table.is_empty() {
+            if self.deferred_lookups.len() >= LOOKUP_QUEUE_CAPACITY {
+                let _ = lookup.result.try_send(DhtPeers {
+                    info_hash,
+                    peers: Vec::new(),
+                });
+                return;
+            }
+            self.deferred_lookups.push(lookup);
+            return;
+        }
+        self.start_lookup(lookup).await;
+    }
+
+    async fn start_lookup(&mut self, lookup: Lookup) {
         if self.lookups.len() >= MAX_CONCURRENT_LOOKUPS {
             if self.lookup_queue.len() >= LOOKUP_QUEUE_CAPACITY {
                 let _ = lookup.result.try_send(DhtPeers {
-                    info_hash,
+                    info_hash: lookup.info_hash,
                     peers: Vec::new(),
                 });
                 return;
@@ -726,6 +771,8 @@ impl NodeState {
         }
         let id = self.next_lookup_id;
         self.next_lookup_id = self.next_lookup_id.wrapping_add(1);
+        let mut lookup = lookup;
+        lookup.started_ms = self.now_ms();
         self.lookups.insert(id, lookup);
         self.dispatch_lookup(id).await;
     }
@@ -822,6 +869,18 @@ impl NodeState {
         }
         self.vault.rotate_if_due(now, &self.random);
         self.store.expire(now);
+        if self
+            .last_persist_ms
+            .is_none_or(|last| now.saturating_sub(last) >= PERSIST_INTERVAL_MS)
+        {
+            self.persist();
+            self.last_persist_ms = Some(now);
+        }
+        if !self.deferred_lookups.is_empty() && !self.table.is_empty() {
+            for lookup in std::mem::take(&mut self.deferred_lookups) {
+                self.start_lookup(lookup).await;
+            }
+        }
         if self.fill.active {
             self.maybe_dispatch_fill().await;
         } else if self.table.is_empty() {
@@ -952,6 +1011,20 @@ impl NodeState {
         let _ = self.socket.send_to(&bytes, destination).await;
     }
 
+    fn persist(&self) {
+        let Some(path) = &self.persist_path else {
+            return;
+        };
+        let nodes: Vec<NodeInfo> = self
+            .table
+            .entries()
+            .into_iter()
+            .map(|entry| entry.info)
+            .take(dht_state::MAX_PERSISTED_NODES)
+            .collect();
+        let _ = dht_state::save(path, &self.self_id, &nodes);
+    }
+
     fn publish(&self, status: &watch::Sender<DhtStatus>) {
         let _ = status.send(DhtStatus {
             active: true,
@@ -1021,9 +1094,17 @@ async fn run_bound(
         commands_open: true,
         counters: Counters::default(),
         last_bootstrap_ms: None,
+        last_persist_ms: None,
+        persist_path: options.persist_path,
+        deferred_lookups: Vec::new(),
         start,
         random: SystemRandom,
     };
+    for node_info in options.restore_nodes {
+        if node_info.id != node.self_id && node.filter.allows(node_info.addr) {
+            node.table.offer(node_info, 0);
+        }
+    }
     node.publish(&status);
     let mut sweep = tokio::time::interval(Duration::from_millis(SWEEP_INTERVAL_MS));
     sweep.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1041,6 +1122,11 @@ async fn run_bound(
                     }
                     DhtCommand::VerifyCandidate { addr } => {
                         node.accept_verification(addr).await;
+                    }
+                    DhtCommand::PersistAndShutdown { reply } => {
+                        node.persist();
+                        let _ = reply.send(());
+                        break;
                     }
                 },
                 None => node.commands_open = false,

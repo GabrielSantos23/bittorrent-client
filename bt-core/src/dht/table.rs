@@ -263,6 +263,14 @@ impl RoutingTable {
             .map(|entry| entry.info.addr)
     }
 
+    pub fn entries(&self) -> Vec<NodeEntry> {
+        self.buckets
+            .iter()
+            .flat_map(|bucket| bucket.nodes.iter())
+            .cloned()
+            .collect()
+    }
+
     pub fn bucket_is_stale(&self, bucket_index: u8, now_ms: u64) -> bool {
         let Some(bucket) = self.buckets.get(usize::from(bucket_index)) else {
             return false;

@@ -28,6 +28,28 @@ fn torrent_bytes(private: bool) -> Vec<u8> {
     bytes
 }
 
+fn self_reply_planted(
+    planted: &Mutex<Vec<([u8; 20], SocketAddr)>>,
+    datagram: &[u8],
+) -> Option<Vec<SocketAddr>> {
+    if !datagram.windows(11).any(|window| window == b"9:get_peers") {
+        return None;
+    }
+    let hash_pos = datagram
+        .windows(14)
+        .position(|window| window == b"9:info_hash20:")?
+        + 14;
+    let hash: [u8; 20] = datagram[hash_pos..hash_pos + 20].try_into().ok()?;
+    let peers: Vec<SocketAddr> = planted
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(planted_hash, _)| *planted_hash == hash)
+        .map(|(_, addr)| *addr)
+        .collect();
+    (!peers.is_empty()).then_some(peers)
+}
+
 #[derive(Default)]
 struct DhtObservations {
     queries: Vec<(String, Option<[u8; 20]>)>,
@@ -41,11 +63,16 @@ struct FakeDhtNode {
 
 impl FakeDhtNode {
     async fn spawn() -> FakeDhtNode {
+        Self::spawn_with_peers(Vec::new()).await
+    }
+
+    async fn spawn_with_peers(planted: Vec<([u8; 20], SocketAddr)>) -> FakeDhtNode {
         let socket = std::sync::Arc::new(
             tokio::net::UdpSocket::bind((std::net::Ipv4Addr::new(127, 0, 0, 1), 0))
                 .await
                 .unwrap(),
         );
+        let planted = Arc::new(Mutex::new(planted));
         let observations = Arc::new(Mutex::new(DhtObservations::default()));
         let task_socket = socket.clone();
         let task_observations = observations.clone();
@@ -90,6 +117,19 @@ impl FakeDhtNode {
                 let mut reply = Vec::new();
                 reply.extend_from_slice(b"d1:rd2:id20:");
                 reply.extend_from_slice(&FAKE_NODE_ID);
+                if let Some(peers) = self_reply_planted(&planted, datagram) {
+                    reply.extend_from_slice(b"5:token2:TK6:valuesl");
+                    for peer in peers {
+                        let SocketAddr::V4(v4) = peer else {
+                            continue;
+                        };
+                        reply.push(b'6');
+                        reply.push(b':');
+                        reply.extend_from_slice(&v4.ip().octets());
+                        reply.extend_from_slice(&v4.port().to_be_bytes());
+                    }
+                    reply.push(b'e');
+                }
                 reply.extend_from_slice(b"e1:t2:");
                 reply.extend_from_slice(&datagram[tid_pos..tid_pos + 2]);
                 reply.extend_from_slice(b"1:y1:re");
@@ -130,7 +170,6 @@ struct FakeTcpPeer {
 struct TcpObservations {
     dht_bit_in_handshake: Option<bool>,
     port_message_seen: Option<u16>,
-    message_ids: Vec<u8>,
 }
 
 impl FakeTcpPeer {
@@ -187,7 +226,6 @@ impl FakeTcpPeer {
                     {
                         break;
                     }
-                    task_observations.lock().unwrap().message_ids.push(body[0]);
                     if body[0] == 9 && body.len() == 3 {
                         let port = u16::from_be_bytes([body[1], body[2]]);
                         task_observations.lock().unwrap().port_message_seen = Some(port);
@@ -206,19 +244,6 @@ impl FakeTcpPeer {
 
     fn addr(&self) -> SocketAddr {
         self.bound_addr
-    }
-}
-
-async fn wait_for_opt<T>(condition: impl Fn() -> Option<T>, seconds: u64) -> Option<T> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
-    loop {
-        if let Some(value) = condition() {
-            return Some(value);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -343,16 +368,19 @@ async fn dht_torrent_advertises_bit_sends_port_and_looks_up() {
         Some(true),
         "an active dht must advertise the reserved bit"
     );
-    let waited = wait_for_opt(
-        || tcp_peer.observations.lock().unwrap().port_message_seen,
+    wait_for(
+        || {
+            tcp_peer
+                .observations
+                .lock()
+                .unwrap()
+                .port_message_seen
+                .is_some()
+        },
         10,
+        "engine sent its port message",
     )
     .await;
-    eprintln!(
-        "observed message ids: {:?}",
-        tcp_peer.observations.lock().unwrap().message_ids
-    );
-    assert!(waited.is_some(), "engine sent its port message");
     assert_eq!(
         tcp_peer.observations.lock().unwrap().port_message_seen,
         Some(dht_port),
@@ -411,3 +439,151 @@ async fn port_message_from_peer_triggers_a_verification_ping() {
 
 #[allow(dead_code)]
 fn unused(_: HashSet<u8>) {}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn engine_downloads_a_small_torrent_using_only_dht_peers() {
+    let data = common::test_data();
+    let meta = common::torrent_meta(&data);
+    let fake_peer = SocketAddr::from(([10, 1, 1, 5], 7000));
+    let dht_node = FakeDhtNode::spawn_with_peers(vec![(meta.info_hash, fake_peer)]).await;
+    let integration_handle = bt_core::dht::spawn(
+        DhtOptions::new(0, bt_core::dht::NodeId::from_bytes(SERVICE_ID))
+            .with_bootstrap(vec![format!("127.0.0.1:{}", dht_node.addr().port())])
+            .with_address_filter_for_tests(AddressFilter::permissive_for_tests()),
+    );
+    let status = integration_handle.status();
+    wait_for(|| status.borrow().active, 5, "dht service became active").await;
+    let dht_port = status.borrow().port;
+    let dial = Arc::new(common::FakeDial::new(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![(fake_peer, common::SeederKind::Good)],
+    ));
+    let options = TorrentOptions {
+        bootstrap_peers: Vec::new(),
+        dial,
+        dht: Some(integration(integration_handle.clone(), dht_port)),
+        ..TorrentOptions::default()
+    };
+    let dir = temp_dir("dht-download-out");
+    let torrent = bt_core::engine::Torrent::spawn_with_options(meta, dir.clone(), options)
+        .await
+        .unwrap();
+    let stats = torrent.subscribe();
+    let total = data.len() as u64;
+    wait_for(
+        || stats.borrow().verified_bytes >= total,
+        30,
+        "the torrent downloaded through the dht peer only",
+    )
+    .await;
+    let _ = torrent.stop().await;
+    integration_handle.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn magnet_with_no_trackers_gets_metadata_through_dht() {
+    let data = common::test_data();
+    let meta = common::torrent_meta(&data);
+    let root_value = bt_core::bencode::decode(&common::torrent_bytes(&data)).unwrap();
+    let info_value = match &root_value {
+        bt_core::bencode::Value::Dict(entries) => entries.get(&b"info".to_vec()).unwrap().clone(),
+        _ => unreachable!(),
+    };
+    let info_dict = Arc::new(bt_core::bencode::encode(&info_value));
+    let fake_peer = SocketAddr::from(([10, 1, 1, 6], 7001));
+    let dht_node = FakeDhtNode::spawn_with_peers(vec![(meta.info_hash, fake_peer)]).await;
+    let integration_handle = bt_core::dht::spawn(
+        DhtOptions::new(0, bt_core::dht::NodeId::from_bytes(SERVICE_ID))
+            .with_bootstrap(vec![format!("127.0.0.1:{}", dht_node.addr().port())])
+            .with_address_filter_for_tests(AddressFilter::permissive_for_tests()),
+    );
+    let status = integration_handle.status();
+    wait_for(|| status.borrow().active, 5, "dht service became active").await;
+    let dht_port = status.borrow().port;
+    let dial = Arc::new(common::FakeDial::with_metadata(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![(fake_peer, common::SeederKind::Good)],
+        info_dict,
+    ));
+    let magnet = bt_core::magnet::MagnetLink {
+        info_hash: meta.info_hash,
+        display_name: Some("e2e.bin".to_string()),
+        trackers: Vec::new(),
+        peers: Vec::new(),
+    };
+    let options = TorrentOptions {
+        bootstrap_peers: Vec::new(),
+        dial,
+        dht: Some(integration(integration_handle.clone(), dht_port)),
+        ..TorrentOptions::default()
+    };
+    let dir = temp_dir("dht-magnet-out");
+    let torrent = bt_core::engine::Torrent::spawn_from_magnet(magnet, dir.clone(), options)
+        .await
+        .unwrap();
+    let stats = torrent.subscribe();
+    wait_for(
+        || {
+            matches!(
+                stats.borrow().state,
+                bt_core::engine::State::Downloading | bt_core::engine::State::Completed
+            )
+        },
+        30,
+        "metadata arrived through the dht peer",
+    )
+    .await;
+    let total = data.len() as u64;
+    wait_for(
+        || stats.borrow().verified_bytes >= total,
+        30,
+        "the magnet downloaded through the dht peer only",
+    )
+    .await;
+    assert!(
+        !stats.borrow().dht_waiting,
+        "the waiting flag clears once peers are connected"
+    );
+    let _ = torrent.stop().await;
+    integration_handle.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dht_state_persists_and_a_restart_reuses_the_node_id_and_table() {
+    let dir = temp_dir("dht-persist");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("dht.json");
+    let router = FakeDhtNode::spawn().await;
+    let integration_handle = bt_core::dht::spawn(
+        DhtOptions::new(0, bt_core::dht::NodeId::from_bytes(SERVICE_ID))
+            .with_bootstrap(vec![format!("127.0.0.1:{}", router.addr().port())])
+            .with_persist(Some(path.clone()), Vec::new())
+            .with_address_filter_for_tests(AddressFilter::permissive_for_tests()),
+    );
+    let status = integration_handle.status();
+    wait_for(|| status.borrow().active, 5, "dht service became active").await;
+    integration_handle.persist_and_shutdown().await;
+    let loaded = bt_core::dht::load_state(&path).unwrap();
+    assert_eq!(loaded.node_id, bt_core::dht::NodeId::from_bytes(SERVICE_ID));
+
+    let restarted = bt_core::dht::spawn(
+        DhtOptions::new(0, loaded.node_id)
+            .with_persist(Some(path.clone()), loaded.nodes)
+            .with_address_filter_for_tests(AddressFilter::permissive_for_tests()),
+    );
+    let restarted_status = restarted.status();
+    wait_for(
+        || restarted_status.borrow().node_count >= 1,
+        5,
+        "the restored table is populated",
+    )
+    .await;
+    restarted.shutdown();
+    std::fs::remove_dir_all(dir).unwrap();
+}

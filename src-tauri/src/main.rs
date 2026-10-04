@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use bt_core::dht::DhtStatus;
 use bt_core::engine::State;
 use bt_core::listener::ListenerStatus;
 use bt_core::session::{Session, SessionOptions, TorrentDetail, TorrentSummary};
@@ -207,6 +208,18 @@ fn spawn_listener_events(app: AppHandle, mut status: watch::Receiver<ListenerSta
     });
 }
 
+fn spawn_dht_events(app: AppHandle, mut status: watch::Receiver<DhtStatus>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let snapshot = status.borrow().clone();
+            let _ = app.emit("session://dht", &snapshot);
+            if status.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -277,6 +290,9 @@ fn main() {
 
             let handle = app.handle().clone();
             spawn_listener_events(handle, session.listener_status());
+
+            let handle = app.handle().clone();
+            spawn_dht_events(handle, session.dht_status());
 
             build_tray(app)?;
             Ok(())

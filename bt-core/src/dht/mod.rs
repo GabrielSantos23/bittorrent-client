@@ -4,6 +4,7 @@ mod limiter;
 mod node_id;
 mod schedule;
 mod service;
+mod state;
 mod store;
 mod table;
 mod tokens;
@@ -23,6 +24,9 @@ pub use service::{
     bind, spawn, DhtCommand, DhtHandle, DhtOptions, DhtPeers, DhtStatus, DEFAULT_BOOTSTRAP_ROUTERS,
     LOOKUP_TIME_LIMIT_MS, MAX_CONCURRENT_LOOKUPS, MAX_LOOKUP_QUERIES, MAX_NODES_PER_RESPONSE,
     MAX_VERIFICATIONS, TRANSACTION_TIMEOUT_MS,
+};
+pub use state::{
+    load as load_state, save as save_state, LoadError, LoadedState, MAX_PERSISTED_NODES,
 };
 pub use table::{
     FailureOutcome, Health, NodeEntry, OfferOutcome, RejectReason, ResponseOutcome, RoutingTable,
