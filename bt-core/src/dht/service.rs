@@ -29,8 +29,9 @@ pub const DEFAULT_BOOTSTRAP_ROUTERS: &[&str] = &[
 ];
 
 /// Raw-IP routers consulted only when the configured hostname bootstrap
-/// routers resolve to nothing, so a broken or absent resolver cannot leave
-/// the routing table empty. Overridable through [`DhtOptions`].
+/// routers resolve to nothing or their bootstrap queries go unanswered, so
+/// broken resolvers and dead routers cannot leave the routing table empty.
+/// Overridable through [`DhtOptions`].
 pub const DEFAULT_ROUTER_FALLBACKS: &[&str] = &["212.129.33.59:6881", "87.98.162.88:6881"];
 pub const TRANSACTION_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_PENDING_QUERIES: usize = 128;
@@ -95,8 +96,9 @@ pub struct DhtOptions {
     pub port: u16,
     pub self_id: NodeId,
     pub bootstrap: Vec<String>,
-    /// Routers tried only when every hostname in `bootstrap` fails to
-    /// resolve; defaults to [`DEFAULT_ROUTER_FALLBACKS`].
+    /// Routers tried only when every hostname in `bootstrap` fails to resolve
+    /// or none of them answers a bootstrap query; defaults to
+    /// [`DEFAULT_ROUTER_FALLBACKS`].
     pub router_fallbacks: Vec<String>,
     listener_active: Arc<AtomicBool>,
     announce_port: Arc<AtomicU16>,
@@ -291,6 +293,7 @@ struct FillState {
     active: bool,
     queries_sent: u32,
     candidates: Vec<NodeInfo>,
+    used_fallbacks: bool,
 }
 
 struct Lookup {
@@ -844,6 +847,16 @@ impl NodeState {
             .filter(|query| query.kind == PendingKind::Fill)
             .count();
         if self.fill.candidates.is_empty() && outstanding_fill == 0 {
+            if self.table.is_empty()
+                && !self.fill.used_fallbacks
+                && !self.router_fallbacks.is_empty()
+            {
+                self.fill.used_fallbacks = true;
+                if self.dispatch_fallbacks().await {
+                    self.fill.active = true;
+                    return;
+                }
+            }
             self.fill.active = false;
             return;
         }
@@ -969,9 +982,11 @@ impl NodeState {
 
     async fn bootstrap(&mut self) {
         self.last_bootstrap_ms = Some(self.now_ms());
+        self.fill.used_fallbacks = false;
         let mut targets = resolve_bootstrap(&self.bootstrap).await;
         if targets.is_empty() && !self.bootstrap.is_empty() {
             targets = resolve_bootstrap(&self.router_fallbacks).await;
+            self.fill.used_fallbacks = true;
         }
         self.fill.active = true;
         for addr in targets.into_iter().take(MAX_BOOTSTRAP_TARGETS) {
@@ -989,6 +1004,28 @@ impl NodeState {
             )
             .await;
         }
+    }
+
+    async fn dispatch_fallbacks(&mut self) -> bool {
+        let fallbacks = resolve_bootstrap(&self.router_fallbacks).await;
+        let mut dispatched = false;
+        for addr in fallbacks.into_iter().take(MAX_BOOTSTRAP_TARGETS) {
+            if !self.filter.allows(addr) {
+                continue;
+            }
+            self.queried.insert(addr);
+            self.send_query(
+                addr,
+                Query::FindNode {
+                    target: self.self_id,
+                },
+                PendingKind::Fill,
+                None,
+            )
+            .await;
+            dispatched = true;
+        }
+        dispatched
     }
 
     async fn send_query(
@@ -1122,6 +1159,7 @@ async fn run_bound(
             active: false,
             queries_sent: 0,
             candidates: Vec::new(),
+            used_fallbacks: false,
         },
         lookups: HashMap::new(),
         lookup_queue: VecDeque::new(),
@@ -2001,6 +2039,28 @@ mod tests {
             "the resolving bootstrap router must be queried"
         );
         fallback.expect_silence(Duration::from_secs(2)).await;
+        handle.shutdown();
+    }
+
+    #[tokio::test]
+    async fn router_fallbacks_are_queried_when_routers_never_reply() {
+        let silent_router = FakeNode::bind(1).await;
+        let fallback = FakeNode::bind(2).await;
+        let fallback_addr = fallback.addr();
+        let handle = spawn(
+            permissive_options(0, solid_id(1))
+                .with_bootstrap(vec![format!("127.0.0.1:{}", silent_router.addr().port())])
+                .with_router_fallbacks(vec![format!("{fallback_addr}")]),
+        );
+        let status = handle.status();
+        wait_for_status(status.clone(), |s| s.active, 5).await;
+        let bootstrap_query = silent_router.next_datagram().await;
+        assert!(is_find_node(&bootstrap_query));
+        let request = fallback
+            .recv_raw(Duration::from_secs(15))
+            .await
+            .expect("fallback router must be queried when the router never replies");
+        assert!(is_find_node(&request));
         handle.shutdown();
     }
 
