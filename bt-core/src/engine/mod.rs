@@ -3090,6 +3090,11 @@ impl Engine {
     }
 
     fn tick_stats(&mut self) {
+        // Publish BEFORE rotating the baselines: rotating first made every
+        // tick publish an exactly-zero rate (bytes minus themselves over the
+        // window), and since block arrivals do not publish, those zero
+        // snapshots were almost all the UI ever received.
+        self.publish();
         let now = TokioInstant::now();
         for handle in self.peers.values_mut() {
             handle.rate_base = handle.received_bytes;
@@ -3098,7 +3103,6 @@ impl Engine {
             handle.depth = pipeline_depth(handle.rate_window.rate(), TARGET_RTT, BLOCK_SIZE);
         }
         self.last_rate = (now, self.session_downloaded, self.session_uploaded);
-        self.publish();
     }
 
     fn file_reports(&self) -> Vec<FileStats> {
@@ -3351,6 +3355,99 @@ mod tests {
 
     fn addr(host: &str) -> SocketAddr {
         format!("{host}:1").parse().unwrap()
+    }
+
+    fn stats_engine(dir: &std::path::Path) -> (Engine, watch::Receiver<Stats>) {
+        let raw = boundary_torrent_bytes();
+        let meta = Arc::new(MetaInfo::from_bytes(&raw).unwrap());
+        let priorities = vec![FilePriority::Normal; 3];
+        let storage = Arc::new(Storage::create(&meta, dir, &priorities).unwrap());
+        let (stats_tx, stats_rx) = watch::channel(Stats {
+            state: State::Downloading,
+            name: "test".to_string(),
+            total_length: 0,
+            verified_bytes: 0,
+            wanted_bytes: 0,
+            verified_wanted_bytes: 0,
+            session_downloaded: 0,
+            session_uploaded: 0,
+            upload_rate: 0.0,
+            ratio: 0.0,
+            verified_pieces: 0,
+            piece_count: 0,
+            download_rate: 0.0,
+            peer_count: 0,
+            incoming_peers: 0,
+            outgoing_peers: 0,
+            peers: Vec::new(),
+            trackers: Vec::new(),
+            files: Vec::new(),
+            metadata_progress: None,
+            diag: MetadataDiag::default(),
+            error_retryable: false,
+            error: None,
+            dht_waiting: false,
+            resumed_from_saved_state: false,
+            startup_pieces_hashed: 0,
+            resume_fallback: None,
+        });
+        let (commands_tx, commands_rx) = mpsc::channel(16);
+        let (events_tx, events_rx) = mpsc::channel(1024);
+        let (incoming_tx, incoming_rx) = mpsc::channel(8);
+        let (announce_tx, announce_rx) = mpsc::channel(64);
+        let (_metadata_tx, _metadata_rx) = watch::channel(None::<Arc<Vec<u8>>>);
+        let engine = Engine::new(
+            meta,
+            storage,
+            Arc::new(std::sync::Mutex::new(Vec::new())),
+            None,
+            watch::channel(None).0,
+            tracker::http_client().unwrap_or_else(|_| reqwest::Client::new()),
+            TorrentOptions::default(),
+            stats_tx,
+            commands_rx,
+            events_tx,
+            events_rx,
+            incoming_rx,
+            announce_rx,
+            mpsc::channel(64).0,
+            StartupVerification::FullRecheck(None),
+        );
+        // Silence unused-variable warnings for the senders this test never
+        // drives; the engine only needs them to exist.
+        let _ = (commands_tx, incoming_tx, announce_tx);
+        (engine, stats_rx)
+    }
+
+    #[test]
+    fn stats_ticks_publish_the_window_rate_before_resetting_the_baselines() {
+        let dir = prios_temp_dir("stats-rate");
+        let (mut engine, stats_rx) = stats_engine(&dir);
+
+        // Bytes arrived since spawn: the tick must publish the window rate,
+        // not zero.
+        engine.session_downloaded = 10_000;
+        engine.session_uploaded = 2_000;
+        engine.tick_stats();
+        let snapshot = stats_rx.borrow().clone();
+        assert!(
+            snapshot.download_rate > 0.0,
+            "a tick with bytes in the window must publish a non-zero download rate"
+        );
+        assert!(snapshot.upload_rate > 0.0);
+
+        // An idle tick (no new bytes) correctly reports zero.
+        engine.tick_stats();
+        let snapshot = stats_rx.borrow().clone();
+        assert_eq!(snapshot.download_rate, 0.0);
+        assert_eq!(snapshot.upload_rate, 0.0);
+
+        // New bytes in the next window are visible again.
+        engine.session_downloaded += 5_000;
+        engine.tick_stats();
+        let snapshot = stats_rx.borrow().clone();
+        assert!(snapshot.download_rate > 0.0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn boundary_torrent_bytes() -> Vec<u8> {
