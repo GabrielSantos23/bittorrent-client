@@ -6,4 +6,8 @@ import type { FilePriority } from "./FilePriority";
  * soon as the metadata arrives, so the UI can show the file list and let the
  * user choose priorities before any data is downloaded.
  */
-export type MagnetOptions = { paused: boolean, pause_after_metadata: boolean, file_priorities: Array<[number, FilePriority]>, };
+export type MagnetOptions = { paused: boolean, pause_after_metadata: boolean, file_priorities: Array<[number, FilePriority]>, 
+/**
+ * Overrides the free space check performed when the metadata arrives.
+ */
+skip_free_space_check: boolean, };

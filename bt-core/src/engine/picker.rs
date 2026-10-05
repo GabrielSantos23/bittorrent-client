@@ -130,6 +130,24 @@ impl PiecePicker {
             .count();
     }
 
+    /// Replaces the have state wholesale, for a recheck that runs on a picker
+    /// that already has state: pieces the recheck no longer verifies are
+    /// unmarked and any in-flight piece state is dropped.
+    pub fn reset_have(&mut self, have: &Bitfield) {
+        for index in 0..self.piece_count {
+            if have.get(index) {
+                let _ = self.have.set(index);
+            } else {
+                let _ = self.have.clear(index);
+            }
+        }
+        self.active.clear();
+        self.endgame_extras.clear();
+        self.wanted_missing = (0..self.piece_count)
+            .filter(|&index| self.wanted.get(index) && !self.have.get(index))
+            .count();
+    }
+
     /// Restricts the picker to the wanted piece classes. Returns the in-flight
     /// blocks of pieces that are no longer wanted, as `(peer, index, begin)`
     /// cancel targets, and the indices of the dropped pieces.

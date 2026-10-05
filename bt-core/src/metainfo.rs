@@ -89,7 +89,7 @@ impl MetaInfo {
 
 fn parse_info(dict: &BTreeMap<Vec<u8>, Value>) -> Result<Info, MetaInfoError> {
     let name = get_str(dict, "name")?;
-    validate_path_component(&name, "name")?;
+    validate_component(&name, "name")?;
     let piece_length = get_u64(dict, "piece length")?;
     if piece_length == 0 || piece_length > u32::MAX as u64 {
         return Err(MetaInfoError::InvalidPieceLength(u32::MAX as u64));
@@ -115,6 +115,7 @@ fn parse_info(dict: &BTreeMap<Vec<u8>, Value>) -> Result<Info, MetaInfoError> {
             actual: pieces.len() as u64,
         });
     }
+    validate_path_layout(&name, &content)?;
     Ok(Info {
         name,
         piece_length: piece_length as u32,
@@ -122,6 +123,33 @@ fn parse_info(dict: &BTreeMap<Vec<u8>, Value>) -> Result<Info, MetaInfoError> {
         private,
         content,
     })
+}
+
+/// Validates the torrent's file layout under the native platform's rules:
+/// per-component rules for the name and every path segment, plus a whole
+/// torrent check that no two files would end up as the same file on disk.
+fn validate_path_layout(name: &str, content: &Content) -> Result<(), MetaInfoError> {
+    use crate::paths::{self, PathPlatform};
+    let platform = PathPlatform::native();
+    paths::validate_component(platform, name)
+        .map_err(|err| MetaInfoError::InvalidComponent { key: "name", err })?;
+    let paths: Vec<Vec<String>> = match content {
+        Content::Single { .. } => vec![vec![name.to_string()]],
+        Content::Multi { files } => files
+            .iter()
+            .map(|file| {
+                let mut components = vec![name.to_string()];
+                components.extend(file.path.iter().cloned());
+                components
+            })
+            .collect(),
+    };
+    if let Some(conflict) = paths::detect_path_conflicts(platform, &paths).err() {
+        return Err(MetaInfoError::ConflictingPaths {
+            conflict: conflict.to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn get_pieces(dict: &BTreeMap<Vec<u8>, Value>) -> Result<Vec<[u8; 20]>, MetaInfoError> {
@@ -166,28 +194,27 @@ fn get_path(dict: &BTreeMap<Vec<u8>, Value>) -> Result<Vec<String>, MetaInfoErro
         })
         .collect::<Result<Vec<_>, MetaInfoError>>()?;
     if path.is_empty() {
-        return Err(MetaInfoError::InvalidPath("path"));
+        return Err(MetaInfoError::InvalidComponent {
+            key: "path",
+            err: crate::paths::PathError::Empty,
+        });
     }
     for segment in &path {
-        validate_path_component(segment, "path")?;
+        validate_component(segment, "path")?;
     }
     Ok(path)
 }
 
+fn validate_component(value: &str, key: &'static str) -> Result<(), MetaInfoError> {
+    crate::paths::validate_component(crate::paths::PathPlatform::native(), value)
+        .map_err(|err| MetaInfoError::InvalidComponent { key, err })
+}
+
+/// Traversal-only safety check, used before deleting files by path. The
+/// metainfo parser has already applied the full native platform rules.
 pub(crate) fn validate_path_component(value: &str, key: &'static str) -> Result<(), MetaInfoError> {
-    let bytes = value.as_bytes();
-    let drive_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    if value.is_empty()
-        || value == "."
-        || value == ".."
-        || value.contains('/')
-        || value.contains('\\')
-        || value.contains('\0')
-        || drive_prefix
-    {
-        return Err(MetaInfoError::InvalidPath(key));
-    }
-    Ok(())
+    crate::paths::validate_component(crate::paths::PathPlatform::Unix, value)
+        .map_err(|err| MetaInfoError::InvalidComponent { key, err })
 }
 
 fn parse_announce_list(value: &Value) -> Result<Vec<Vec<String>>, MetaInfoError> {
@@ -498,17 +525,7 @@ mod tests {
 
     #[test]
     fn rejects_unsafe_names() {
-        for name in [
-            "",
-            ".",
-            "..",
-            "a/b",
-            "a\\b",
-            "a\0b",
-            "/etc/passwd",
-            "C:\\temp",
-            "C:",
-        ] {
+        for name in ["", ".", "..", "a/b", "a\\b", "a\0b", "/etc/passwd"] {
             let mut info = Vec::new();
             info.extend_from_slice(b"d6:lengthi6e4:name");
             push_string(&mut info, name);
@@ -518,7 +535,7 @@ mod tests {
             assert!(
                 matches!(
                     MetaInfo::from_bytes(&torrent_with_info(&info)),
-                    Err(MetaInfoError::InvalidPath("name"))
+                    Err(MetaInfoError::InvalidComponent { key: "name", .. })
                 ),
                 "name {name:?} should be rejected"
             );
@@ -526,8 +543,35 @@ mod tests {
     }
 
     #[test]
+    fn colon_names_follow_the_native_platform_rules() {
+        for name in ["C:\\temp", "C:", "a:b"] {
+            let mut info = Vec::new();
+            info.extend_from_slice(b"d6:lengthi6e4:name");
+            push_string(&mut info, name);
+            info.extend_from_slice(b"12:piece lengthi16384e");
+            push_pieces(&mut info);
+            info.push(b'e');
+            let result = MetaInfo::from_bytes(&torrent_with_info(&info));
+            if cfg!(windows) {
+                assert!(
+                    matches!(
+                        result,
+                        Err(MetaInfoError::InvalidComponent { key: "name", .. })
+                    ),
+                    "name {name:?} must be rejected on Windows"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "name {name:?} must be accepted where the colon is an ordinary character"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rejects_unsafe_path_segments() {
-        for segment in ["", ".", "..", "a/b", "a\\b", "a\0b", "C:"] {
+        for segment in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
             let mut info = Vec::new();
             info.extend_from_slice(b"d5:filesld6:lengthi6e4:pathl");
             push_string(&mut info, segment);
@@ -537,11 +581,82 @@ mod tests {
             assert!(
                 matches!(
                     MetaInfo::from_bytes(&torrent_with_info(&info)),
-                    Err(MetaInfoError::InvalidPath("path"))
+                    Err(MetaInfoError::InvalidComponent { key: "path", .. })
                 ),
                 "segment {segment:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn path_segments_follow_the_native_windows_rules() {
+        for segment in ["CON", "con.txt", "a.", "a ", "C:"] {
+            let mut info = Vec::new();
+            info.extend_from_slice(b"d5:filesld6:lengthi6e4:pathl");
+            push_string(&mut info, segment);
+            info.extend_from_slice(b"eee4:name3:dir12:piece lengthi16384e");
+            push_pieces(&mut info);
+            info.push(b'e');
+            let result = MetaInfo::from_bytes(&torrent_with_info(&info));
+            if cfg!(windows) {
+                assert!(
+                    matches!(
+                        result,
+                        Err(MetaInfoError::InvalidComponent { key: "path", .. })
+                    ),
+                    "segment {segment:?} must be rejected on Windows"
+                );
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "segment {segment:?} must be accepted on Unix"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn case_colliding_files_fail_the_torrent_on_windows() {
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d5:filesl");
+        for name in ["A.txt", "a.txt"] {
+            info.extend_from_slice(b"d6:lengthi2e4:pathl");
+            push_string(&mut info, name);
+            info.extend_from_slice(b"ee");
+        }
+        info.extend_from_slice(b"e4:name3:dir12:piece lengthi16384e");
+        push_pieces(&mut info);
+        info.push(b'e');
+        let result = MetaInfo::from_bytes(&torrent_with_info(&info));
+        if cfg!(windows) {
+            assert!(
+                matches!(result, Err(MetaInfoError::ConflictingPaths { .. })),
+                "case-colliding files must fail the torrent on Windows"
+            );
+        } else {
+            assert!(
+                result.is_ok(),
+                "case-differing files are distinct files on Unix"
+            );
+        }
+    }
+
+    #[test]
+    fn identical_file_paths_fail_the_torrent_on_every_platform() {
+        let mut info = Vec::new();
+        info.extend_from_slice(b"d5:filesl");
+        for _ in 0..2 {
+            info.extend_from_slice(b"d6:lengthi2e4:pathl");
+            push_string(&mut info, "same");
+            info.extend_from_slice(b"ee");
+        }
+        info.extend_from_slice(b"e4:name3:dir12:piece lengthi16384e");
+        push_pieces(&mut info);
+        info.push(b'e');
+        assert!(matches!(
+            MetaInfo::from_bytes(&torrent_with_info(&info)),
+            Err(MetaInfoError::ConflictingPaths { .. })
+        ));
     }
 
     #[test]
@@ -552,7 +667,10 @@ mod tests {
         info.push(b'e');
         assert!(matches!(
             MetaInfo::from_bytes(&torrent_with_info(&info)),
-            Err(MetaInfoError::InvalidPath("path"))
+            Err(MetaInfoError::InvalidComponent {
+                key: "path",
+                err: crate::paths::PathError::Empty
+            })
         ));
     }
 

@@ -36,7 +36,7 @@ mod storage;
 
 pub use peer_task::{BoxedStream, Dial, TcpDial};
 pub use resume::remove_snapshot;
-pub use storage::delete_torrent_files;
+pub use storage::{delete_torrent_files, FaultOp, FaultyFs, FileBackend, RealFs};
 
 pub const BLOCK_SIZE: usize = assembly::BLOCK_SIZE;
 const MAX_PEERS: usize = 50;
@@ -161,6 +161,9 @@ pub struct Stats {
     pub metadata_progress: Option<MetadataProgress>,
     pub diag: MetadataDiag,
     pub error: Option<String>,
+    /// Whether the current error can plausibly be fixed by the user and
+    /// retried (disk full, permissions, missing directory...).
+    pub error_retryable: bool,
     pub dht_waiting: bool,
     pub resumed_from_saved_state: bool,
     pub startup_pieces_hashed: usize,
@@ -207,6 +210,7 @@ pub enum EngineCommand {
     Resume,
     Stop,
     SetFilePriorities(Vec<(usize, FilePriority)>),
+    ForceRecheck,
 }
 
 #[derive(Clone)]
@@ -234,6 +238,11 @@ pub struct TorrentOptions {
     /// Magnets only: pause as soon as the metadata arrives so the file list
     /// can be shown and priorities chosen before any data is downloaded.
     pub pause_after_metadata: bool,
+    /// Filesystem boundary; production uses `RealFs`, tests may inject
+    /// `FaultyFs` to simulate disk errors.
+    pub fs: Arc<dyn FileBackend>,
+    /// Overrides the free space check performed before a download starts.
+    pub skip_free_space_check: bool,
 }
 
 impl Default for TorrentOptions {
@@ -252,6 +261,8 @@ impl Default for TorrentOptions {
             resume_dir: None,
             file_priorities: Vec::new(),
             pause_after_metadata: false,
+            fs: Arc::new(storage::RealFs),
+            skip_free_space_check: false,
         }
     }
 }
@@ -278,6 +289,13 @@ impl Torrent {
     ) -> Result<(), EngineError> {
         self.commands
             .send(EngineCommand::SetFilePriorities(priorities))
+            .await
+            .map_err(|_| EngineError::Closed)
+    }
+
+    pub async fn force_recheck(&self) -> Result<(), EngineError> {
+        self.commands
+            .send(EngineCommand::ForceRecheck)
             .await
             .map_err(|_| EngineError::Closed)
     }
@@ -342,6 +360,7 @@ impl Torrent {
                 total: None,
             }),
             diag: MetadataDiag::default(),
+            error_retryable: false,
             error: if no_source {
                 Some(
                     "no peer source available: the magnet has no trackers and no x.pe peers"
@@ -395,9 +414,26 @@ impl Torrent {
         let output_dir_clone = output_dir.clone();
         let priorities = padded_priorities(&options.file_priorities, file_count_of(&meta));
         let priorities_for_storage = priorities.clone();
+        if !options.skip_free_space_check {
+            let meta_for_space = meta.clone();
+            let dir_for_space = output_dir.clone();
+            let priorities_for_space = priorities.clone();
+            let fs = options.fs.clone();
+            spawn_blocking(move || {
+                Storage::check_free_space(
+                    &meta_for_space,
+                    &dir_for_space,
+                    &priorities_for_space,
+                    fs.as_ref(),
+                )
+            })
+            .await
+            .map_err(|_| EngineError::Task)??;
+        }
+        let fs = options.fs.clone();
         let storage = spawn_blocking({
             let meta = meta.clone();
-            move || Storage::create(&meta, &output_dir_clone, &priorities_for_storage)
+            move || Storage::create_with_fs(&meta, &output_dir_clone, &priorities_for_storage, fs)
         })
         .await
         .map_err(|_| EngineError::Task)??;
@@ -480,6 +516,7 @@ impl Torrent {
             files: Vec::new(),
             metadata_progress: None,
             diag: MetadataDiag::default(),
+            error_retryable: false,
             error: None,
             dht_waiting: false,
             resumed_from_saved_state: resumed,
@@ -632,7 +669,11 @@ struct Engine {
     file_priorities: Vec<FilePriority>,
     file_verified: Vec<u64>,
     pause_after_metadata: bool,
+    fs: Arc<dyn FileBackend>,
+    skip_free_space_check: bool,
     error: Option<String>,
+    error_retryable: bool,
+    failed_piece: Option<usize>,
     last_rate: (TokioInstant, u64, u64),
     trackers: Vec<TrackerRuntime>,
     announce_results: mpsc::Receiver<TrackerOutcome>,
@@ -912,6 +953,8 @@ impl Engine {
             resume_dir,
             file_priorities,
             pause_after_metadata,
+            fs,
+            skip_free_space_check,
             ..
         } = options;
         let (dht_results_tx, dht_results) = mpsc::channel(16);
@@ -971,7 +1014,11 @@ impl Engine {
             file_priorities: Vec::new(),
             file_verified: Vec::new(),
             pause_after_metadata,
+            fs,
+            skip_free_space_check,
             error: None,
+            error_retryable: false,
+            failed_piece: None,
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
             diag: MetadataDiag::default(),
@@ -1038,6 +1085,8 @@ impl Engine {
             dht,
             resume_dir,
             pause_after_metadata,
+            fs,
+            skip_free_space_check,
             ..
         } = options;
         let (dht_results_tx, dht_results) = mpsc::channel(16);
@@ -1089,7 +1138,11 @@ impl Engine {
             file_priorities,
             file_verified: Vec::new(),
             pause_after_metadata,
+            fs,
+            skip_free_space_check,
             error: None,
+            error_retryable: false,
+            failed_piece: None,
             last_rate: (TokioInstant::now(), 0, 0),
             pending_pause: false,
             diag: MetadataDiag::default(),
@@ -1338,11 +1391,12 @@ impl Engine {
                 }
             }
             EngineCommand::Pause => self.pause().await,
-            EngineCommand::Resume => self.resume(),
+            EngineCommand::Resume => self.resume().await,
             EngineCommand::Stop => self.stop().await,
             EngineCommand::SetFilePriorities(priorities) => {
                 self.apply_file_priorities(priorities).await;
             }
+            EngineCommand::ForceRecheck => self.force_recheck().await,
         }
     }
 
@@ -1469,7 +1523,9 @@ impl Engine {
                     .have_map
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = have.clone();
-                self.picker().set_have(&have);
+                // A recheck may run on a picker that already has state (force
+                // recheck), so pieces that no longer verify must be unmarked.
+                self.picker().reset_have(&have);
                 let mut verified = 0u64;
                 for index in 0..meta.info.pieces.len() {
                     if have.get(index) {
@@ -1592,20 +1648,109 @@ impl Engine {
         }
     }
 
-    fn resume(&mut self) {
-        if self.state == State::Paused {
-            self.state = if self
-                .picker
-                .as_ref()
-                .is_some_and(|picker| picker.is_complete())
-            {
-                self.completed_state()
+    async fn resume(&mut self) {
+        match self.state {
+            State::Paused => {
+                self.state = if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.is_complete())
+                {
+                    self.completed_state()
+                } else {
+                    State::Downloading
+                };
+                self.queue_event(Event::Started);
+                self.wake_trackers(TokioInstant::now());
+                self.publish();
+            }
+            State::Error => {
+                // Retry after a storage fault: recreate the directories the
+                // download writes into (never deleting anything), requeue the
+                // piece whose write failed and start requesting again.
+                self.error = None;
+                self.error_retryable = false;
+                if let Some(storage) = self.storage.clone() {
+                    match spawn_blocking(move || storage.recreate_directories()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            // The retry cannot even prepare the directories;
+                            // report it and stay in the Error state.
+                            self.error = Some(err.to_string());
+                            self.error_retryable = err.retryable();
+                            self.publish();
+                            return;
+                        }
+                        Err(_) => {
+                            self.error = Some("directory recreation task failed".to_string());
+                            self.error_retryable = true;
+                            self.publish();
+                            return;
+                        }
+                    }
+                }
+                // Blocks in flight were silently dropped while the engine was
+                // in the Error state, so their picker slots are stale: claim
+                // them all back, like a choke would, before requesting again.
+                if let Some(picker) = self.picker.as_mut() {
+                    let peers: Vec<SocketAddr> = self.peers.keys().copied().collect();
+                    for peer in peers {
+                        picker.return_blocks(peer);
+                    }
+                }
+                for handle in self.peers.values_mut() {
+                    handle.in_flight = 0;
+                }
+                self.deferred.clear();
+                if let Some(index) = self.failed_piece.take() {
+                    self.picker().requeue_piece(index);
+                }
+                self.state = if self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.is_complete())
+                {
+                    self.completed_state()
+                } else {
+                    State::Downloading
+                };
+                self.queue_event(Event::Started);
+                self.wake_trackers(TokioInstant::now());
+                self.refill_all().await;
+                self.publish();
+            }
+            _ => {}
+        }
+    }
+
+    /// Re-verifies every piece from disk. Also rewrites the resume snapshot,
+    /// or removes it when nothing survives the recheck, so a stale snapshot
+    /// cannot resurrect pieces that no longer verify.
+    async fn force_recheck(&mut self) {
+        let Some(meta) = self.meta.clone() else {
+            return;
+        };
+        self.disconnect_all().await;
+        let resume_dir = self.resume_dir.clone();
+        let info_hash_hex = crate::hex::encode(&meta.info_hash);
+        self.state = State::Checking;
+        self.publish();
+        self.run_check().await;
+        if self.state == State::Error {
+            return;
+        }
+        let have_count = self
+            .have_map
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .count();
+        if let Some(dir) = resume_dir {
+            if have_count == 0 {
+                self::resume::remove_snapshot(&dir, &info_hash_hex);
             } else {
-                State::Downloading
-            };
-            self.queue_event(Event::Started);
-            self.wake_trackers(TokioInstant::now());
-            self.publish();
+                self.resume_dirty = true;
+                self.write_resume_snapshot().await;
+            }
         }
     }
 
@@ -2075,15 +2220,56 @@ impl Engine {
                 .unwrap_or_default();
             padded_priorities(&pairs, file_count_of(&meta))
         };
+        if !self.skip_free_space_check {
+            let meta_for_space = meta.clone();
+            let dir_for_space = output.clone();
+            let priorities_for_space = file_priorities.clone();
+            let fs = self.fs.clone();
+            match tokio::task::spawn_blocking(move || {
+                Storage::check_free_space(
+                    &meta_for_space,
+                    &dir_for_space,
+                    &priorities_for_space,
+                    fs.as_ref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    self.error = Some(err.to_string());
+                    self.error_retryable = err.retryable();
+                    self.state = State::Error;
+                    self.publish();
+                    return;
+                }
+                Err(_) => {
+                    self.error = Some("free space check failed".to_string());
+                    self.error_retryable = true;
+                    self.state = State::Error;
+                    self.publish();
+                    return;
+                }
+            }
+        }
         let priorities_for_storage = file_priorities.clone();
+        let fs = self.fs.clone();
         let storage = match tokio::task::spawn_blocking(move || {
-            Storage::create(&storage_meta, &output, &priorities_for_storage)
+            Storage::create_with_fs(&storage_meta, &output, &priorities_for_storage, fs)
         })
         .await
         {
             Ok(Ok(storage)) => Arc::new(storage),
-            _ => {
+            Ok(Err(err)) => {
+                self.error = Some(err.to_string());
+                self.error_retryable = err.retryable();
+                self.state = State::Error;
+                self.publish();
+                return;
+            }
+            Err(_) => {
                 self.error = Some("storage creation failed".to_string());
+                self.error_retryable = false;
                 self.state = State::Error;
                 self.publish();
                 return;
@@ -2563,6 +2749,7 @@ impl Engine {
             }
             PeerEvent::Disconnected { addr, reason } => {
                 let label = reason.unwrap_or_else(|| "unknown".to_string());
+                let engine_initiated = label == "clean";
                 *self.diag.peer_close_reasons.entry(label).or_default() += 1;
                 let mut direction = None;
                 if let Some(handle) = self.peers.remove(&addr) {
@@ -2575,7 +2762,9 @@ impl Engine {
                     }
                 }
                 if direction == Some(PeerDirection::Outgoing) {
-                    if self.state == State::Downloading {
+                    // A "clean" close is the engine's own doing (Stop);
+                    // only failures the peer caused earn a connect backoff.
+                    if self.state == State::Downloading && !engine_initiated {
                         self.backoff
                             .insert(addr, TokioInstant::now() + CONNECT_BACKOFF);
                     }
@@ -2714,7 +2903,11 @@ impl Engine {
                 self.refill_all().await;
             }
             Ok(PieceWriteOutcome::Failed(err)) => {
+                // Disk-related write failures are not peer strikes and not
+                // hash failures: the data came back fine, the disk said no.
                 self.error = Some(err.to_string());
+                self.error_retryable = err.retryable();
+                self.failed_piece = Some(index);
                 self.state = State::Error;
             }
             Err(_) => self.state = State::Error,
@@ -3025,6 +3218,7 @@ impl Engine {
                 .map(|pending| pending.received_of_total()),
             diag: self.diag.clone(),
             error: self.error.clone(),
+            error_retryable: self.error_retryable,
             dht_waiting: self.dht_waiting(),
             resumed_from_saved_state: self.resumed_from_saved_state,
             startup_pieces_hashed: self.startup_pieces_hashed,

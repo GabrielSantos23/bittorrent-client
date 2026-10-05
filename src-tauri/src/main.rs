@@ -39,6 +39,7 @@ async fn add_torrent(
     path: String,
     paused: Option<bool>,
     file_priorities: Option<Vec<(u32, FilePriority)>>,
+    skip_free_space_check: Option<bool>,
 ) -> Result<String, String> {
     let path = PathBuf::from(path);
     let metadata =
@@ -60,6 +61,7 @@ async fn add_torrent(
             .into_iter()
             .map(|(index, priority)| (index as usize, priority))
             .collect(),
+        skip_free_space_check: skip_free_space_check.unwrap_or(false),
     };
     state
         .session
@@ -74,12 +76,14 @@ async fn add_magnet(
     uri: String,
     paused: Option<bool>,
     pause_after_metadata: Option<bool>,
+    skip_free_space_check: Option<bool>,
 ) -> Result<String, String> {
     let download_dir = lock_settings(&state).download_dir.clone();
     let options = MagnetOptions {
         paused: paused.unwrap_or(false),
         pause_after_metadata: pause_after_metadata.unwrap_or(false),
         file_priorities: Vec::new(),
+        skip_free_space_check: skip_free_space_check.unwrap_or(false),
     };
     state
         .session
@@ -101,6 +105,15 @@ async fn set_file_priorities(
     state
         .session
         .set_file_priorities(&id, priorities)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn force_recheck(state: tauri::State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .session
+        .force_recheck(&id)
         .await
         .map_err(|err| err.to_string())
 }
@@ -376,6 +389,7 @@ fn main() {
             add_torrent,
             add_magnet,
             set_file_priorities,
+            force_recheck,
             list_torrents,
             get_listener_status,
             get_dht_status,

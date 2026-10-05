@@ -10,6 +10,7 @@ pub mod hex;
 pub mod listener;
 pub mod magnet;
 pub mod metainfo;
+pub mod paths;
 pub mod peer;
 pub mod peer_id;
 pub mod percent;

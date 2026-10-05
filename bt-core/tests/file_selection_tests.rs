@@ -115,6 +115,7 @@ async fn downloads_only_the_selected_file_of_a_multi_file_torrent() {
             &bytes,
             dir.clone(),
             AddOptions {
+                skip_free_space_check: false,
                 paused: false,
                 file_priorities: vec![
                     (0, FilePriority::Skip),
@@ -209,6 +210,7 @@ async fn priority_change_at_runtime_cancels_in_flight_blocks() {
             &bytes,
             dir.clone(),
             AddOptions {
+                skip_free_space_check: false,
                 paused: false,
                 file_priorities: vec![(1, FilePriority::Skip)],
             },
@@ -321,6 +323,7 @@ async fn announce_left_counts_all_unverified_bytes_and_completed_event_waits_for
             &bytes,
             dir.clone(),
             AddOptions {
+                skip_free_space_check: false,
                 paused: false,
                 file_priorities: vec![(0, FilePriority::Skip)],
             },
@@ -437,6 +440,7 @@ async fn pause_after_metadata_lets_the_user_choose_before_any_download() {
             &uri,
             dir.clone(),
             MagnetOptions {
+                skip_free_space_check: false,
                 paused: false,
                 pause_after_metadata: true,
                 file_priorities: Vec::new(),
@@ -517,6 +521,7 @@ async fn priorities_persist_across_restarts() {
             &bytes,
             dir.clone(),
             AddOptions {
+                skip_free_space_check: false,
                 paused: false,
                 file_priorities: vec![(0, FilePriority::High), (1, FilePriority::Skip)],
             },
@@ -593,6 +598,7 @@ async fn resume_works_when_a_skipped_file_was_never_created() {
             &bytes,
             dir.clone(),
             AddOptions {
+                skip_free_space_check: false,
                 paused: false,
                 file_priorities: vec![(0, FilePriority::Skip)],
             },

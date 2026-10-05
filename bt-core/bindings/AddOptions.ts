@@ -5,4 +5,8 @@ import type { FilePriority } from "./FilePriority";
  * Options for adding a .torrent: start paused, and optionally select file
  * priorities up front (sparse `(file index, priority)` pairs, default Normal).
  */
-export type AddOptions = { paused: boolean, file_priorities: Array<[number, FilePriority]>, };
+export type AddOptions = { paused: boolean, file_priorities: Array<[number, FilePriority]>, 
+/**
+ * Overrides the free space check performed before the download starts.
+ */
+skip_free_space_check: boolean, };

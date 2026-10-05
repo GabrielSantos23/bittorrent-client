@@ -33,6 +33,9 @@ pub struct AddOptions {
     pub paused: bool,
     #[serde(default)]
     pub file_priorities: Vec<(usize, FilePriority)>,
+    /// Overrides the free space check performed before the download starts.
+    #[serde(default)]
+    pub skip_free_space_check: bool,
 }
 
 /// Options for adding a magnet. `pause_after_metadata` pauses the torrent as
@@ -47,6 +50,9 @@ pub struct MagnetOptions {
     pub pause_after_metadata: bool,
     #[serde(default)]
     pub file_priorities: Vec<(usize, FilePriority)>,
+    /// Overrides the free space check performed when the metadata arrives.
+    #[serde(default)]
+    pub skip_free_space_check: bool,
 }
 
 #[derive(Clone)]
@@ -60,6 +66,7 @@ pub struct SessionOptions {
     pub dht_enabled: bool,
     pub dht_port: u16,
     pub dht_bootstrap: Vec<String>,
+    pub fs: Arc<dyn crate::engine::FileBackend>,
 }
 
 impl SessionOptions {
@@ -75,6 +82,7 @@ impl SessionOptions {
             dht_enabled: true,
             dht_port: listen_port,
             dht_bootstrap: Vec::new(),
+            fs: Arc::new(crate::engine::RealFs),
         }
     }
 
@@ -109,6 +117,7 @@ pub struct TorrentSummary {
     pub peer_count: usize,
     pub output_dir: PathBuf,
     pub error: Option<String>,
+    pub error_retryable: bool,
     pub dht_waiting: bool,
 }
 
@@ -158,6 +167,10 @@ enum SessionCommand {
     SetFilePriorities {
         id: String,
         priorities: Vec<(usize, FilePriority)>,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    ForceRecheck {
+        id: String,
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
     Pause {
@@ -379,6 +392,7 @@ impl Session {
                 port: dht_port.clone(),
             }),
             resume_dir: persistence.clone(),
+            fs: options.fs,
         };
         let mut restore_errors = Vec::new();
         let mut restored = Vec::new();
@@ -398,6 +412,7 @@ impl Session {
                             paused: entry.paused,
                             pause_after_metadata: entry.pause_after_metadata,
                             file_priorities: entry.file_priorities.clone(),
+                            skip_free_space_check: false,
                         },
                     ));
                 }
@@ -418,6 +433,7 @@ impl Session {
                                     AddOptions {
                                         paused: entry.paused,
                                         file_priorities: entry.file_priorities.clone(),
+                                        skip_free_space_check: false,
                                     },
                                 ))
                             } else {
@@ -617,6 +633,18 @@ impl Session {
         rx.await.map_err(|_| SessionError::Closed)?
     }
 
+    pub async fn force_recheck(&self, id: &str) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::ForceRecheck {
+                id: id.to_string(),
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
     pub async fn pause(&self, id: &str) -> Result<(), SessionError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -700,6 +728,7 @@ struct EngineWiring {
     peer_id: [u8; 20],
     dht: Option<crate::engine::DhtIntegration>,
     resume_dir: Option<PathBuf>,
+    fs: Arc<dyn crate::engine::FileBackend>,
 }
 
 struct SessionActor {
@@ -848,6 +877,17 @@ impl SessionActor {
                 reply,
             } => {
                 let result = self.set_file_priorities(&id, priorities).await;
+                let _ = reply.send(result);
+            }
+            SessionCommand::ForceRecheck { id, reply } => {
+                let result = match self.torrents.get(&id) {
+                    Some(entry) => entry
+                        .handle
+                        .force_recheck()
+                        .await
+                        .map_err(SessionError::from),
+                    None => Err(SessionError::Unknown(id.clone())),
+                };
                 let _ = reply.send(result);
             }
             SessionCommand::Pause { id, reply } => {
@@ -1122,6 +1162,8 @@ async fn spawn_magnet_entry(
         // A paused magnet pauses when the metadata arrives; without this the
         // engine would leave FetchingMetadata straight into Downloading.
         pause_after_metadata: options.paused || options.pause_after_metadata,
+        fs: wiring.fs.clone(),
+        skip_free_space_check: options.skip_free_space_check,
     };
     let handle = Torrent::spawn_from_magnet(link, output_dir.clone(), engine_options).await?;
     let stats = handle.subscribe();
@@ -1174,6 +1216,8 @@ async fn spawn_entry(
         resume_dir: wiring.resume_dir.clone(),
         file_priorities: options.file_priorities.clone(),
         pause_after_metadata: false,
+        fs: wiring.fs.clone(),
+        skip_free_space_check: options.skip_free_space_check,
     };
     let handle =
         Torrent::spawn_with_options((*meta).clone(), output_dir.clone(), engine_options).await?;
@@ -1226,6 +1270,7 @@ fn make_summary(id: &str, entry: &SessionTorrent) -> TorrentSummary {
         peer_count: stats.peer_count,
         output_dir: entry.output_dir.clone(),
         error: stats.error,
+        error_retryable: stats.error_retryable,
         dht_waiting: stats.dht_waiting,
     }
 }

@@ -9,4 +9,4 @@ wanted_bytes: number,
 /**
  * Progress relative to the wanted bytes.
  */
-progress: number, download_rate: number, session_uploaded: number, upload_rate: number, ratio: number, eta_seconds: number | null, peer_count: number, output_dir: string, error: string | null, dht_waiting: boolean, };
+progress: number, download_rate: number, session_uploaded: number, upload_rate: number, ratio: number, eta_seconds: number | null, peer_count: number, output_dir: string, error: string | null, error_retryable: boolean, dht_waiting: boolean, };

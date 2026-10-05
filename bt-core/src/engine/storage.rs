@@ -1,14 +1,15 @@
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use sha1::{Digest, Sha1};
 
 use crate::engine::FilePriority;
-use crate::error::StorageError;
+use crate::error::{classify_dir_io, classify_file_io, StorageError};
 use crate::metainfo::{Content, MetaInfo};
+use crate::paths;
 use crate::peer::Bitfield;
 
 pub struct FileSlot {
@@ -20,11 +21,190 @@ pub struct FileSlot {
     dirty: AtomicBool,
 }
 
+/// The filesystem boundary behind [`Storage`]. Production uses [`RealFs`];
+/// tests install a [`FaultyFs`] to inject disk errors.
+pub trait FileBackend: Send + Sync + 'static {
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()>;
+    fn exists(&self, path: &Path) -> bool;
+    fn open_rw(&self, path: &Path) -> std::io::Result<File>;
+    fn set_len(&self, file: &File, len: u64) -> std::io::Result<()>;
+    /// One read at `offset`; short reads are allowed, the caller loops.
+    fn read_at(&self, file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize>;
+    fn write_all_at(&self, file: &File, offset: u64, data: &[u8]) -> std::io::Result<()>;
+    fn sync_data(&self, file: &File) -> std::io::Result<()>;
+    fn available_space(&self, path: &Path) -> std::io::Result<u64>;
+}
+
+#[derive(Debug, Default)]
+pub struct RealFs;
+
+impl FileBackend for RealFs {
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
+    fn open_rw(&self, path: &Path) -> std::io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+    }
+
+    fn set_len(&self, file: &File, len: u64) -> std::io::Result<()> {
+        file.set_len(len)
+    }
+
+    fn read_at(&self, file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read(buf)
+    }
+
+    fn write_all_at(&self, file: &File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(data)
+    }
+
+    fn sync_data(&self, file: &File) -> std::io::Result<()> {
+        file.sync_data()
+    }
+
+    fn available_space(&self, path: &Path) -> std::io::Result<u64> {
+        fs4::available_space(path)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FaultOp {
+    CreateDirAll,
+    Open,
+    SetLen,
+    Read,
+    Write,
+    SyncData,
+}
+
+/// A filesystem double that delegates to the real filesystem but fails the
+/// configured operations with the configured io error kinds, and can report
+/// an injected amount of available space.
+#[derive(Debug, Default)]
+pub struct FaultyFs {
+    faults: Mutex<Vec<(FaultOp, u32, std::io::ErrorKind)>>,
+    available_space: Mutex<Option<u64>>,
+    real: RealFs,
+}
+
+impl FaultyFs {
+    pub fn new() -> FaultyFs {
+        FaultyFs::default()
+    }
+
+    /// Fails the next `times` operations of `op` with `kind`.
+    pub fn fail(&self, op: FaultOp, times: u32, kind: std::io::ErrorKind) {
+        self.faults
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((op, times, kind));
+    }
+
+    pub fn clear_faults(&self) {
+        self.faults
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
+    }
+
+    pub fn set_available_space(&self, bytes: Option<u64>) {
+        *self
+            .available_space
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = bytes;
+    }
+
+    fn take_fault(&self, op: FaultOp) -> Option<std::io::ErrorKind> {
+        let mut faults = self.faults.lock().unwrap_or_else(|p| p.into_inner());
+        for entry in faults.iter_mut() {
+            if entry.0 == op && entry.1 > 0 {
+                entry.1 -= 1;
+                return Some(entry.2);
+            }
+        }
+        None
+    }
+}
+
+impl FileBackend for FaultyFs {
+    fn create_dir_all(&self, path: &Path) -> std::io::Result<()> {
+        if let Some(kind) = self.take_fault(FaultOp::CreateDirAll) {
+            return Err(std::io::Error::from(kind));
+        }
+        self.real.create_dir_all(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.real.exists(path)
+    }
+
+    fn open_rw(&self, path: &Path) -> std::io::Result<File> {
+        if let Some(kind) = self.take_fault(FaultOp::Open) {
+            return Err(std::io::Error::from(kind));
+        }
+        self.real.open_rw(path)
+    }
+
+    fn set_len(&self, file: &File, len: u64) -> std::io::Result<()> {
+        if let Some(kind) = self.take_fault(FaultOp::SetLen) {
+            return Err(std::io::Error::from(kind));
+        }
+        self.real.set_len(file, len)
+    }
+
+    fn read_at(&self, file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(kind) = self.take_fault(FaultOp::Read) {
+            return Err(std::io::Error::from(kind));
+        }
+        self.real.read_at(file, offset, buf)
+    }
+
+    fn write_all_at(&self, file: &File, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        if let Some(kind) = self.take_fault(FaultOp::Write) {
+            return Err(std::io::Error::from(kind));
+        }
+        self.real.write_all_at(file, offset, data)
+    }
+
+    fn sync_data(&self, file: &File) -> std::io::Result<()> {
+        if let Some(kind) = self.take_fault(FaultOp::SyncData) {
+            return Err(std::io::Error::from(kind));
+        }
+        self.real.sync_data(file)
+    }
+
+    fn available_space(&self, path: &Path) -> std::io::Result<u64> {
+        let injected = *self
+            .available_space
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match injected {
+            Some(bytes) => Ok(bytes),
+            None => self.real.available_space(path),
+        }
+    }
+}
+
 pub struct Storage {
     slots: Vec<FileSlot>,
     piece_length: u32,
     total_length: u64,
     priorities: Vec<FilePriority>,
+    fs: Arc<dyn FileBackend>,
 }
 
 impl Storage {
@@ -33,7 +213,22 @@ impl Storage {
         output_dir: &Path,
         priorities: &[FilePriority],
     ) -> Result<Storage, StorageError> {
-        std::fs::create_dir_all(output_dir)?;
+        Storage::create_with_fs(meta, output_dir, priorities, Arc::new(RealFs))
+    }
+
+    pub fn create_with_fs(
+        meta: &MetaInfo,
+        output_dir: &Path,
+        priorities: &[FilePriority],
+        fs: Arc<dyn FileBackend>,
+    ) -> Result<Storage, StorageError> {
+        if fs.exists(output_dir) && !output_dir.is_dir() {
+            return Err(StorageError::OutputDirMissing {
+                path: output_dir.to_path_buf(),
+            });
+        }
+        fs.create_dir_all(&paths::prepare_file_path(output_dir))
+            .map_err(|err| classify_dir_io(output_dir, err))?;
         let entries: Vec<(Vec<String>, u64)> = match &meta.info.content {
             Content::Single { length } => vec![(vec![meta.info.name.clone()], *length)],
             Content::Multi { files } => files
@@ -71,17 +266,16 @@ impl Storage {
                 });
             } else {
                 if let Some(parent) = full.parent() {
-                    std::fs::create_dir_all(parent)?;
+                    fs.create_dir_all(&paths::prepare_file_path(parent))
+                        .map_err(|err| classify_dir_io(parent, err))?;
                 }
-                let existed = full.exists();
-                let file = OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
-                    .open(&full)?;
+                let existed = fs.exists(&full);
+                let file = fs
+                    .open_rw(&paths::prepare_file_path(&full))
+                    .map_err(|err| classify_file_io(&full, err))?;
                 if !existed && *length > 0 {
-                    file.set_len(*length)?;
+                    fs.set_len(&file, *length)
+                        .map_err(|err| classify_file_io(&full, err))?;
                 }
                 slots.push(FileSlot {
                     offset,
@@ -99,6 +293,7 @@ impl Storage {
             piece_length: meta.info.piece_length,
             total_length: offset,
             priorities: priorities.to_vec(),
+            fs,
         })
     }
 
@@ -141,19 +336,37 @@ impl Storage {
         Ok(())
     }
 
+    /// Recreates missing parent directories of files that will be written.
+    /// Never deletes anything; used when a download retries after a fault.
+    pub fn recreate_directories(&self) -> Result<(), StorageError> {
+        for slot in &self.slots {
+            if slot.skip.load(Ordering::SeqCst) {
+                continue;
+            }
+            if let Some(parent) = slot.path.parent() {
+                self.fs
+                    .create_dir_all(&paths::prepare_file_path(parent))
+                    .map_err(|err| classify_dir_io(parent, err))?;
+            }
+        }
+        Ok(())
+    }
+
     fn open_slot(&self, slot_index: usize) -> Result<File, StorageError> {
         let slot = &self.slots[slot_index];
         if let Some(parent) = slot.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            self.fs
+                .create_dir_all(&paths::prepare_file_path(parent))
+                .map_err(|err| classify_dir_io(parent, err))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&slot.path)?;
+        let file = self
+            .fs
+            .open_rw(&paths::prepare_file_path(&slot.path))
+            .map_err(|err| classify_file_io(&slot.path, err))?;
         if slot.length > 0 {
-            file.set_len(slot.length)?;
+            self.fs
+                .set_len(&file, slot.length)
+                .map_err(|err| classify_file_io(&slot.path, err))?;
         }
         Ok(file)
     }
@@ -186,13 +399,13 @@ impl Storage {
             let result = {
                 let mut guard = lock_file(&slot.file);
                 match guard.as_mut() {
-                    Some(file) => file.sync_data(),
+                    Some(file) => self.fs.sync_data(file),
                     None => Ok(()),
                 }
             };
             if let Err(err) = result {
                 slot.dirty.store(true, Ordering::SeqCst);
-                return Err(err.into());
+                return Err(classify_file_io(&slot.path, err));
             }
         }
         Ok(())
@@ -261,13 +474,20 @@ impl Storage {
                 cursor += span_length;
                 continue;
             };
-            file.seek(SeekFrom::Start(file_offset))?;
             let mut filled = 0usize;
             while filled < span_length {
-                match file.read(&mut buffer[cursor + filled..cursor + span_length])? {
-                    0 => break,
-                    read => filled += read,
+                let read = self
+                    .fs
+                    .read_at(
+                        file,
+                        file_offset + filled as u64,
+                        &mut buffer[cursor + filled..cursor + span_length],
+                    )
+                    .map_err(|err| classify_file_io(&slot.path, err))?;
+                if read == 0 {
+                    break;
                 }
+                filled += read;
             }
             cursor += span_length;
         }
@@ -286,16 +506,21 @@ impl Storage {
                 cursor += length;
                 continue;
             };
-            file.seek(SeekFrom::Start(file_offset))?;
             let mut filled = 0usize;
             while filled < length {
-                match file.read(&mut buf[cursor + filled..cursor + length])? {
-                    0 => {
-                        buf[cursor + filled..cursor + length].fill(0);
-                        break;
-                    }
-                    read => filled += read,
+                let read = self
+                    .fs
+                    .read_at(
+                        file,
+                        file_offset + filled as u64,
+                        &mut buf[cursor + filled..cursor + length],
+                    )
+                    .map_err(|err| classify_file_io(&slot.path, err))?;
+                if read == 0 {
+                    buf[cursor + filled..cursor + length].fill(0);
+                    break;
                 }
+                filled += read;
             }
             cursor += length;
         }
@@ -318,10 +543,71 @@ impl Storage {
                     guard.insert(self.open_slot(slot_index)?)
                 }
             };
-            file.seek(SeekFrom::Start(file_offset))?;
-            file.write_all(&data[cursor..cursor + length])?;
+            self.fs
+                .write_all_at(file, file_offset, &data[cursor..cursor + length])
+                .map_err(|err| classify_file_io(&slot.path, err))?;
             slot.dirty.store(true, Ordering::SeqCst);
             cursor += length;
+        }
+        Ok(())
+    }
+
+    /// Bytes still to be written for the non-skipped files: their declared
+    /// lengths minus what already exists on disk.
+    pub fn bytes_still_needed(
+        meta: &MetaInfo,
+        output_dir: &Path,
+        priorities: &[FilePriority],
+    ) -> u64 {
+        let entries: Vec<(Vec<String>, u64)> = match &meta.info.content {
+            Content::Single { length } => vec![(vec![meta.info.name.clone()], *length)],
+            Content::Multi { files } => files
+                .iter()
+                .map(|file| {
+                    let mut path = vec![meta.info.name.clone()];
+                    path.extend(file.path.clone());
+                    (path, file.length)
+                })
+                .collect(),
+        };
+        let mut needed = 0u64;
+        for (index, (segments, length)) in entries.iter().enumerate() {
+            if priorities
+                .get(index)
+                .copied()
+                .unwrap_or(FilePriority::Normal)
+                .is_skip()
+            {
+                continue;
+            }
+            let mut full = output_dir.to_path_buf();
+            for segment in segments {
+                full.push(segment);
+            }
+            let existing = std::fs::metadata(&full).map(|meta| meta.len()).unwrap_or(0);
+            needed += length.saturating_sub(existing);
+        }
+        needed
+    }
+
+    /// Free space check for the wanted bytes of a torrent, honoring file
+    /// priorities: skipped files do not count.
+    pub fn check_free_space(
+        meta: &MetaInfo,
+        output_dir: &Path,
+        priorities: &[FilePriority],
+        fs: &dyn FileBackend,
+    ) -> Result<(), StorageError> {
+        let needed = Storage::bytes_still_needed(meta, output_dir, priorities);
+        let available = fs
+            .available_space(&paths::prepare_file_path(output_dir))
+            .map_err(|err| classify_dir_io(output_dir, err))?;
+        if available < needed {
+            return Err(StorageError::NotEnoughSpace {
+                path: output_dir.to_path_buf(),
+                needed,
+                available,
+            });
         }
         Ok(())
     }
@@ -349,8 +635,9 @@ pub fn delete_torrent_files(meta: &MetaInfo, output_dir: &Path) -> Result<(), St
         for segment in segments {
             full.push(segment);
         }
+        let full = paths::prepare_file_path(&full);
         if full.is_file() {
-            fs::remove_file(&full)?;
+            std::fs::remove_file(&full)?;
         }
         let mut parent = full.parent();
         while let Some(current) = parent {
@@ -364,7 +651,7 @@ pub fn delete_torrent_files(meta: &MetaInfo, output_dir: &Path) -> Result<(), St
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     dirs.dedup();
     for dir in dirs {
-        match fs::remove_dir(&dir) {
+        match std::fs::remove_dir(&dir) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
             Err(err) => return Err(err.into()),

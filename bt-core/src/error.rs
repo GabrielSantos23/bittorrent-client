@@ -1,5 +1,7 @@
 use thiserror::Error;
 
+use std::path::{Path, PathBuf};
+
 #[derive(Debug, Error)]
 pub enum BencodeError {
     #[error("unexpected end of input at byte {0}")]
@@ -42,8 +44,13 @@ pub enum MetaInfoError {
     PieceCountMismatch { expected: u64, actual: u64 },
     #[error("file lengths overflow a u64 total")]
     LengthOverflow,
-    #[error("key '{0}' contains an unsafe path")]
-    InvalidPath(&'static str),
+    #[error("key '{key}' contains an invalid path component: {err}")]
+    InvalidComponent {
+        key: &'static str,
+        err: crate::paths::PathError,
+    },
+    #[error("torrent file layout conflict: {conflict}")]
+    ConflictingPaths { conflict: String },
 }
 
 #[derive(Debug, Error)]
@@ -130,6 +137,70 @@ pub enum StorageError {
     PieceOutOfRange(usize),
     #[error("torrent contains an unsafe path")]
     UnsafePath,
+    #[error("disk full while writing {path}")]
+    DiskFull { path: PathBuf },
+    #[error("permission denied for {path}")]
+    PermissionDenied { path: PathBuf },
+    #[error("the filesystem holding {path} is read-only")]
+    ReadOnlyFilesystem { path: PathBuf },
+    #[error("output directory is missing or not a directory: {path}")]
+    OutputDirMissing { path: PathBuf },
+    #[error("path is too long: {path}")]
+    PathTooLong { path: PathBuf },
+    #[error("not enough free space for {path}: {needed} bytes needed, {available} available")]
+    NotEnoughSpace {
+        path: PathBuf,
+        needed: u64,
+        available: u64,
+    },
+}
+
+impl StorageError {
+    /// Whether the user can plausibly fix the situation and retry (free
+    /// space, permissions, recreating the directory) as opposed to errors
+    /// that need different input.
+    pub fn retryable(&self) -> bool {
+        matches!(
+            self,
+            StorageError::DiskFull { .. }
+                | StorageError::PermissionDenied { .. }
+                | StorageError::ReadOnlyFilesystem { .. }
+                | StorageError::OutputDirMissing { .. }
+                | StorageError::NotEnoughSpace { .. }
+        )
+    }
+}
+
+/// Maps an io error that happened while touching `path` to the typed error.
+pub(crate) fn classify_file_io(path: &Path, err: std::io::Error) -> StorageError {
+    match err.kind() {
+        std::io::ErrorKind::StorageFull => StorageError::DiskFull { path: path.into() },
+        std::io::ErrorKind::PermissionDenied => {
+            StorageError::PermissionDenied { path: path.into() }
+        }
+        std::io::ErrorKind::ReadOnlyFilesystem => {
+            StorageError::ReadOnlyFilesystem { path: path.into() }
+        }
+        std::io::ErrorKind::InvalidFilename => StorageError::PathTooLong { path: path.into() },
+        _ => StorageError::Io(err),
+    }
+}
+
+/// Maps an io error from creating a directory; a missing parent means the
+/// output directory cannot exist yet.
+pub(crate) fn classify_dir_io(path: &Path, err: std::io::Error) -> StorageError {
+    match err.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory => {
+            StorageError::OutputDirMissing { path: path.into() }
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            StorageError::PermissionDenied { path: path.into() }
+        }
+        std::io::ErrorKind::ReadOnlyFilesystem => {
+            StorageError::ReadOnlyFilesystem { path: path.into() }
+        }
+        _ => StorageError::Io(err),
+    }
 }
 
 #[derive(Debug, Error)]

@@ -90,17 +90,21 @@ pub fn load_snapshot(path: &Path) -> Result<ResumeSnapshot, ResumeError> {
 pub fn current_fingerprints(paths: &[PathBuf]) -> Vec<Option<FileFingerprint>> {
     paths
         .iter()
-        .map(|path| match std::fs::metadata(path) {
-            Ok(metadata) if metadata.is_file() => metadata.modified().ok().and_then(|modified| {
-                let since_epoch = modified.duration_since(UNIX_EPOCH).ok()?;
-                Some(FileFingerprint {
-                    length: metadata.len(),
-                    modified_secs: since_epoch.as_secs(),
-                    modified_nanos: since_epoch.subsec_nanos(),
-                })
-            }),
-            _ => None,
-        })
+        .map(
+            |path| match std::fs::metadata(crate::paths::prepare_file_path(path)) {
+                Ok(metadata) if metadata.is_file() => {
+                    metadata.modified().ok().and_then(|modified| {
+                        let since_epoch = modified.duration_since(UNIX_EPOCH).ok()?;
+                        Some(FileFingerprint {
+                            length: metadata.len(),
+                            modified_secs: since_epoch.as_secs(),
+                            modified_nanos: since_epoch.subsec_nanos(),
+                        })
+                    })
+                }
+                _ => None,
+            },
+        )
         .collect()
 }
 
