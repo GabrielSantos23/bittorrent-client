@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src-tauri/ui/package-lock.json
+
+      - name: npm ci
+        working-directory: src-tauri/ui
+        run: npm ci
+
+      - name: Build the NSIS installer
+        run: npx -y @tauri-apps/cli@^2 build
+
+      - name: Checksums
+        shell: bash
+        run: |
+          cd src-tauri/target/release/bundle/nsis
+          sha256sum *.exe > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer-${{ github.ref_name }}
+          path: |
+            target/release/bundle/nsis/*.exe
+            target/release/bundle/nsis/sha256sums.txt
+
+      - name: Attach to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --draft --verify-tag || true
+          gh release upload "$GITHUB_REF_NAME" \
+            target/release/bundle/nsis/*.exe \
+            target/release/bundle/nsis/sha256sums.txt \
+            --clobber

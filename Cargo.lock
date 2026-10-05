@@ -324,7 +324,7 @@ dependencies = [
 
 [[package]]
 name = "bt-app"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bt-core",
  "serde",
@@ -339,7 +339,7 @@ dependencies = [
 
 [[package]]
 name = "bt-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bt-core",
  "tokio",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "bt-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bytes",
  "fs4",

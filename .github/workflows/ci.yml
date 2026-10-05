@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (warnings denied)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Live network tests (dht_live, tracker_live) are #[ignore]d; they run
+      # through the "Live tests" workflow instead.
+      - name: cargo test
+        run: cargo test --workspace
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src-tauri/ui/package-lock.json
+
+      - name: npm ci
+        working-directory: src-tauri/ui
+        run: npm ci
+
+      - name: typecheck
+        working-directory: src-tauri/ui
+        run: npm run typecheck
+
+      - name: vitest
+        working-directory: src-tauri/ui
+        run: npm run test
+
+      - name: UI build
+        working-directory: src-tauri/ui
+        run: npm run build
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: src-tauri/ui/package-lock.json
+
+      - name: npm audit (production dependencies)
+        working-directory: src-tauri/ui
+        run: npm audit --omit=dev --audit-level=high
