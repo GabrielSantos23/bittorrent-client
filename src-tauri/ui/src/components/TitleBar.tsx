@@ -6,6 +6,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/animate-ui/components/radix/tooltip";
+import UpdateButton from "@/components/UpdateButton";
 
 // Caption glyphs are drawn on a 10×10 grid with 1px strokes to match the
 // Segoe Fluent caption icons; lucide's 24-grid outlines look too heavy at
@@ -167,6 +168,7 @@ export default function TitleBar({
           </TooltipTrigger>
           <TooltipContent side="bottom">Toggle sidebar</TooltipContent>
         </Tooltip>
+        <UpdateButton />
         <button
           type="button"
           className={captionButton}
