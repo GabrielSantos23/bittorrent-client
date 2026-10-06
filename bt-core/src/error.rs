@@ -153,6 +153,8 @@ pub enum StorageError {
         needed: u64,
         available: u64,
     },
+    #[error("the torrent's storage has been closed")]
+    Closed,
 }
 
 impl StorageError {

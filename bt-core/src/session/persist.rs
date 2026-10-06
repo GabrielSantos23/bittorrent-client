@@ -22,6 +22,9 @@ pub(crate) struct PersistedTorrent {
     pub file_priorities: Vec<(usize, FilePriority)>,
     #[serde(default)]
     pub pause_after_metadata: bool,
+    /// Pause automatically once the download finishes (stop seeding).
+    #[serde(default)]
+    pub stop_after_complete: bool,
 }
 
 pub(crate) fn load(data_dir: &Path) -> (SessionFile, Vec<String>) {

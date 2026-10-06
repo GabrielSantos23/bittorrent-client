@@ -205,6 +205,7 @@ pub struct Storage {
     total_length: u64,
     priorities: Vec<FilePriority>,
     fs: Arc<dyn FileBackend>,
+    closed: AtomicBool,
 }
 
 impl Storage {
@@ -294,6 +295,7 @@ impl Storage {
             total_length: offset,
             priorities: priorities.to_vec(),
             fs,
+            closed: AtomicBool::new(false),
         })
     }
 
@@ -353,6 +355,9 @@ impl Storage {
     }
 
     fn open_slot(&self, slot_index: usize) -> Result<File, StorageError> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(StorageError::Closed);
+        }
         let slot = &self.slots[slot_index];
         if let Some(parent) = slot.path.parent() {
             self.fs
@@ -369,6 +374,17 @@ impl Storage {
                 .map_err(|err| classify_file_io(&slot.path, err))?;
         }
         Ok(file)
+    }
+
+    /// Closes every open file handle and refuses later reopens. Called when
+    /// the owning torrent is being removed, so its content can be deleted
+    /// with no handle left writing to it. Waits out any in-flight write on a
+    /// slot by taking its file under the slot's lock.
+    pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        for slot in &self.slots {
+            lock_file(&slot.file).take();
+        }
     }
 
     pub fn pieces_overlapping_file(&self, file_index: usize) -> Vec<usize> {
@@ -613,7 +629,40 @@ impl Storage {
     }
 }
 
+const DELETE_ATTEMPTS: usize = 8;
+const DELETE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn remove_file_exact(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+fn remove_dir_exact(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_dir(path)
+}
+
+/// Removes a file or directory, retrying briefly when something still holds
+/// the name (a straggler handle, an antivirus scan). `tolerated` kinds are
+/// success from the caller's point of view (already gone, folder shared).
+fn remove_with_retry(
+    path: &Path,
+    remove: fn(&Path) -> std::io::Result<()>,
+    tolerated: &[std::io::ErrorKind],
+) -> std::io::Result<()> {
+    for attempt in 0..DELETE_ATTEMPTS {
+        match remove(path) {
+            Ok(()) => return Ok(()),
+            Err(err) if tolerated.contains(&err.kind()) => return Ok(()),
+            Err(_) if attempt + 1 < DELETE_ATTEMPTS => {
+                std::thread::sleep(DELETE_RETRY_DELAY);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 pub fn delete_torrent_files(meta: &MetaInfo, output_dir: &Path) -> Result<(), StorageError> {
+    let prepared_output = paths::prepare_file_path(output_dir);
     let relatives: Vec<Vec<String>> = match &meta.info.content {
         Content::Single { length: _ } => vec![vec![meta.info.name.clone()]],
         Content::Multi { files } => files
@@ -636,12 +685,11 @@ pub fn delete_torrent_files(meta: &MetaInfo, output_dir: &Path) -> Result<(), St
             full.push(segment);
         }
         let full = paths::prepare_file_path(&full);
-        if full.is_file() {
-            std::fs::remove_file(&full)?;
-        }
+        remove_with_retry(&full, remove_file_exact, &[std::io::ErrorKind::NotFound])
+            .map_err(|err| classify_file_io(&full, err))?;
         let mut parent = full.parent();
         while let Some(current) = parent {
-            if current == output_dir || !current.starts_with(output_dir) {
+            if current == prepared_output || !current.starts_with(&prepared_output) {
                 break;
             }
             dirs.push(current.to_path_buf());
@@ -651,11 +699,15 @@ pub fn delete_torrent_files(meta: &MetaInfo, output_dir: &Path) -> Result<(), St
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     dirs.dedup();
     for dir in dirs {
-        match std::fs::remove_dir(&dir) {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
-            Err(err) => return Err(err.into()),
-        }
+        remove_with_retry(
+            &dir,
+            remove_dir_exact,
+            &[
+                std::io::ErrorKind::NotFound,
+                std::io::ErrorKind::DirectoryNotEmpty,
+            ],
+        )
+        .map_err(|err| classify_dir_io(&dir, err))?;
     }
     Ok(())
 }
@@ -670,11 +722,16 @@ fn lock_file(file: &Mutex<Option<File>>) -> MutexGuard<'_, Option<File>> {
 pub fn recheck(
     storage: &Storage,
     hashes: &[[u8; 20]],
-    mut on_progress: impl FnMut(usize),
+    mut on_progress: impl FnMut(usize) -> bool,
 ) -> Bitfield {
     let mut have = Bitfield::new(hashes.len());
     let mut buffer = vec![0u8; storage.piece_length() as usize];
     for (index, expected) in hashes.iter().enumerate() {
+        // Returning false from the callback cancels the recheck mid-flight
+        // (the torrent is being discarded; there is no point hashing on).
+        if !on_progress(index) {
+            break;
+        }
         let size = storage.piece_size(index);
         if storage.read_piece(index, &mut buffer[..size]).is_ok() {
             let digest: [u8; 20] = Sha1::digest(&buffer[..size]).into();
@@ -758,6 +815,54 @@ mod tests {
     }
 
     #[test]
+    fn delete_torrent_files_removes_files_and_empty_folders() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("delete-files");
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
+        storage.write_piece(0, &[1, 2, 3, 4]).unwrap();
+        storage.write_piece(1, &[5, 6, 7, 8]).unwrap();
+        storage.write_piece(2, &[9, 10, 11, 12]).unwrap();
+        assert!(dir.join("dir/a.txt").is_file());
+        assert!(dir.join("dir/sub/b.bin").is_file());
+
+        // An unrelated file in the same output dir must survive.
+        let unrelated = dir.join("keep.txt");
+        fs::write(&unrelated, b"keep me").unwrap();
+
+        storage.close();
+        delete_torrent_files(&meta, &dir).unwrap();
+
+        assert!(!dir.join("dir").exists());
+        assert!(unrelated.is_file());
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn closed_storage_refuses_to_reopen_skipped_files() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("closed");
+        let storage = Storage::create(
+            &meta,
+            &dir,
+            &[
+                FilePriority::Normal,
+                FilePriority::Skip,
+                FilePriority::Normal,
+            ],
+        )
+        .unwrap();
+        storage.close();
+        // Piece 1 spans a.txt and the skipped sub/b.bin; bringing the skipped
+        // file back would have to reopen it, which must be refused now.
+        assert!(matches!(
+            storage.write_piece(1, &[5, 6, 7, 8]),
+            Err(StorageError::Closed)
+        ));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn reads_blocks_across_file_boundaries() {
         let meta = multi_file_meta(&hashes_of(&content()));
         let dir = temp_dir("readblock");
@@ -787,15 +892,34 @@ mod tests {
         fs::write(dir.join("dir/a.txt"), &data[0..5]).unwrap();
         fs::write(dir.join("dir/sub/b.bin"), &data[5..8]).unwrap();
         fs::write(dir.join("dir/c.txt"), &data[8..12]).unwrap();
-        let have = recheck(&storage, &meta.info.pieces, |_| {});
+        let have = recheck(&storage, &meta.info.pieces, |_| true);
         assert_eq!(have.count(), 3);
         let mut corrupted = data[0..5].to_vec();
         corrupted[4] = 0xFF;
         fs::write(dir.join("dir/a.txt"), corrupted).unwrap();
-        let have = recheck(&storage, &meta.info.pieces, |_| {});
+        let have = recheck(&storage, &meta.info.pieces, |_| true);
         assert!(have.get(0));
         assert!(!have.get(1));
         assert!(have.get(2));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn recheck_can_be_cancelled_mid_flight() {
+        let meta = multi_file_meta(&hashes_of(&content()));
+        let dir = temp_dir("recheck-cancel");
+        let storage = Storage::create(&meta, &dir, &all_normal(3)).unwrap();
+        fs::write(dir.join("dir/a.txt"), &content()[0..5]).unwrap();
+        fs::write(dir.join("dir/sub/b.bin"), &content()[5..8]).unwrap();
+        fs::write(dir.join("dir/c.txt"), &content()[8..12]).unwrap();
+        let mut calls = 0;
+        let have = recheck(&storage, &meta.info.pieces, |done| {
+            calls += 1;
+            done < 1
+        });
+        // Cancelled right after the first piece: only that piece was hashed.
+        assert_eq!(have.count(), 1);
+        assert_eq!(calls, 3);
         fs::remove_dir_all(dir).unwrap();
     }
 

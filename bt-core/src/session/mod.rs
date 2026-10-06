@@ -36,6 +36,10 @@ pub struct AddOptions {
     /// Overrides the free space check performed before the download starts.
     #[serde(default)]
     pub skip_free_space_check: bool,
+    /// Pause the torrent automatically once the download finishes, so it
+    /// does not keep seeding.
+    #[serde(default)]
+    pub stop_after_complete: bool,
 }
 
 /// Options for adding a magnet. `pause_after_metadata` pauses the torrent as
@@ -53,6 +57,10 @@ pub struct MagnetOptions {
     /// Overrides the free space check performed when the metadata arrives.
     #[serde(default)]
     pub skip_free_space_check: bool,
+    /// Pause the torrent automatically once the download finishes, so it
+    /// does not keep seeding.
+    #[serde(default)]
+    pub stop_after_complete: bool,
 }
 
 #[derive(Clone)]
@@ -119,6 +127,8 @@ pub struct TorrentSummary {
     pub error: Option<String>,
     pub error_retryable: bool,
     pub dht_waiting: bool,
+    /// Whether the torrent pauses automatically once it finishes downloading.
+    pub stop_after_complete: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ts_rs::TS)]
@@ -179,6 +189,11 @@ enum SessionCommand {
     },
     Resume {
         id: String,
+        reply: oneshot::Sender<Result<(), SessionError>>,
+    },
+    SetStopAfterComplete {
+        id: String,
+        stop: bool,
         reply: oneshot::Sender<Result<(), SessionError>>,
     },
     Remove {
@@ -413,6 +428,7 @@ impl Session {
                             pause_after_metadata: entry.pause_after_metadata,
                             file_priorities: entry.file_priorities.clone(),
                             skip_free_space_check: false,
+                            stop_after_complete: entry.stop_after_complete,
                         },
                     ));
                 }
@@ -434,6 +450,7 @@ impl Session {
                                         paused: entry.paused,
                                         file_priorities: entry.file_priorities.clone(),
                                         skip_free_space_check: false,
+                                        stop_after_complete: entry.stop_after_complete,
                                     },
                                 ))
                             } else {
@@ -669,6 +686,21 @@ impl Session {
         rx.await.map_err(|_| SessionError::Closed)?
     }
 
+    /// Controls whether a torrent pauses automatically once it finishes
+    /// downloading (stop seeding after completion).
+    pub async fn set_stop_after_complete(&self, id: &str, stop: bool) -> Result<(), SessionError> {
+        let (reply, rx) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::SetStopAfterComplete {
+                id: id.to_string(),
+                stop,
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::Closed)?;
+        rx.await.map_err(|_| SessionError::Closed)?
+    }
+
     pub async fn remove(&self, id: &str, delete_files: bool) -> Result<(), SessionError> {
         let (reply, rx) = oneshot::channel();
         self.commands
@@ -709,6 +741,7 @@ struct SessionTorrent {
     meta: Arc<MetaInfo>,
     output_dir: PathBuf,
     paused: bool,
+    stop_after_complete: bool,
     magnet: Option<String>,
     file_priorities: Vec<(usize, FilePriority)>,
     pause_after_metadata: bool,
@@ -846,7 +879,10 @@ impl SessionActor {
                     }
                     None => return,
                 },
-                _ = tick.tick() => self.publish(),
+                _ = tick.tick() => {
+                    self.publish();
+                    self.auto_stop_seeding().await;
+                }
             }
         }
     }
@@ -896,6 +932,10 @@ impl SessionActor {
             }
             SessionCommand::Resume { id, reply } => {
                 let result = self.set_paused(&id, false).await;
+                let _ = reply.send(result);
+            }
+            SessionCommand::SetStopAfterComplete { id, stop, reply } => {
+                let result = self.set_stop_after_complete(&id, stop).await;
                 let _ = reply.send(result);
             }
             SessionCommand::Remove {
@@ -1036,19 +1076,77 @@ impl SessionActor {
         Ok(())
     }
 
+    async fn set_stop_after_complete(&mut self, id: &str, stop: bool) -> Result<(), SessionError> {
+        let entry = self
+            .torrents
+            .get_mut(id)
+            .ok_or_else(|| SessionError::Unknown(id.to_string()))?;
+        entry.stop_after_complete = stop;
+        // A torrent that is already finished stops seeding as soon as the
+        // flag is turned on.
+        if stop && !entry.paused {
+            let state = entry.stats.borrow().state;
+            if matches!(state, State::Seeding | State::Completed) {
+                entry.handle.pause().await?;
+                entry.paused = true;
+            }
+        }
+        self.persist();
+        self.publish();
+        Ok(())
+    }
+
+    /// Pauses torrents flagged `stop_after_complete` once they finish
+    /// downloading, so seeding stops automatically.
+    async fn auto_stop_seeding(&mut self) {
+        let finished: Vec<String> = self
+            .torrents
+            .iter()
+            .filter(|(_, entry)| {
+                entry.stop_after_complete
+                    && !entry.paused
+                    && matches!(
+                        entry.stats.borrow().state,
+                        State::Seeding | State::Completed
+                    )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in finished {
+            let _ = self.set_paused(&id, true).await;
+        }
+    }
+
     async fn remove(&mut self, id: &str, delete_files: bool) -> Result<(), SessionError> {
         let entry = self
             .torrents
             .remove(id)
             .ok_or_else(|| SessionError::Unknown(id.to_string()))?;
         self.order.retain(|existing| existing != id);
-        entry.handle.stop().await?;
         if delete_files {
-            let meta = entry.meta.clone();
+            // Magnet torrents only carry a placeholder metainfo in the
+            // session until the real one arrives from peers; the engine holds
+            // the real bytes once fetched. Deleting from the placeholder
+            // would target a file that does not exist and silently leave the
+            // whole content on disk.
+            let meta = entry
+                .handle
+                .metainfo()
+                .map(Arc::new)
+                .unwrap_or_else(|| entry.meta.clone());
+            // The engine still holds every file open; terminate it first so
+            // the removal below cannot race an open handle (and fail on
+            // Windows with the content still on disk).
+            entry.handle.shutdown().await;
             let output_dir = entry.output_dir.clone();
             spawn_blocking(move || crate::engine::delete_torrent_files(&meta, &output_dir))
                 .await
                 .map_err(|_| SessionError::Closed)??;
+        } else {
+            entry.handle.stop().await?;
+            // The torrent is gone for good; don't leave the engine task
+            // idling with its file handles for the rest of the session.
+            entry.handle.shutdown().await;
         }
         if let Some(data_dir) = &self.persistence {
             let _ = persist::remove_metainfo(data_dir, id);
@@ -1115,6 +1213,7 @@ impl SessionActor {
                             file: format!("{id}.torrent"),
                             output_dir: entry.output_dir.clone(),
                             paused: entry.paused,
+                            stop_after_complete: entry.stop_after_complete,
                             magnet: entry.magnet.clone(),
                             file_priorities: entry.file_priorities.clone(),
                             pause_after_metadata: entry.pause_after_metadata,
@@ -1146,6 +1245,9 @@ async fn spawn_magnet_entry(
     options: MagnetOptions,
     wiring: &EngineWiring,
 ) -> Result<SessionTorrent, SessionError> {
+    // A trackerless magnet has no way to find peers if the network blocks or
+    // degrades DHT; the fallback trackers give it a TCP-based path instead.
+    let link = link.with_fallback_trackers();
     let engine_options = crate::engine::TorrentOptions {
         bootstrap_peers: wiring.bootstrap_peers.clone(),
         dial: wiring.dial.clone(),
@@ -1189,6 +1291,7 @@ async fn spawn_magnet_entry(
         meta: Arc::new(placeholder_meta),
         output_dir,
         paused: options.paused,
+        stop_after_complete: options.stop_after_complete,
         magnet: Some(uri),
         file_priorities: options.file_priorities,
         pause_after_metadata: options.pause_after_metadata,
@@ -1230,6 +1333,7 @@ async fn spawn_entry(
         meta,
         output_dir,
         paused: options.paused,
+        stop_after_complete: options.stop_after_complete,
         magnet: None,
         file_priorities: options.file_priorities,
         pause_after_metadata: false,
@@ -1272,5 +1376,6 @@ fn make_summary(id: &str, entry: &SessionTorrent) -> TorrentSummary {
         error: stats.error,
         error_retryable: stats.error_retryable,
         dht_waiting: stats.dht_waiting,
+        stop_after_complete: entry.stop_after_complete,
     }
 }

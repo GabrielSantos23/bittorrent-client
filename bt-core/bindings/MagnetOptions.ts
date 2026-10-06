@@ -10,4 +10,9 @@ export type MagnetOptions = { paused: boolean, pause_after_metadata: boolean, fi
 /**
  * Overrides the free space check performed when the metadata arrives.
  */
-skip_free_space_check: boolean, };
+skip_free_space_check: boolean, 
+/**
+ * Pause the torrent automatically once the download finishes, so it
+ * does not keep seeding.
+ */
+stop_after_complete: boolean, };

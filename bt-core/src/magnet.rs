@@ -6,6 +6,18 @@ use thiserror::Error;
 pub const MAX_MAGNET_LENGTH: usize = 8 * 1024;
 pub const MAX_MAGNET_TRACKERS: usize = 50;
 
+/// Trackers used as a peer-discovery fallback for magnets that carry none.
+/// A trackerless magnet depends entirely on DHT for peers, and some networks
+/// block or degrade UDP while TCP stays usable; announcing to these gives the
+/// engine a TCP-based path to peers and metadata.
+pub const FALLBACK_TRACKERS: &[&str] = &[
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.stealth.si:80/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+    "http://tracker.dler.org:6969/announce",
+    "http://tracker.renfei.net:8080/announce",
+];
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MagnetError {
     #[error("magnet uri is {0} bytes, above the {1} byte limit")]
@@ -113,6 +125,20 @@ pub fn parse(uri: &str) -> Result<MagnetLink, MagnetError> {
         trackers,
         peers,
     })
+}
+
+impl MagnetLink {
+    /// Fills in the fallback trackers when the magnet carries none; magnets
+    /// with their own trackers are left untouched.
+    pub fn with_fallback_trackers(mut self) -> Self {
+        if self.trackers.is_empty() {
+            self.trackers = FALLBACK_TRACKERS
+                .iter()
+                .map(|tracker| tracker.to_string())
+                .collect();
+        }
+        self
+    }
 }
 
 fn parse_xt(value: &str) -> Result<[u8; 20], MagnetError> {
@@ -346,5 +372,26 @@ mod tests {
     fn rejects_invalid_percent_escapes_in_name() {
         let uri = format!("magnet:?xt=urn:btih:{HEX_HASH}&dn=%zz");
         assert_eq!(parse(&uri).unwrap_err(), MagnetError::BadHashCharacters);
+    }
+
+    #[test]
+    fn fills_fallback_trackers_only_for_trackerless_magnets() {
+        let trackerless = parse(&format!("magnet:?xt=urn:btih:{HEX_HASH}&dn=solo"))
+            .unwrap()
+            .with_fallback_trackers();
+        assert_eq!(
+            trackerless.trackers,
+            FALLBACK_TRACKERS
+                .iter()
+                .map(|tracker| tracker.to_string())
+                .collect::<Vec<_>>()
+        );
+
+        let with_trackers = parse(&format!(
+            "magnet:?xt=urn:btih:{HEX_HASH}&tr=udp%3A%2F%2Fmine%3A80"
+        ))
+        .unwrap()
+        .with_fallback_trackers();
+        assert_eq!(with_trackers.trackers, vec!["udp://mine:80".to_string()]);
     }
 }

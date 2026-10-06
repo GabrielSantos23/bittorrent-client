@@ -269,6 +269,8 @@ impl Default for TorrentOptions {
 
 pub struct Torrent {
     commands: mpsc::Sender<EngineCommand>,
+    run: tokio::task::JoinHandle<()>,
+    raw_metainfo: Arc<std::sync::Mutex<Vec<u8>>>,
     stats: watch::Receiver<Stats>,
     metadata: watch::Receiver<Option<Arc<Vec<u8>>>>,
 }
@@ -394,12 +396,14 @@ impl Torrent {
             incoming_rx,
             announce_results,
             announce_results_tx,
-            raw_metainfo,
+            raw_metainfo.clone(),
             metadata_tx,
         );
-        tokio::spawn(engine.run());
+        let run = tokio::spawn(engine.run());
         Ok(Torrent {
             commands,
+            run,
+            raw_metainfo,
             stats: stats_rx,
             metadata: metadata_rx,
         })
@@ -530,7 +534,7 @@ impl Torrent {
         let engine = Engine::new(
             meta,
             storage,
-            raw_metainfo,
+            raw_metainfo.clone(),
             None,
             metadata_tx.clone(),
             http,
@@ -544,16 +548,50 @@ impl Torrent {
             announce_results_tx,
             startup,
         );
-        tokio::spawn(engine.run());
+        let run = tokio::spawn(engine.run());
         Ok(Torrent {
             commands,
+            run,
+            raw_metainfo,
             stats: stats_rx,
             metadata: metadata_rx,
         })
     }
 
+    /// The torrent's metainfo. For magnets this is `None` until the real
+    /// metadata has been fetched from peers — the session otherwise only
+    /// carries a placeholder for them.
+    pub fn metainfo(&self) -> Option<MetaInfo> {
+        let raw = self
+            .raw_metainfo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if raw.is_empty() {
+            return None;
+        }
+        MetaInfo::from_bytes(&raw).ok()
+    }
+
     pub fn subscribe(&self) -> watch::Receiver<Stats> {
         self.stats.clone()
+    }
+
+    /// Fully terminates the engine task, closing every file handle the
+    /// storage holds. Call before deleting a torrent's content, or whenever
+    /// the torrent is being discarded, so no handle outlives it.
+    pub async fn shutdown(self) {
+        let Torrent {
+            commands,
+            run,
+            raw_metainfo: _,
+            stats: _,
+            metadata: _,
+        } = self;
+        // Closing the channel ends run()'s select loop; joining it waits out
+        // the teardown that closes the storage handles.
+        drop(commands);
+        let _ = run.await;
     }
 
     pub async fn start(&self) -> Result<(), EngineError> {
@@ -1234,6 +1272,12 @@ impl Engine {
                 },
             }
         }
+        // The engine task is over: release every file handle now so callers
+        // that follow up by deleting the torrent's content never race an
+        // open handle.
+        if let Some(storage) = &self.storage {
+            storage.close();
+        }
         self.write_resume_snapshot().await;
         self.registry.unregister(&self.info_hash());
     }
@@ -1507,45 +1551,62 @@ impl Engine {
         self.publish();
         self.startup_pieces_hashed += meta.info.pieces.len();
         let progress = self.stats_tx.clone();
-        let have = spawn_blocking(move || {
+        let piece_count = meta.info.pieces.len();
+        let hashing = spawn_blocking(move || {
             storage::recheck(&storage, &meta.info.pieces, |done| {
                 progress.send_modify(|stats| stats.verified_pieces = done);
+                true
             })
-        })
-        .await;
+        });
+        // A shutdown (dropped command sender) cancels the hashing within one
+        // poll tick, instead of a multi-gigabyte verification blocking the
+        // torrent's own removal.
+        let have = tokio::select! {
+            hashed = hashing => match hashed {
+                Ok(have) => have,
+                Err(_) => {
+                    self.error = Some("recheck failed".to_string());
+                    self.state = State::Error;
+                    self.publish();
+                    return;
+                }
+            },
+            _ = async {
+                while !self.commands.is_closed() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            } => Bitfield::new(piece_count),
+        };
+        if self.commands.is_closed() {
+            // The torrent is being discarded mid-verification; skip the rest
+            // of startup — run()'s teardown closes the storage right after.
+            return;
+        }
         let meta = match &self.meta {
             Some(meta) => meta.clone(),
             None => return,
         };
-        match have {
-            Ok(have) => {
-                *self
-                    .have_map
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = have.clone();
-                // A recheck may run on a picker that already has state (force
-                // recheck), so pieces that no longer verify must be unmarked.
-                self.picker().reset_have(&have);
-                let mut verified = 0u64;
-                for index in 0..meta.info.pieces.len() {
-                    if have.get(index) {
-                        verified += self.piece_size(index) as u64;
-                    }
-                }
-                self.verified_bytes = verified;
-                self.file_verified = self
-                    .storage
-                    .as_ref()
-                    .map(|storage| file_verified_of(storage, &have))
-                    .unwrap_or_default();
-                self.error = None;
-                self.finish_initial_verification().await;
-            }
-            Err(_) => {
-                self.error = Some("recheck failed".to_string());
-                self.state = State::Error;
+        *self
+            .have_map
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = have.clone();
+        // A recheck may run on a picker that already has state (force
+        // recheck), so pieces that no longer verify must be unmarked.
+        self.picker().reset_have(&have);
+        let mut verified = 0u64;
+        for index in 0..meta.info.pieces.len() {
+            if have.get(index) {
+                verified += self.piece_size(index) as u64;
             }
         }
+        self.verified_bytes = verified;
+        self.file_verified = self
+            .storage
+            .as_ref()
+            .map(|storage| file_verified_of(storage, &have))
+            .unwrap_or_default();
+        self.error = None;
+        self.finish_initial_verification().await;
         self.publish();
     }
 
@@ -2293,7 +2354,13 @@ impl Engine {
         self.storage = Some(storage);
         self.file_priorities = file_priorities;
         self.file_verified = vec![0; file_count];
-        self.raw_metainfo = Arc::new(std::sync::Mutex::new(raw.clone()));
+        // Mutate the shared Arc rather than replacing it: the Torrent handle
+        // holds a clone so the session can read the real metainfo (e.g. to
+        // delete the torrent's content) once it has arrived.
+        *self
+            .raw_metainfo
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = raw.clone();
         self.pending = None;
         let _ = self.metadata_tx.send(Some(Arc::new(raw)));
         self.initial_check().await;

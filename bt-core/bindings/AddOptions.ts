@@ -9,4 +9,9 @@ export type AddOptions = { paused: boolean, file_priorities: Array<[number, File
 /**
  * Overrides the free space check performed before the download starts.
  */
-skip_free_space_check: boolean, };
+skip_free_space_check: boolean, 
+/**
+ * Pause the torrent automatically once the download finishes, so it
+ * does not keep seeding.
+ */
+stop_after_complete: boolean, };

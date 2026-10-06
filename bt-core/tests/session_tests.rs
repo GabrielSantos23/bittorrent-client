@@ -3,6 +3,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bt_core::bencode;
 use bt_core::engine::State;
 use bt_core::error::SessionError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -102,6 +103,115 @@ async fn add_rejects_duplicates_and_removes_files() {
     assert!(unrelated.exists());
     assert!(out.exists());
 
+    let summaries = wait_for(&session.subscribe(), |s| s.is_empty(), 10).await;
+    assert!(summaries.is_empty());
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_with_files_clears_multi_file_folders() {
+    // Multi-file torrent: dir/{a.txt, sub/b.bin, c.txt} — removal must take
+    // the whole folder tree with it, not leave it behind on disk.
+    let mut raw = Vec::new();
+    raw.extend_from_slice(b"d4:infod5:filesl");
+    raw.extend_from_slice(b"d6:lengthi5e4:pathl5:a.txtee");
+    raw.extend_from_slice(b"d6:lengthi3e4:pathl3:sub5:b.binee");
+    raw.extend_from_slice(b"d6:lengthi4e4:pathl5:c.txtee");
+    raw.extend_from_slice(b"e4:name3:dir12:piece lengthi4e6:pieces");
+    raw.extend_from_slice(b"60:");
+    raw.extend_from_slice(&[7u8; 60]);
+    raw.extend_from_slice(b"ee");
+
+    let data_dir = temp_dir("session-multi-data");
+    let out = temp_dir("session-multi-out");
+    let session = Session::spawn_with_options(
+        Some(data_dir.clone()),
+        SessionOptions::new(0, 0).with_dht_bootstrap(Vec::new()),
+    )
+    .await
+    .unwrap();
+
+    let id = session
+        .add_torrent(&raw, out.clone(), AddOptions::default())
+        .await
+        .unwrap();
+    // The storage eagerly creates every non-skipped file inside the
+    // torrent's root folder and keeps them open while the torrent runs.
+    assert!(out.join("dir/a.txt").is_file());
+    assert!(out.join("dir/sub/b.bin").is_file());
+    assert!(out.join("dir/c.txt").is_file());
+
+    session.remove(&id, true).await.unwrap();
+
+    // The whole torrent folder tree is gone and nothing else was touched.
+    assert!(!out.join("dir").exists());
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    let summaries = wait_for(&session.subscribe(), |s| s.is_empty(), 10).await;
+    assert!(summaries.is_empty());
+    session.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remove_magnet_with_files_clears_its_content() {
+    // Regression: magnet torrents keep a placeholder metainfo in the session
+    // until the real one arrives from peers. Deletion used to run against
+    // that placeholder and silently delete nothing.
+    let data = test_data();
+    let bytes = torrent_bytes(&data);
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes).unwrap();
+    let root_value = bencode::decode(&bytes).unwrap();
+    let info_value = match &root_value {
+        bencode::Value::Dict(entries) => entries.get(&b"info".to_vec()).unwrap().clone(),
+        _ => unreachable!(),
+    };
+    let info_dict = Arc::new(bencode::encode(&info_value));
+    let info_hash_hex = bt_core::hex::encode(&meta.info_hash);
+    let data_dir = temp_dir("magnet-delete-data");
+    let out = temp_dir("magnet-delete-out");
+    let dial = Arc::new(FakeDial::with_metadata(
+        meta.info_hash,
+        data.clone(),
+        meta.info.pieces.len(),
+        vec![(addr(9431), SeederKind::Good)],
+        info_dict,
+    ));
+    let session = Session::spawn_with_dial(Some(data_dir.clone()), dial, vec![addr(9431)])
+        .await
+        .unwrap();
+    let uri = format!("magnet:?xt=urn:btih:{info_hash_hex}&dn=e2e.bin");
+    let id = session
+        .add_magnet(
+            &uri,
+            out.clone(),
+            MagnetOptions {
+                pause_after_metadata: true,
+                ..MagnetOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // The fake dial serves the metadata; once it arrives the engine creates
+    // the real file and pauses for the user's file selection.
+    let paused_id = id.clone();
+    wait_for(
+        &session.subscribe(),
+        move |s| {
+            s.iter()
+                .any(|t| t.id == paused_id && t.state == State::Paused)
+        },
+        30,
+    )
+    .await;
+    assert!(out.join("e2e.bin").is_file());
+
+    session.remove(&id, true).await.unwrap();
+
+    assert!(
+        !out.join("e2e.bin").exists(),
+        "magnet content must be deleted with the torrent"
+    );
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
     let summaries = wait_for(&session.subscribe(), |s| s.is_empty(), 10).await;
     assert!(summaries.is_empty());
     session.shutdown().await.unwrap();
