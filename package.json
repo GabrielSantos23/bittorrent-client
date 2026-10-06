@@ -3,7 +3,8 @@
   "private": true,
   "scripts": {
     "dev": "tauri dev",
-    "bundle": "tauri build"
+    "bundle": "tauri build",
+    "tauri": "tauri"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"

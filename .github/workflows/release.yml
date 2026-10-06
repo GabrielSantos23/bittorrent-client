@@ -33,6 +33,10 @@ jobs:
         working-directory: src-tauri/ui
         run: npm ci
 
+      # The tauri CLI used by tauri-action comes from the repo root workspace.
+      - name: npm ci (tauri CLI workspace)
+        run: npm ci
+
       # Bulleted commit subjects since the previous tag: the in-app update
       # dialog renders exactly these lines as the changelog.
       - name: Build the changelog
