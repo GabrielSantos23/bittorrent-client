@@ -16,6 +16,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -31,31 +33,38 @@ jobs:
         working-directory: src-tauri/ui
         run: npm ci
 
-      - name: Build the NSIS installer
-        run: npx -y @tauri-apps/cli@^2 build
-
-      - name: Checksums
+      # Bulleted commit subjects since the previous tag: the in-app update
+      # dialog renders exactly these lines as the changelog.
+      - name: Build the changelog
+        id: changelog
         shell: bash
         run: |
-          cd src-tauri/target/release/bundle/nsis
-          sha256sum *.exe > sha256sums.txt
-          cat sha256sums.txt
+          git config --global core.pager cat
+          previous=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          if [ -n "$previous" ]; then
+            range="$previous..HEAD"
+          else
+            range="HEAD"
+          fi
+          {
+            echo "body<<CHANGELOG_EOF"
+            git log --no-merges --pretty=format:"- %s (%h)" "$range"
+            echo ""
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-installer-${{ github.ref_name }}
-          path: |
-            target/release/bundle/nsis/*.exe
-            target/release/bundle/nsis/sha256sums.txt
-
-      - name: Attach to the GitHub release
-        shell: bash
+      - name: Build, sign and publish the release
+        uses: tauri-apps/tauri-action@v0
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --draft --verify-tag || true
-          gh release upload "$GITHUB_REF_NAME" \
-            target/release/bundle/nsis/*.exe \
-            target/release/bundle/nsis/sha256sums.txt \
-            --clobber
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: .
+          tagName: ${{ github.ref_name }}
+          releaseName: 'BitTorrent Client ${{ github.ref_name }}'
+          releaseBody: ${{ steps.changelog.outputs.body }}
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ''

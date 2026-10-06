@@ -4,3 +4,4 @@ src-tauri/ui/dist/
 gen/
 downloads/
 .zcode/
+.tauri/
