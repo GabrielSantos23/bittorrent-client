@@ -33,6 +33,15 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
-    "icon": ["icons/icon.ico"]
+    "icon": ["icons/icon.ico"],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDc2NjM1N0I5NTVGREEzOUQKUldTZG8vMVZ1VmRqZHNPTWdWVXJJYWxTZ2lsSHlPOTJXSUo4ZXVUVnVvZk9hT3MxMkN2bDJ2VVoK",
+      "endpoints": [
+        "https://github.com/GabrielSantos23/bittorrent-client/releases/latest/download/latest.json"
+      ]
+    }
   }
 }
