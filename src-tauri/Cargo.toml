@@ -10,7 +10,10 @@ custom-protocol = ["tauri/custom-protocol"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+axum = { workspace = true }
 bt-core = { path = "../bt-core" }
+if-addrs = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tauri = { version = "2", features = ["tray-icon"] }
@@ -18,3 +21,6 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 ts-rs = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }

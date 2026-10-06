@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod remote;
 mod settings;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bt_core::dht::DhtStatus;
@@ -12,6 +13,7 @@ use bt_core::listener::ListenerStatus;
 use bt_core::session::{
     AddOptions, MagnetOptions, Session, SessionOptions, TorrentDetail, TorrentSummary,
 };
+use remote::RemoteStatus;
 use settings::{default_settings, load_settings, save_settings, Settings};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::watch;
@@ -20,10 +22,11 @@ const MAX_TORRENT_FILE_BYTES: u64 = 10 * 1024 * 1024;
 
 pub struct AppState {
     session: Session,
-    settings: Mutex<Settings>,
+    settings: Arc<Mutex<Settings>>,
     data_dir: PathBuf,
     selected_tx: watch::Sender<Option<String>>,
     summaries: watch::Receiver<Vec<TorrentSummary>>,
+    remote: remote::RemoteHandle,
 }
 
 fn lock_settings(state: &AppState) -> std::sync::MutexGuard<'_, Settings> {
@@ -31,6 +34,68 @@ fn lock_settings(state: &AppState) -> std::sync::MutexGuard<'_, Settings> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn read_torrent_file(path: &str) -> Result<Vec<u8>, String> {
+    let metadata =
+        std::fs::metadata(path).map_err(|err| format!("cannot access torrent file: {err}"))?;
+    if !metadata.is_file() {
+        return Err("torrent path is not a regular file".to_string());
+    }
+    if metadata.len() > MAX_TORRENT_FILE_BYTES {
+        return Err("torrent file is larger than 10 MiB".to_string());
+    }
+    std::fs::read(path).map_err(|err| format!("cannot read torrent file: {err}"))
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TorrentFileEntry {
+    pub index: usize,
+    pub path: Vec<String>,
+    #[ts(type = "number")]
+    pub length: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, ts_rs::TS)]
+#[ts(export)]
+pub struct TorrentInspection {
+    pub name: String,
+    #[ts(type = "number")]
+    pub total_length: u64,
+    pub files: Vec<TorrentFileEntry>,
+}
+
+#[tauri::command]
+async fn inspect_torrent(path: String) -> Result<TorrentInspection, String> {
+    let bytes = read_torrent_file(&path)?;
+    let meta = bt_core::metainfo::MetaInfo::from_bytes(&bytes)
+        .map_err(|err| format!("invalid torrent file: {err}"))?;
+    let total_length = meta
+        .info
+        .total_length()
+        .map_err(|err| format!("invalid torrent file: {err}"))?;
+    let files = match &meta.info.content {
+        bt_core::metainfo::Content::Single { length } => vec![TorrentFileEntry {
+            index: 0,
+            path: vec![meta.info.name.clone()],
+            length: *length,
+        }],
+        bt_core::metainfo::Content::Multi { files: entries } => entries
+            .iter()
+            .enumerate()
+            .map(|(index, file)| TorrentFileEntry {
+                index,
+                path: file.path.clone(),
+                length: file.length,
+            })
+            .collect(),
+    };
+    Ok(TorrentInspection {
+        name: meta.info.name,
+        total_length,
+        files,
+    })
 }
 
 #[tauri::command]
@@ -41,16 +106,7 @@ async fn add_torrent(
     file_priorities: Option<Vec<(u32, FilePriority)>>,
     skip_free_space_check: Option<bool>,
 ) -> Result<String, String> {
-    let path = PathBuf::from(path);
-    let metadata =
-        std::fs::metadata(&path).map_err(|err| format!("cannot access torrent file: {err}"))?;
-    if !metadata.is_file() {
-        return Err("torrent path is not a regular file".to_string());
-    }
-    if metadata.len() > MAX_TORRENT_FILE_BYTES {
-        return Err("torrent file is larger than 10 MiB".to_string());
-    }
-    let bytes = std::fs::read(&path).map_err(|err| format!("cannot read torrent file: {err}"))?;
+    let bytes = read_torrent_file(&path)?;
     bt_core::metainfo::MetaInfo::from_bytes(&bytes)
         .map_err(|err| format!("invalid torrent file: {err}"))?;
     let download_dir = lock_settings(&state).download_dir.clone();
@@ -62,6 +118,7 @@ async fn add_torrent(
             .map(|(index, priority)| (index as usize, priority))
             .collect(),
         skip_free_space_check: skip_free_space_check.unwrap_or(false),
+        stop_after_complete: false,
     };
     state
         .session
@@ -84,6 +141,7 @@ async fn add_magnet(
         pause_after_metadata: pause_after_metadata.unwrap_or(false),
         file_priorities: Vec::new(),
         skip_free_space_check: skip_free_space_check.unwrap_or(false),
+        stop_after_complete: false,
     };
     state
         .session
@@ -194,12 +252,18 @@ async fn set_settings(
     dht_enabled: bool,
     dht_port: u16,
 ) -> Result<(), String> {
+    let (remote_token, remote_port) = {
+        let guard = lock_settings(&state);
+        (guard.remote_token.clone(), guard.remote_port)
+    };
     let settings = Settings {
         download_dir: PathBuf::from(download_dir),
         listen_port,
         upload_limit_bps,
         dht_enabled,
         dht_port,
+        remote_token,
+        remote_port,
     };
     let path = state.data_dir.join("settings.json");
     state
@@ -230,6 +294,39 @@ async fn open_output_dir(state: tauri::State<'_, AppState>, id: String) -> Resul
         .await
         .ok_or_else(|| "unknown torrent".to_string())?;
     tauri_plugin_opener::open_path(detail.output_dir, None::<&str>).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+async fn remote_start(state: tauri::State<'_, AppState>) -> Result<RemoteStatus, String> {
+    state.remote.start().await
+}
+
+#[tauri::command]
+async fn remote_stop(state: tauri::State<'_, AppState>) -> Result<RemoteStatus, String> {
+    Ok(state.remote.stop().await)
+}
+
+#[tauri::command]
+async fn remote_status(state: tauri::State<'_, AppState>) -> Result<RemoteStatus, String> {
+    Ok(state.remote.status())
+}
+
+#[tauri::command]
+async fn remote_refresh_token(state: tauri::State<'_, AppState>) -> Result<RemoteStatus, String> {
+    state.remote.refresh_token().await
+}
+
+#[tauri::command]
+async fn set_stop_after_complete(
+    state: tauri::State<'_, AppState>,
+    id: String,
+    stop: bool,
+) -> Result<(), String> {
+    state
+        .session
+        .set_stop_after_complete(&id, stop)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 fn spawn_summary_events(app: AppHandle, mut summaries: watch::Receiver<Vec<TorrentSummary>>) {
@@ -293,6 +390,18 @@ fn spawn_dht_events(app: AppHandle, mut status: watch::Receiver<DhtStatus>) {
     });
 }
 
+fn spawn_remote_events(app: AppHandle, mut status: watch::Receiver<RemoteStatus>) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let snapshot = status.borrow().clone();
+            let _ = app.emit("remote://status", &snapshot);
+            if status.changed().await.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn build_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let show = tauri::menu::MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
     let quit = tauri::menu::MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -347,12 +456,19 @@ fn main() {
             ))?;
             let summaries = session.subscribe();
             let (selected_tx, selected_rx) = watch::channel(None);
+            let settings = Arc::new(Mutex::new(settings));
+            let remote = remote::RemoteHandle::new(
+                session.clone(),
+                settings.clone(),
+                data_dir.join("settings.json"),
+            );
             app.manage(AppState {
                 session: session.clone(),
-                settings: Mutex::new(settings),
+                settings,
                 data_dir,
                 selected_tx,
                 summaries: summaries.clone(),
+                remote,
             });
 
             let handle = app.handle().clone();
@@ -366,6 +482,9 @@ fn main() {
 
             let handle = app.handle().clone();
             spawn_dht_events(handle, session.dht_status());
+
+            let handle = app.handle().clone();
+            spawn_remote_events(handle, app.state::<AppState>().remote.subscribe());
 
             build_tray(app)?;
             Ok(())
@@ -388,6 +507,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             add_torrent,
             add_magnet,
+            inspect_torrent,
             set_file_priorities,
             force_recheck,
             list_torrents,
@@ -399,7 +519,12 @@ fn main() {
             select_torrent,
             get_settings,
             set_settings,
-            open_output_dir
+            open_output_dir,
+            set_stop_after_complete,
+            remote_start,
+            remote_stop,
+            remote_status,
+            remote_refresh_token
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

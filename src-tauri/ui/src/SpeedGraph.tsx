@@ -22,13 +22,13 @@ export function SpeedGraph({ history, width = 260, height = 44 }: SpeedGraphProp
       role="img"
       aria-label={`Download speed history, current ${max} bytes per second peak`}
     >
-      <polygon points={area} className="fill-primary/10" />
+      <polygon points={area} className="fill-accent/10" />
       <polyline
         points={line}
         fill="none"
         strokeWidth="1.5"
         strokeLinejoin="round"
-        className="stroke-primary"
+        className="stroke-accent"
       />
     </svg>
   );

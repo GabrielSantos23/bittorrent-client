@@ -18,6 +18,11 @@ pub struct Settings {
     pub dht_enabled: bool,
     #[serde(default = "default_listen_port")]
     pub dht_port: u16,
+    #[serde(default)]
+    pub remote_token: String,
+    #[serde(default = "default_remote_port")]
+    #[ts(type = "number")]
+    pub remote_port: u16,
 }
 
 fn default_listen_port() -> u16 {
@@ -28,6 +33,10 @@ fn default_dht_enabled() -> bool {
     true
 }
 
+fn default_remote_port() -> u16 {
+    8420
+}
+
 pub fn default_settings(data_dir: &Path) -> Settings {
     Settings {
         download_dir: data_dir.join("downloads"),
@@ -35,6 +44,8 @@ pub fn default_settings(data_dir: &Path) -> Settings {
         upload_limit_bps: 0,
         dht_enabled: true,
         dht_port: DEFAULT_LISTEN_PORT,
+        remote_token: String::new(),
+        remote_port: default_remote_port(),
     }
 }
 
@@ -81,6 +92,8 @@ mod tests {
             upload_limit_bps: 1024,
             dht_enabled: false,
             dht_port: 6890,
+            remote_token: "abc123".to_string(),
+            remote_port: 8420,
         }
     }
 
@@ -105,6 +118,8 @@ mod tests {
         assert_eq!(settings.upload_limit_bps, 0);
         assert!(settings.dht_enabled);
         assert_eq!(settings.dht_port, DEFAULT_LISTEN_PORT);
+        assert_eq!(settings.remote_token, "");
+        assert_eq!(settings.remote_port, default_remote_port());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

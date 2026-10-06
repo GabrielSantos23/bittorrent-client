@@ -1,3 +1,15 @@
+export function byteParts(bytes: number): { value: number; unit: string } {
+  if (bytes < 1024) return { value: bytes, unit: "B" };
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let value = bytes / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return { value, unit: units[unit] };
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   const units = ["KiB", "MiB", "GiB", "TiB"];
@@ -41,10 +53,34 @@ export function formatAnnounceTime(unixSeconds: number | null, timeZone?: string
 export const stateColor: Record<string, string> = {
   Checking: "text-info",
   FetchingMetadata: "text-info",
-  Downloading: "text-primary",
+  Downloading: "text-accent",
   Paused: "text-muted-foreground",
-  Completed: "text-primary",
+  Completed: "text-accent",
   Stopped: "text-muted-foreground",
-  Error: "text-destructive",
+  Error: "",
   Seeding: "text-info",
+};
+
+export type BadgeVariant =
+  | "default"
+  | "secondary"
+  | "destructive"
+  | "info"
+  | "success";
+
+export const badgeVariantByState: Record<string, BadgeVariant> = {
+  Checking: "info",
+  FetchingMetadata: "info",
+  Downloading: "success",
+  Seeding: "info",
+  Completed: "success",
+  Paused: "secondary",
+  Stopped: "secondary",
+  Error: "destructive",
+};
+
+// Short display labels for states whose raw enum name is too wide for the
+// fixed State column.
+export const stateLabel: Record<string, string> = {
+  FetchingMetadata: "Fetching",
 };
